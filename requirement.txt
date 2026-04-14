@@ -1,0 +1,5 @@
+aiohttp==3.9.5
+python-telegram-bot==20.7
+python-dotenv==1.0.1
+aiohttp-socks==0.8.4
+curl_cffi>=0.15.0
