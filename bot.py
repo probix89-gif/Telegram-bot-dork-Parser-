@@ -72,7 +72,7 @@ MAX_PAGES = 70
 
 # ─── RELIABILITY CONSTANTS ───────────────────────────────────────────────────
 WORKER_FETCH_TIMEOUT = 120
-JOB_TIMEOUT          = 30 * 60
+JOB_TIMEOUT          = 6 * 60 * 60
 MAX_RETRIES          = 3
 CHUNK_STALL_TIMEOUT  = 60.0
 EMPTY_RATE_SLOWDOWN  = 0.50
