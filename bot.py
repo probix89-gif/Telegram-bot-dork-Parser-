@@ -54,13 +54,13 @@ log = logging.getLogger(__name__)
 BOT_TOKEN             = os.environ.get("BOT_TOKEN", "")
 N_CHUNKS              = int(os.environ.get("N_CHUNKS", 2))
 WORKERS_PER_CHUNK     = int(os.environ.get("WORKERS_PER_CHUNK", 8))
-MAX_WORKERS_PER_CHUNK = 20
-# [CHANGED] Fast mode delays: reduced to 0.5–1.0s after 3 consecutive hits
-MIN_DELAY             = float(os.environ.get("MIN_DELAY", 1.5))
-MAX_DELAY             = float(os.environ.get("MAX_DELAY", 3.0))
-FAST_MIN_DELAY        = 0.5   # used after 3 consecutive successful fetches
-FAST_MAX_DELAY        = 1.0
-FAST_STREAK_THRESHOLD = 3     # hits needed to switch to fast mode
+MAX_WORKERS_PER_CHUNK = 100                      # [CHANGED] increased from 20 to 100
+# [CHANGED] Human‑like delays: increased and more variable
+MIN_DELAY             = float(os.environ.get("MIN_DELAY", 2.0))
+MAX_DELAY             = float(os.environ.get("MAX_DELAY", 6.0))
+FAST_MIN_DELAY        = 1.0                      # fast mode after consecutive hits
+FAST_MAX_DELAY        = 2.5
+FAST_STREAK_THRESHOLD = 5                        # increased threshold for fast mode
 MAX_RESULTS           = int(os.environ.get("MAX_RESULTS", 10))
 TOR_PROXY             = os.environ.get("TOR_PROXY", "socks5://127.0.0.1:9050")
 OUTPUT_DIR            = Path("results")
@@ -806,10 +806,8 @@ async def fetch_page_bing(
         "setlang": "en",
     }
 
-    # [NEW] active_session may be swapped to a fallback on proxy error.
-    # The fallback session is tracked separately so we can close it when done.
     active_session   = session
-    fallback_session = None   # [NEW] will be set if we create a proxy fallback
+    fallback_session = None
 
     try:
         for attempt in range(MAX_RETRIES):
@@ -864,8 +862,6 @@ async def fetch_page_bing(
                 await asyncio.sleep(backoff)
 
             except CurlError as exc:
-                # [NEW] Proxy fallback: if this looks like a proxy error and we have
-                # alternatives in the pool, create a new one-shot session and retry.
                 if _is_proxy_error(exc) and PROXY_ENABLED and len(_proxy_pool) > 1 and attempt < MAX_RETRIES - 1:
                     cur_proxy = getattr(active_session, "_cur_proxy", None)
                     log.warning(
@@ -890,8 +886,6 @@ async def fetch_page_bing(
         return [], True
 
     finally:
-        # [NEW] Always close the fallback session if one was created; never close
-        # the original chunk session (owned by run_chunk).
         if fallback_session is not None:
             await fallback_session.close()
 
@@ -902,12 +896,6 @@ async def fetch_page_yahoo(
     dork: str, page: int, max_res: int,
     chunk_id: int = 0,
 ) -> tuple:
-    """
-    [CHANGED] Uses curl_cffi AsyncSession.
-    [CHANGED] Full browser header rotation.
-    [NEW]     CAPTCHA hook.
-    [NEW]     Proxy fallback on CurlError proxy failure (same pattern as Bing).
-    """
     params = {
         "p":  dork,
         "b":  (page - 1) * 10 + 1,
@@ -915,7 +903,6 @@ async def fetch_page_yahoo(
         "vl": "lang_en",
     }
 
-    # [NEW] Proxy fallback tracking
     active_session   = session
     fallback_session = None
 
@@ -989,7 +976,6 @@ async def fetch_page_yahoo(
                 await asyncio.sleep(backoff)
 
             except CurlError as exc:
-                # [NEW] Proxy fallback on proxy-type CurlError
                 if _is_proxy_error(exc) and PROXY_ENABLED and len(_proxy_pool) > 1 and attempt < MAX_RETRIES - 1:
                     cur_proxy = getattr(active_session, "_cur_proxy", None)
                     log.warning(
@@ -1014,31 +1000,21 @@ async def fetch_page_yahoo(
         return [], True
 
     finally:
-        # [NEW] Close fallback session; preserve original chunk session.
         if fallback_session is not None:
             await fallback_session.close()
 
 
 # ─── DUCKDUCKGO PAGE FETCH ────────────────────────────────────────────────────
-# [NEW] DuckDuckGo HTML endpoint — POST-based, no JavaScript, no API key needed
 async def fetch_page_duckduckgo(
     session: AsyncSession,
     dork: str, page: int, max_res: int,
     chunk_id: int = 0,
 ) -> tuple:
-    """
-    Fetch results from DuckDuckGo's HTML endpoint.
-    DDG HTML does not support deep pagination; only page 1 is reliable.
-    Uses POST to html.duckduckgo.com/html/.
-    [NEW] Proxy fallback on CurlError proxy failure (same pattern as Bing/Yahoo).
-    """
     if page > 1:
-        return [], False   # DDG HTML doesn't paginate reliably past page 1
+        return [], False
 
-    # DDG pagination: 's' param (0 = page1, 30 = page2, etc.) — attempt if page > 1 skipped
     data = {"q": dork, "b": "", "kl": "us-en", "df": ""}
 
-    # [NEW] Proxy fallback tracking
     active_session   = session
     fallback_session = None
 
@@ -1094,7 +1070,6 @@ async def fetch_page_duckduckgo(
                 await asyncio.sleep(backoff)
 
             except CurlError as exc:
-                # [NEW] Proxy fallback on proxy-type CurlError
                 if _is_proxy_error(exc) and PROXY_ENABLED and len(_proxy_pool) > 1 and attempt < MAX_RETRIES - 1:
                     cur_proxy = getattr(active_session, "_cur_proxy", None)
                     log.warning(
@@ -1119,26 +1094,19 @@ async def fetch_page_duckduckgo(
         return [], True
 
     finally:
-        # [NEW] Close fallback session; preserve original chunk session.
         if fallback_session is not None:
             await fallback_session.close()
 
 
 # ─── FETCH ALL PAGES (Parallel) ───────────────────────────────────────────────
-# [CHANGED] Uses asyncio.gather to fetch multiple pages concurrently per dork
 async def fetch_all_pages(
     session: AsyncSession,
     dork: str, engine: str,
     pages: list, max_res: int,
     chunk_id: int = 0,
 ) -> tuple:
-    """
-    [CHANGED] Fetches all pages for a dork concurrently using asyncio.gather.
-    Pages are staggered with small random delays to avoid synchronized bursts.
-    DDG only supports page 1 reliably; additional pages are skipped for it.
-    """
     if engine == "duckduckgo":
-        sorted_pages = [min(pages)]   # DDG: only first page
+        sorted_pages = [min(pages)]
     else:
         sorted_pages = sorted(pages)
 
@@ -1148,11 +1116,10 @@ async def fetch_all_pages(
         "duckduckgo": fetch_page_duckduckgo,
     }[engine]
 
-    # [NEW] Stagger concurrent page requests (0.1–0.4s per page index) to
-    # avoid hammering the server with fully-simultaneous requests
+    # [CHANGED] Stagger concurrent page requests with more human‑like delays (0.2–0.6s per index)
     async def _fetch_with_stagger(page: int, idx: int) -> tuple:
         if idx > 0:
-            await asyncio.sleep(random.uniform(0.1, 0.4) * idx)
+            await asyncio.sleep(random.uniform(0.2, 0.6) * idx)
         return await fetch_fn(session, dork, page, max_res, chunk_id)
 
     tasks   = [_fetch_with_stagger(p, i) for i, p in enumerate(sorted_pages)]
@@ -1173,6 +1140,7 @@ async def fetch_all_pages(
 
 
 # ─── WORKER ───────────────────────────────────────────────────────────────────
+# [CHANGED] Human‑like delay with occasional long pauses
 async def dork_worker(
     wid: int,
     chunk_id: int,
@@ -1186,14 +1154,10 @@ async def dork_worker(
     stop_ev: asyncio.Event,
     slowdown_ev: asyncio.Event,
 ) -> None:
-    """
-    [CHANGED] Dynamic adaptive delay:
-      - After FAST_STREAK_THRESHOLD consecutive successes → fast mode (0.5–1.0s)
-      - On empty/degraded → revert to normal delay + exponential backoff
-    """
     eidx               = wid % len(engines)
     empty_streak       = 0
-    consecutive_hits   = 0   # [NEW] track consecutive successes for fast mode
+    consecutive_hits   = 0
+    request_count      = 0        # [NEW] track total requests for occasional long breaks
 
     while not stop_ev.is_set():
         try:
@@ -1233,12 +1197,12 @@ async def dork_worker(
             await results_q.put((dork, engine, scored, len(raw), degraded_cnt))
 
         queue.task_done()
+        request_count += 1
 
-        # [CHANGED] Dynamic adaptive delay
+        # [CHANGED] Human‑like delay calculation
         if raw:
             consecutive_hits += 1
             empty_streak       = 0
-            # Fast mode after FAST_STREAK_THRESHOLD consecutive hits
             if consecutive_hits >= FAST_STREAK_THRESHOLD:
                 delay = random.uniform(FAST_MIN_DELAY, FAST_MAX_DELAY)
                 log.debug(f"[C{chunk_id}][W{wid}] FAST mode delay={delay:.2f}s (streak={consecutive_hits})")
@@ -1257,6 +1221,12 @@ async def dork_worker(
         if slowdown_ev.is_set():
             delay += random.uniform(2.0, 5.0)
 
+        # [NEW] Occasional long human‑like break (10‑30s every 15‑25 requests)
+        if request_count % random.randint(15, 25) == 0:
+            long_break = random.uniform(10.0, 30.0)
+            log.info(f"[C{chunk_id}][W{wid}] Taking a human‑like break of {long_break:.1f}s")
+            await asyncio.sleep(long_break)
+
         await asyncio.sleep(delay)
 
 
@@ -1274,10 +1244,6 @@ async def run_chunk(
     global_stop_ev: asyncio.Event,
     proxy: str | None = None,
 ) -> dict:
-    """
-    [CHANGED] Accepts an optional per-chunk proxy argument.
-    [CHANGED] Session created via curl_cffi _make_isolated_session.
-    """
     session     = _make_isolated_session(use_tor=use_tor, proxy=proxy)
     queue       = asyncio.Queue(maxsize=len(dorks) * 2)
     results_q   = asyncio.Queue(maxsize=500)
@@ -1391,10 +1357,6 @@ async def run_chunk(
 
 # ─── JOB RUNNER ───────────────────────────────────────────────────────────────
 async def run_dork_job(chat_id: int, dorks: list, context) -> None:
-    """
-    [CHANGED] Passes a randomly assigned proxy per chunk (from pool if available).
-    All existing features (chunking, scoring, filtering, Tor, stop, progress) intact.
-    """
     sess      = get_session(chat_id)
     engines   = sess.get("engines", list(ENGINES))
     workers_n = min(sess.get("workers", WORKERS_PER_CHUNK), MAX_WORKERS_PER_CHUNK)
@@ -1429,7 +1391,6 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
     tmp_file.write(f"# Filter : SQL ≥{min_score} | Chunks: {actual_chunks}\n")
     tmp_file.close()
 
-    # [CHANGED] Show PROXY_ENABLED state in job status header
     if use_tor:
         proxy_info = "🧅 TOR"
     elif PROXY_ENABLED and _proxy_pool:
@@ -1522,8 +1483,6 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
     status_task  = asyncio.create_task(_status_updater())
     timeout_task = asyncio.create_task(_job_timeout())
 
-    # [CHANGED] Each chunk gets a randomly assigned proxy from the pool.
-    # When PROXY_ENABLED is False, _get_random_proxy returns None for all chunks.
     chunk_proxies = [_get_random_proxy() if not use_tor else None for _ in range(actual_chunks)]
 
     chunk_results = []
@@ -1569,7 +1528,6 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
         active_jobs.pop(chat_id, None)
         active_stop_evs.pop(chat_id, None)
 
-    # ── Merge + global deduplication ─────────────────────────────────────────
     seen_urls    : set  = set()
     all_scored   : list = []
     total_raw        = 0
@@ -1709,7 +1667,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("📖 Help",         callback_data="m_help")],
     ]
 
-    # [CHANGED] Show proxy status with PROXY_ENABLED state
     if PROXY_ENABLED and _proxy_pool:
         proxy_status = f"🔄 {len(_proxy_pool)} proxies loaded (enabled)"
     elif not PROXY_ENABLED and _proxy_pool:
@@ -1723,7 +1680,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔒 Chrome110 TLS fingerprint spoofing\n"
         "⚡ Parallel page fetching per dork\n"
         "🔄 Full browser header rotation\n"
-        "📈 Dynamic adaptive delay (fast/slow mode)\n"
+        "📈 Human‑like adaptive delay (fast/slow mode)\n"
         "🔍 Bing + Yahoo + DuckDuckGo engines\n"
         "🛡 SQL filter | Auto-slowdown | CAPTCHA hook\n"
         f"{proxy_status}\n\n"
@@ -1731,14 +1688,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /dork <q>   — single dork\n"
         "  /clean      — URL list cleaner mode\n"
         "  /pages      — pick pages 1-70\n"
-        "  /workers N  — workers per chunk (1-20)\n"
+        "  /workers N  — workers per chunk (1-100)\n"
         "  /chunks N   — parallel chunk count (1-8)\n"
         "  /engine X   — bing|yahoo|duckduckgo|all\n"
         "  /tor        — toggle Tor IP rotation\n"
         "  /filter N   — SQL score filter (0-100)\n"
         "  /stop       — stop & get partial results\n"
         "  Upload .txt — auto-detected (URLs or dorks)\n\n"
-        "🔄 Proxy Commands:\n"                                   # [NEW]
+        "🔄 Proxy Commands:\n"
         "  /addproxy <url>    — add proxy to pool\n"
         "  /removeproxy [i|url] — remove by index or URL\n"
         "  /proxylist         — view all proxies\n"
@@ -1834,7 +1791,6 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     s       = get_session(chat_id)
 
-    # [CHANGED] Show full proxy status including PROXY_ENABLED flag
     if PROXY_ENABLED and _proxy_pool:
         proxy_line = f"🔄 Proxies  : {len(_proxy_pool)} in pool (enabled)\n"
     elif not PROXY_ENABLED and _proxy_pool:
@@ -1859,7 +1815,7 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"/workers N | /chunks N | /maxres N\n"
         f"/engine X  | /filter N\n"
         f"/pages     | /tor\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"          # [NEW] proxy commands section
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🔄 Proxy Management:\n"
         f"/addproxy <url>      — add to pool\n"
         f"/removeproxy [i|url] — remove from pool\n"
@@ -1973,15 +1929,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def cmd_addproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    [NEW] /addproxy <proxy_url>
-    Add a new proxy to the in-memory pool and persist to proxies.txt.
-
-    Accepted formats:
-      /addproxy socks5://user:pass@host:port
-      /addproxy http://host:port
-      /addproxy https://host:port
-    """
     if not context.args:
         await update.message.reply_text(
             "➕ ADD PROXY\n"
@@ -1997,7 +1944,6 @@ async def cmd_addproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     proxy_url = context.args[0].strip()
 
-    # Validate format
     if not _validate_proxy_url(proxy_url):
         await update.message.reply_text(
             "❌ Invalid proxy format.\n\n"
@@ -2009,7 +1955,6 @@ async def cmd_addproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Check for duplicate
     if proxy_url in _proxy_pool:
         await update.message.reply_text(
             f"⚠️ Proxy already in pool.\n"
@@ -2018,7 +1963,6 @@ async def cmd_addproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Add to in-memory pool and persist
     async with _proxy_pool_lock:
         _proxy_pool.append(proxy_url)
         _persist_proxies()
@@ -2041,12 +1985,6 @@ async def cmd_addproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_removeproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    [NEW] /removeproxy [index | proxy_url]
-    Remove a proxy from the pool by its 1-based index or exact URL.
-    With no argument, show the numbered list of current proxies.
-    """
-    # No argument → show numbered list for reference
     if not context.args:
         if not _proxy_pool:
             await update.message.reply_text(
@@ -2067,7 +2005,6 @@ async def cmd_removeproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     arg = context.args[0].strip()
 
     async with _proxy_pool_lock:
-        # Try removal by integer index (1-based)
         try:
             idx = int(arg) - 1
             if idx < 0 or idx >= len(_proxy_pool):
@@ -2091,9 +2028,8 @@ async def cmd_removeproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         except ValueError:
-            pass  # not an integer — try URL match
+            pass
 
-        # Try removal by exact URL
         if arg in _proxy_pool:
             _proxy_pool.remove(arg)
             _persist_proxies()
@@ -2117,13 +2053,7 @@ async def cmd_removeproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_proxylist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    [NEW] /proxylist
-    Display all proxies currently in the pool with their index, protocol, host,
-    and port. No status indicators or test results — just the list.
-    """
     if not _proxy_pool:
-        # [CHANGED] Show PROXY_ENABLED status even when pool is empty
         enabled_note = "" if PROXY_ENABLED else "\n⚠️ Note: PROXY_ENABLED=false — proxies are globally disabled."
         await update.message.reply_text(
             f"📭 Proxy pool is empty.{enabled_note}\n\n"
@@ -2153,12 +2083,6 @@ async def cmd_proxylist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_testproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    [NEW] /testproxy <proxy_url>
-    Manually test a proxy by making a lightweight GET request to httpbin.org/ip
-    (or ipinfo.io/ip as fallback). Reports success/failure, latency, and
-    the external IP the proxy presents. No automatic testing — manual only.
-    """
     if not context.args:
         await update.message.reply_text(
             "🧪 TEST PROXY\n"
@@ -2198,7 +2122,6 @@ async def cmd_testproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ext_ip     = None
     error_msg  = None
 
-    # [NEW] Create an isolated test session for this proxy only
     test_session = AsyncSession(
         impersonate="chrome110",
         verify=False,
@@ -2219,13 +2142,12 @@ async def cmd_testproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 if resp.status_code == 200:
                     raw_text = resp.text.strip()
-                    # Try to parse JSON from httpbin {"origin": "x.x.x.x"}
                     import json as _json
                     try:
                         data   = _json.loads(raw_text)
                         ext_ip = data.get("origin") or data.get("ip") or raw_text
                     except Exception:
-                        ext_ip = raw_text[:50]   # plain text IP from ipinfo/ipify
+                        ext_ip = raw_text[:50]
                     success = True
                     break
                 else:
@@ -2254,7 +2176,6 @@ async def cmd_testproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🌍 External IP: {ext_ip}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
         )
-        # Suggest adding if not already in pool
         if proxy_url not in _proxy_pool:
             result_text += "➕ Not in pool yet — use /addproxy to add it."
         else:
@@ -2405,7 +2326,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    # [CHANGED] Updated inline help and settings to include proxy commands
     replies = {
         "m_bulk":     "📂 Upload a .txt file — URLs or dorks (auto-detected). No limit!",
         "m_single":   "🔍 /dork inurl:login.php?id=\nSet pages with /pages",
@@ -2427,7 +2347,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Pages:{','.join(str(p) for p in sess.get('pages', [1]))} "
             f"Engines:{'+'.join(e.upper() for e in sess.get('engines', ENGINES))} "
             f"Score≥{sess.get('min_score', 30)} Tor:{'ON' if sess.get('tor') else 'OFF'} "
-            f"Proxies:{len(_proxy_pool)}({'on' if PROXY_ENABLED else 'off'})"  # [NEW]
+            f"Proxies:{len(_proxy_pool)}({'on' if PROXY_ENABLED else 'off'})"
         ),
         "m_help": (
             "📖 COMMANDS\n━━━━━━━━━━━━━━━━━━━\n"
@@ -2435,7 +2355,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/clean            — URL list cleaner info\n"
             "/pages            — page selector (1-70)\n"
             "/chunks N         — parallel sessions (1-8)\n"
-            "/workers N        — workers per chunk (1-20)\n"
+            "/workers N        — workers per chunk (1-100)\n"
             "/tor              — toggle Tor rotation\n"
             "/engine X         — bing|yahoo|duckduckgo|all\n"
             "/filter N         — SQL score (0-100)\n"
@@ -2444,7 +2364,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/stop             — stop & get partial results\n"
             "/status           — job status\n"
             "━━━━━━━━━━━━━━━━━━━\n"
-            "🔄 Proxy:\n"                                                         # [NEW]
+            "🔄 Proxy:\n"
             "/addproxy <url>   — add proxy to pool\n"
             "/removeproxy [i]  — remove by index or URL\n"
             "/proxylist        — view all proxies\n"
@@ -2474,7 +2394,6 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # ── Core command registrations (unchanged) ──────────────────────────────
     for name, handler in [
         ("start",    cmd_start),
         ("help",     cmd_settings),
@@ -2493,7 +2412,6 @@ def main():
     ]:
         app.add_handler(CommandHandler(name, handler))
 
-    # ── [NEW] Proxy management command registrations ─────────────────────────
     for name, handler in [
         ("addproxy",    cmd_addproxy),
         ("removeproxy", cmd_removeproxy),
@@ -2512,7 +2430,7 @@ def main():
 
     log.info("=" * 60)
     log.info("  DORK PARSER v18.1 — STEALTH PARALLEL ARCHITECTURE")
-    log.info(f"  Chunks: {N_CHUNKS} | Workers/chunk: {WORKERS_PER_CHUNK}")
+    log.info(f"  Chunks: {N_CHUNKS} | Workers/chunk: {WORKERS_PER_CHUNK} (max {MAX_WORKERS_PER_CHUNK})")
     log.info(f"  Delay: {MIN_DELAY}–{MAX_DELAY}s | Fast: {FAST_MIN_DELAY}–{FAST_MAX_DELAY}s")
     log.info(f"  TLS: Chrome110 fingerprint")
     log.info(f"  Proxies: {len(_proxy_pool)} loaded | PROXY_ENABLED={PROXY_ENABLED}")
