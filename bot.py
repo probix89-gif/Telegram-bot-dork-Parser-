@@ -16,6 +16,7 @@ import asyncio
 import random
 import re
 import os
+import sys
 import time
 import logging
 import tempfile
@@ -44,14 +45,14 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(message)s",
     handlers=[
         logging.FileHandler(log_file),
-        logging.StreamHandler()
+        logging.StreamHandler(sys.stdout)   # Force console output for GitHub Actions
     ]
 )
 log = logging.getLogger(__name__)
 
 # ─── CONFIGURATION ──────────────────────────────────────────────────────────
 BOT_TOKEN             = os.environ.get("BOT_TOKEN", "")
-N_CHUNKS              = int(os.environ.get("N_CHUNKS", 2))          # now ignored (sequential batches)
+N_CHUNKS              = int(os.environ.get("N_CHUNKS", 2))          # ignored in burst mode
 WORKERS_PER_CHUNK     = int(os.environ.get("WORKERS_PER_CHUNK", 8))
 MAX_WORKERS_PER_CHUNK = 100
 MIN_DELAY             = float(os.environ.get("MIN_DELAY", 2.0))
@@ -64,8 +65,7 @@ TOR_PROXY             = os.environ.get("TOR_PROXY", "socks5://127.0.0.1:9050")
 OUTPUT_DIR            = Path("results")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# [NEW] Burst Mode constant
-BURST_SIZE = 100
+BURST_SIZE = 100  # dorks per batch
 
 ENGINES   = ["bing", "yahoo", "duckduckgo"]
 MAX_PAGES = 70
@@ -77,11 +77,11 @@ MAX_RETRIES          = 3
 CHUNK_STALL_TIMEOUT  = 60.0
 EMPTY_RATE_SLOWDOWN  = 0.50
 EMPTY_RATE_RECOVER   = 0.30
-CHUNK_STAGGER_DELAY  = (0.8, 2.5)   # still used between batches for breathing room
+CHUNK_STAGGER_DELAY  = (0.8, 2.5)
 
 DEFAULT_SESSION = {
     "workers":     WORKERS_PER_CHUNK,
-    "chunks":      N_CHUNKS,          # kept for compatibility, but not used for parallelization
+    "chunks":      N_CHUNKS,
     "engines":     list(ENGINES),
     "max_results": MAX_RESULTS,
     "pages":       [1],
@@ -91,11 +91,11 @@ DEFAULT_SESSION = {
 
 user_sessions:   dict = {}
 active_jobs:     dict = {}
-active_stop_evs: dict = {}   # chat_id → global_stop_ev for graceful /stop
+active_stop_evs: dict = {}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ─── PROXY MANAGEMENT (v18.1 ENHANCED) ───────────────────────────────────────
+# ─── PROXY MANAGEMENT ────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
 PROXY_ENABLED: bool = os.environ.get("PROXY_ENABLED", "true").lower() not in ("false", "0", "no")
@@ -172,9 +172,9 @@ def _is_proxy_error(exc: Exception) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ─── TOR ROTATION ────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
-
-# ─── TOR ROTATION ───────────────────────────────────────────────────────────
 _tor_rotation_task = None
 tor_enabled_users  = 0
 
@@ -482,7 +482,7 @@ async def run_url_clean_job(chat_id: int, raw_lines: list, context) -> None:
     active_jobs.pop(chat_id, None)
 
 
-# ─── BROWSER PROFILES (Full header sets) ────────────────────────────────────
+# ─── BROWSER PROFILES ────────────────────────────────────────────────────────
 BROWSER_PROFILES = [
     {   # Chrome 110 / Windows
         "User-Agent":                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
@@ -554,7 +554,7 @@ def _random_headers() -> dict:
     return dict(random.choice(BROWSER_PROFILES))
 
 
-# ─── SESSION FACTORY (curl_cffi) ─────────────────────────────────────────────
+# ─── SESSION FACTORY ─────────────────────────────────────────────────────────
 def _make_isolated_session(use_tor: bool = False, proxy: str | None = None) -> AsyncSession:
     chosen_proxy = None
     if use_tor:
@@ -582,7 +582,7 @@ def _make_fallback_session(exclude_proxy: str | None = None) -> AsyncSession:
     return _make_isolated_session(proxy=fb_proxy)
 
 
-# ─── CAPTCHA HANDLING PLACEHOLDER ────────────────────────────────────────────
+# ─── CAPTCHA HANDLING ────────────────────────────────────────────────────────
 async def _on_captcha_detected(engine: str, chunk_id: int, session_proxy: str | None) -> None:
     log.warning(f"[C{chunk_id}][{engine.upper()}] 🔴 CAPTCHA detected!")
     if session_proxy:
@@ -617,7 +617,7 @@ def _is_captcha(html: str) -> bool:
     return bool(_CAPTCHA_RE.search(html[:4096]))
 
 
-# ─── ROBUST HTML LINK EXTRACTOR ──────────────────────────────────────────────
+# ─── LINK EXTRACTORS ─────────────────────────────────────────────────────────
 class _LinkExtractor(HTMLParser):
     __slots__ = ("links", "_in_cite", "_buf")
     def __init__(self):
@@ -672,7 +672,7 @@ _YAHOO_RU_PATH = re.compile(r"/RU=([^/&]+)")
 _DDG_NOISE     = re.compile(r"duckduckgo\.com|duck\.com", re.IGNORECASE)
 
 
-# ─── BING PAGE FETCH ─────────────────────────────────────────────────────────
+# ─── BING FETCH ──────────────────────────────────────────────────────────────
 async def fetch_page_bing(session: AsyncSession, dork: str, page: int, max_res: int, chunk_id: int = 0) -> tuple:
     params = {
         "q":       dork,
@@ -759,7 +759,7 @@ async def fetch_page_bing(session: AsyncSession, dork: str, page: int, max_res: 
             await fallback_session.close()
 
 
-# ─── YAHOO PAGE FETCH ────────────────────────────────────────────────────────
+# ─── YAHOO FETCH ─────────────────────────────────────────────────────────────
 async def fetch_page_yahoo(session: AsyncSession, dork: str, page: int, max_res: int, chunk_id: int = 0) -> tuple:
     params = {
         "p":  dork,
@@ -866,7 +866,7 @@ async def fetch_page_yahoo(session: AsyncSession, dork: str, page: int, max_res:
             await fallback_session.close()
 
 
-# ─── DUCKDUCKGO PAGE FETCH ────────────────────────────────────────────────────
+# ─── DUCKDUCKGO FETCH ────────────────────────────────────────────────────────
 async def fetch_page_duckduckgo(session: AsyncSession, dork: str, page: int, max_res: int, chunk_id: int = 0) -> tuple:
     if page > 1:
         return [], False
@@ -1069,7 +1069,7 @@ async def dork_worker(
         await asyncio.sleep(delay)
 
 
-# ─── CHUNK RUNNER ─────────────────────────────────────────────────────────────
+# ─── CHUNK RUNNER (now used for a single batch) ──────────────────────────────
 async def run_chunk(
     chunk_id: int,
     dorks: list,
@@ -1081,11 +1081,8 @@ async def run_chunk(
     workers_n: int,
     progress_q: asyncio.Queue,
     global_stop_ev: asyncio.Event,
-    session: AsyncSession = None,          # [NEW] external session passed in
+    session: AsyncSession,
 ) -> dict:
-    """
-    Runs a single chunk (one batch). Uses the provided session.
-    """
     queue = asyncio.Queue(maxsize=len(dorks) * 2)
     results_q = asyncio.Queue(maxsize=500)
     stop_ev = asyncio.Event()
@@ -1156,6 +1153,7 @@ async def run_chunk(
                     "total": total,
                     "raw": raw_cnt,
                     "kept": len(scored),
+                    "scored": scored,   # pass through for global dedup
                 })
             except asyncio.QueueFull:
                 pass
@@ -1206,14 +1204,13 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
     pages_str = ", ".join(str(p) for p in pages)
     start_time = time.time()
 
-    # [NEW] Split dorks into sequential batches of BURST_SIZE
+    # Split into sequential batches
     batches = [dorks[i:i+BURST_SIZE] for i in range(0, total_dorks, BURST_SIZE)]
     total_batches = len(batches)
 
     log.info(
         f"[JOB][{chat_id}] Burst Mode: {total_dorks} dorks → "
-        f"{total_batches} batches of ≤{BURST_SIZE} | {workers_n} workers/batch | "
-        f"delay={MIN_DELAY}–{MAX_DELAY}s (fast={FAST_MIN_DELAY}–{FAST_MAX_DELAY}s)"
+        f"{total_batches} batches of ≤{BURST_SIZE} | {workers_n} workers/batch"
     )
 
     tmp_file = tempfile.NamedTemporaryFile(
@@ -1232,7 +1229,7 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
     elif PROXY_ENABLED and _proxy_pool:
         proxy_info = f"🔄 {len(_proxy_pool)} proxies (fresh session per batch)"
     elif not PROXY_ENABLED and _proxy_pool:
-        proxy_info = f"⏸ Proxy disabled ({len(_proxy_pool)} loaded, PROXY_ENABLED=false)"
+        proxy_info = f"⏸ Proxy disabled ({len(_proxy_pool)} loaded)"
     else:
         proxy_info = "🔓 Direct (no proxy)"
 
@@ -1263,7 +1260,6 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
     total_processed = 0
 
     last_edit = time.time()
-    batch_start_times = []
 
     async def _status_updater() -> None:
         nonlocal last_edit
@@ -1272,7 +1268,6 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
             while True:
                 try:
                     ev = progress_q.get_nowait()
-                    # Update accumulators
                     total_processed += 1
                     total_raw += ev["raw"]
                     for sc, url in ev.get("scored", []):
@@ -1332,7 +1327,6 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
             batch_start = time.time()
 
             try:
-                # Run batch as a single chunk
                 result = await run_chunk(
                     chunk_id=batch_idx - 1,
                     dorks=batch_dorks,
@@ -1354,8 +1348,7 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
                 log.error(f"[JOB][{chat_id}] Batch {batch_idx} raised: {result}")
                 continue
 
-            # Add scored URLs directly to master list via progress queue?
-            # Actually we already collected them via progress_q, but let's also merge
+            # Merge results (already done via progress_q, but also here for safety)
             for sc, url in result["scored"]:
                 if url not in seen_urls:
                     seen_urls.add(url)
@@ -1366,7 +1359,6 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
             batch_elapsed = int(time.time() - batch_start)
             log.info(f"[JOB][{chat_id}] Batch {batch_idx} completed in {batch_elapsed}s")
 
-            # Small breathing room between batches
             if batch_idx < total_batches and not global_stop_ev.is_set():
                 stagger = random.uniform(*CHUNK_STAGGER_DELAY)
                 log.info(f"[JOB][{chat_id}] Pausing {stagger:.1f}s before next batch")
@@ -1384,7 +1376,6 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
         active_jobs.pop(chat_id, None)
         active_stop_evs.pop(chat_id, None)
 
-    # Sort final unique URLs
     all_scored.sort(reverse=True)
     unique_cnt = len(all_scored)
     elapsed = int(time.time() - start_time)
@@ -1392,8 +1383,7 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
 
     log.info(
         f"[JOB][{chat_id}] COMPLETE — dorks={total_dorks} raw={total_raw} "
-        f"unique={unique_cnt} degraded={total_degraded} elapsed={elapsed}s "
-        f"success_rate={success_rate:.1%}"
+        f"unique={unique_cnt} degraded={total_degraded} elapsed={elapsed}s"
     )
 
     high   = [(sc, u) for sc, u in all_scored if sc >= 70]
@@ -1488,7 +1478,7 @@ def page_keyboard(selected: list) -> InlineKeyboardMarkup:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ─── COMMAND HANDLERS (unchanged except start message update) ────────────────
+# ─── COMMAND HANDLERS ────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1540,8 +1530,498 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(kb),
     )
 
-# (All other command handlers remain identical to v18.1; omitted for brevity but included in full code)
-# ... include all other handlers: cmd_dork, cmd_pages, cmd_tor, cmd_filter, cmd_settings, cmd_workers, cmd_chunks, cmd_maxres, cmd_engine, cmd_clean, cmd_stop, cmd_status, proxy commands, handle_document, handle_text, handle_callback, main.
+async def cmd_dork(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not context.args:
+        await update.message.reply_text("Usage: /dork inurl:login.php?id=")
+        return
+    if chat_id in active_jobs and not active_jobs[chat_id].done():
+        await update.message.reply_text("⚠️ Job running! Use /stop first.")
+        return
+    dork = " ".join(context.args)
+    s = get_session(chat_id)
+    await update.message.reply_text(
+        f"🔍 {dork[:60]}\n"
+        f"📄 Pages: {', '.join(str(p) for p in s.get('pages', [1]))}"
+        f"{'  🧅TOR' if s.get('tor') else ''}"
+    )
+    active_jobs[chat_id] = asyncio.create_task(run_dork_job(chat_id, [dork], context))
 
-# For brevity in this response, the full code includes all unchanged handlers from v18.1.
-# The complete working code is provided in the final answer.
+async def cmd_pages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    selected = get_session(chat_id).get("pages", [1])
+    await update.message.reply_text(
+        f"📄 SELECT PAGES (1–70)\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Selected: {', '.join(str(p) for p in selected)}\n"
+        f"Tap to toggle, then Confirm.",
+        reply_markup=page_keyboard(selected),
+    )
+
+async def cmd_tor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global tor_enabled_users
+    chat_id = update.effective_chat.id
+    sess = get_session(chat_id)
+
+    if context.args and context.args[0].lower() in ("on", "off"):
+        new_val = context.args[0].lower() == "on"
+    else:
+        new_val = not sess.get("tor", False)
+
+    old_val = sess.get("tor", False)
+    sess["tor"] = new_val
+
+    if new_val and not old_val:
+        tor_enabled_users += 1
+        if tor_enabled_users == 1:
+            start_tor_rotation()
+        await update.message.reply_text(
+            "🧅 TOR ENABLED\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Tor IP will rotate every 2 minutes.\n"
+            "Make sure Tor is running:\n"
+            "  sudo apt install tor && sudo service tor start\n\n"
+            "⚠️ Speed will be slower."
+        )
+    elif not new_val and old_val:
+        tor_enabled_users = max(0, tor_enabled_users - 1)
+        if tor_enabled_users == 0:
+            stop_tor_rotation()
+        await update.message.reply_text("🔓 TOR DISABLED — Direct connection.")
+    else:
+        await update.message.reply_text(f"Tor is already {'ON' if new_val else 'OFF'}.")
+
+async def cmd_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    sess = get_session(chat_id)
+    try:
+        n = max(0, min(int(context.args[0]), 100))
+        sess["min_score"] = n
+        label = "🟥 High only" if n >= 70 else "🟧 Medium+" if n >= 40 else "🟨 All URLs"
+        await update.message.reply_text(f"🛡 SQL Filter: ≥{n} ({label})")
+    except Exception:
+        cur = sess.get("min_score", 30)
+        await update.message.reply_text(
+            f"Usage: /filter N (0-100)\nCurrent: {cur}\n\n"
+            f"🟥 70+ = high (likely SQLi)\n"
+            f"🟧 40+ = medium (default 30)\n"
+            f"🟨 0   = accept all"
+        )
+
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    s = get_session(chat_id)
+
+    if PROXY_ENABLED and _proxy_pool:
+        proxy_line = f"🔄 Proxies  : {len(_proxy_pool)} in pool (enabled)\n"
+    elif not PROXY_ENABLED and _proxy_pool:
+        proxy_line = f"⏸ Proxies  : {len(_proxy_pool)} loaded but DISABLED\n"
+    else:
+        proxy_line = "🔓 Proxies  : none loaded\n"
+
+    await update.message.reply_text(
+        f"⚙️ SETTINGS\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚡ Batches  : {BURST_SIZE} dorks each (sequential)\n"
+        f"🔧 Workers  : {s.get('workers', WORKERS_PER_CHUNK)}/batch (max {MAX_WORKERS_PER_CHUNK})\n"
+        f"📄 Pages    : {', '.join(str(p) for p in s.get('pages', [1]))} (1–70)\n"
+        f"🔍 Engines  : {'+'.join(e.upper() for e in s.get('engines', ENGINES))}\n"
+        f"📊 Max/Page : {s.get('max_results', MAX_RESULTS)}\n"
+        f"🛡 SQL ≥    : {s.get('min_score', 30)}\n"
+        f"🧅 Tor      : {'ON' if s.get('tor') else 'OFF'}\n"
+        f"⏱ Delay    : {MIN_DELAY}–{MAX_DELAY}s | Fast: {FAST_MIN_DELAY}–{FAST_MAX_DELAY}s\n"
+        f"🔒 TLS      : Chrome110 fingerprint\n"
+        f"{proxy_line}"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"/workers N | /maxres N | /engine X\n"
+        f"/filter N | /pages | /tor\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔄 Proxy Management:\n"
+        f"/addproxy <url>      — add to pool\n"
+        f"/removeproxy [i|url] — remove from pool\n"
+        f"/proxylist           — view pool\n"
+        f"/testproxy <url>     — test a proxy"
+    )
+
+async def cmd_workers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    try:
+        n = max(1, min(int(context.args[0]), MAX_WORKERS_PER_CHUNK))
+        get_session(chat_id)["workers"] = n
+        await update.message.reply_text(f"✅ Workers per batch: {n} (max {MAX_WORKERS_PER_CHUNK})")
+    except Exception:
+        await update.message.reply_text(f"Usage: /workers N (1-{MAX_WORKERS_PER_CHUNK})")
+
+async def cmd_chunks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "ℹ️ Burst Mode uses fixed batch size of 100 dorks.\n"
+        "Use /workers to control concurrency inside each batch."
+    )
+
+async def cmd_maxres(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    try:
+        n = max(1, min(int(context.args[0]), 50))
+        get_session(chat_id)["max_results"] = n
+        await update.message.reply_text(f"✅ Max/page: {n}")
+    except Exception:
+        await update.message.reply_text("Usage: /maxres N (1-50)")
+
+async def cmd_engine(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    try:
+        choice = context.args[0].lower()
+        engine_map = {
+            "bing": ["bing"],
+            "yahoo": ["yahoo"],
+            "duckduckgo": ["duckduckgo"],
+            "ddg": ["duckduckgo"],
+            "all": list(ENGINES),
+            "both": ["bing", "yahoo"],
+        }
+        engines = engine_map.get(choice, list(ENGINES))
+        get_session(chat_id)["engines"] = engines
+        await update.message.reply_text(f"✅ Engines: {'+'.join(e.upper() for e in engines)}")
+    except Exception:
+        await update.message.reply_text("Usage: /engine bing|yahoo|duckduckgo|ddg|all|both")
+
+async def cmd_clean(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🧹 URL CLEANER MODE\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Upload a .txt file containing one URL per line.\n"
+        "The bot will automatically detect it as a URL list and apply:\n\n"
+        "  🚫 Blocked domain filter (major platforms + custom list)\n"
+        "  🔗 Keep only URLs with query parameters (?param=value)\n"
+        "  📏 Remove URLs longer than 200 characters\n"
+        "  ❌ Remove invalid/malformed URLs\n"
+        "  🔁 Remove duplicates\n\n"
+        "📁 Results saved to cleaned_urls.txt and sent back to you.\n"
+        "⏹ Use /stop anytime — partial results will be returned.\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Just upload your .txt file now ↑"
+    )
+
+async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    stop_ev = active_stop_evs.get(chat_id)
+    job = active_jobs.get(chat_id)
+
+    if stop_ev and job and not job.done():
+        stop_ev.set()
+        await update.message.reply_text(
+            "⏹ STOP REQUESTED\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Workers are draining...\n"
+            "📦 Partial results will be sent automatically."
+        )
+    elif job and not job.done():
+        job.cancel()
+        active_jobs.pop(chat_id, None)
+        await update.message.reply_text("🛑 Job force-stopped (no partial results available).")
+    else:
+        await update.message.reply_text("💤 No active job to stop.")
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    job = active_jobs.get(chat_id)
+    await update.message.reply_text(
+        "⚡ Job RUNNING" if job and not job.done() else "💤 No active job"
+    )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ─── PROXY MANAGEMENT COMMANDS ───────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def cmd_addproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "➕ ADD PROXY\n━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Usage: /addproxy <proxy_url>\n\n"
+            "Formats:\n  socks5://user:pass@host:port\n  http://host:port\n  https://host:port\n\n"
+            f"Current pool size: {len(_proxy_pool)}"
+        )
+        return
+
+    proxy_url = context.args[0].strip()
+    if not _validate_proxy_url(proxy_url):
+        await update.message.reply_text("❌ Invalid proxy format.")
+        return
+
+    if proxy_url in _proxy_pool:
+        await update.message.reply_text(f"⚠️ Proxy already in pool.")
+        return
+
+    async with _proxy_pool_lock:
+        _proxy_pool.append(proxy_url)
+        _persist_proxies()
+
+    info = _parse_proxy_info(proxy_url)
+    log.info(f"[PROXY] Added: {proxy_url}")
+    await update.message.reply_text(
+        f"✅ PROXY ADDED\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔌 Protocol : {info['protocol']}\n"
+        f"🌐 Host     : {info['host']}:{info['port']}\n"
+        f"🔐 Auth     : {'Yes' if info['auth'] else 'No'}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n📦 Pool size: {len(_proxy_pool)}"
+    )
+
+async def cmd_removeproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        if not _proxy_pool:
+            await update.message.reply_text("📭 Proxy pool is empty.")
+            return
+        lines = ["📋 PROXY POOL\n━━━━━━━━━━━━━━━━━━━━━━"]
+        for i, p in enumerate(_proxy_pool, start=1):
+            info = _parse_proxy_info(p)
+            lines.append(f"{i}. [{info['protocol']}] {info['host']}:{info['port']}")
+        lines.append("Usage: /removeproxy <index> or <url>")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    arg = context.args[0].strip()
+    async with _proxy_pool_lock:
+        try:
+            idx = int(arg) - 1
+            if idx < 0 or idx >= len(_proxy_pool):
+                await update.message.reply_text("❌ Index out of range.")
+                return
+            removed = _proxy_pool.pop(idx)
+            _persist_proxies()
+            info = _parse_proxy_info(removed)
+            await update.message.reply_text(f"🗑 Removed: [{info['protocol']}] {info['host']}:{info['port']}")
+            return
+        except ValueError:
+            pass
+        if arg in _proxy_pool:
+            _proxy_pool.remove(arg)
+            _persist_proxies()
+            await update.message.reply_text(f"🗑 Removed by URL.")
+        else:
+            await update.message.reply_text("❌ Proxy not found.")
+
+async def cmd_proxylist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _proxy_pool:
+        await update.message.reply_text("📭 Proxy pool is empty.")
+        return
+    enabled_tag = "✅ ENABLED" if PROXY_ENABLED else "⏸ DISABLED"
+    lines = [f"🔄 PROXY POOL — {len(_proxy_pool)} proxies | {enabled_tag}", "━━━━━━━━━━━━━━━━━━━━━━"]
+    for i, p in enumerate(_proxy_pool, start=1):
+        info = _parse_proxy_info(p)
+        auth_tag = " 🔐" if info["auth"] else ""
+        lines.append(f"{i:>2}. [{info['protocol']:7s}] {info['host']}:{info['port']}{auth_tag}")
+    await update.message.reply_text("\n".join(lines))
+
+async def cmd_testproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /testproxy <proxy_url>")
+        return
+    proxy_url = context.args[0].strip()
+    if not _validate_proxy_url(proxy_url):
+        await update.message.reply_text("❌ Invalid proxy format.")
+        return
+
+    info = _parse_proxy_info(proxy_url)
+    wait_msg = await update.message.reply_text(f"🧪 Testing {info['host']}:{info['port']}...")
+
+    test_urls = ["https://httpbin.org/ip", "https://api.ipify.org"]
+    success = False
+    latency_ms = None
+    ext_ip = None
+    error_msg = None
+
+    test_session = AsyncSession(impersonate="chrome110", verify=False, timeout=15, proxy=proxy_url)
+    try:
+        for test_url in test_urls:
+            try:
+                t0 = time.monotonic()
+                resp = await test_session.get(test_url, headers=_random_headers(), timeout=15)
+                latency_ms = int((time.monotonic() - t0) * 1000)
+                if resp.status_code == 200:
+                    ext_ip = resp.text.strip()
+                    success = True
+                    break
+                else:
+                    error_msg = f"HTTP {resp.status_code}"
+            except Exception as e:
+                error_msg = str(e)[:50]
+    finally:
+        await test_session.close()
+
+    if success:
+        result = f"✅ WORKING\n⏱ {latency_ms}ms\n🌍 IP: {ext_ip}"
+    else:
+        result = f"❌ FAILED\n{error_msg}"
+    await wait_msg.edit_text(f"🧪 Proxy Test Result\n━━━━━━━━━━━━━━━━━━━━━━\n{result}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ─── FILE HANDLERS ───────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _looks_like_url_list(lines: list) -> bool:
+    non_empty = [l for l in lines if l.strip() and not l.startswith("#")]
+    if not non_empty:
+        return False
+    url_lines = sum(1 for l in non_empty if l.strip().startswith("http"))
+    return url_lines / len(non_empty) >= 0.5
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    doc = update.message.document
+    if chat_id in active_jobs and not active_jobs[chat_id].done():
+        await update.message.reply_text("⚠️ Job running! Use /stop first.")
+        return
+    if not doc.file_name.endswith(".txt"):
+        await update.message.reply_text("❌ Send a .txt file.")
+        return
+    await update.message.reply_text("📥 Reading file...")
+    try:
+        content = await (await context.bot.get_file(doc.file_id)).download_as_bytearray()
+        lines = content.decode("utf-8", errors="replace").splitlines()
+        if _looks_like_url_list(lines):
+            raw_urls = [l.strip() for l in lines if l.strip() and not l.startswith("#")]
+            await update.message.reply_text(f"🧹 URL LIST detected — {len(raw_urls)} URLs\n🚀 Running URL Cleaner...")
+            active_jobs[chat_id] = asyncio.create_task(run_url_clean_job(chat_id, raw_urls, context))
+        else:
+            dorks = [l.strip() for l in lines if l.strip() and not l.startswith("#")]
+            if not dorks:
+                await update.message.reply_text("❌ No dorks found.")
+                return
+            s = get_session(chat_id)
+            await update.message.reply_text(
+                f"✅ {len(dorks)} dorks | Pages: {', '.join(str(p) for p in s.get('pages', [1]))}\n🚀 Starting..."
+            )
+            active_jobs[chat_id] = asyncio.create_task(run_dork_job(chat_id, dorks, context))
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Error: {exc}")
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    lines = [l.strip() for l in update.message.text.splitlines() if l.strip() and not l.startswith("#")]
+    if len(lines) > 1:
+        if chat_id in active_jobs and not active_jobs[chat_id].done():
+            await update.message.reply_text("⚠️ Job running! /stop first.")
+            return
+        s = get_session(chat_id)
+        await update.message.reply_text(f"✅ {len(lines)} dorks | Pages: {', '.join(str(p) for p in s.get('pages', [1]))}\n🚀 Starting...")
+        active_jobs[chat_id] = asyncio.create_task(run_dork_job(chat_id, lines, context))
+    else:
+        await update.message.reply_text("Use /dork <q> or upload .txt")
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    chat_id = query.message.chat_id
+    sess = get_session(chat_id)
+
+    if data.startswith("pg_"):
+        cmd = data[3:]
+        selected = list(sess.get("pages", [1]))
+        if cmd == "all":
+            selected = list(range(1, 71))
+        elif cmd == "clear":
+            selected = []
+        elif cmd == "confirm":
+            sess["pages"] = selected or [1]
+            try:
+                await query.edit_message_text(f"✅ Pages: {', '.join(str(p) for p in sorted(sess['pages']))}")
+            except Exception:
+                pass
+            return
+        else:
+            try:
+                p = int(cmd)
+                if p in selected:
+                    selected.remove(p)
+                else:
+                    selected.append(p)
+                selected = sorted(selected)
+            except ValueError:
+                pass
+        sess["pages"] = selected
+        try:
+            await query.edit_message_text(
+                f"📄 SELECT PAGES (1–70)\nSelected: {', '.join(str(p) for p in selected) or 'none'}",
+                reply_markup=page_keyboard(selected),
+            )
+        except Exception:
+            pass
+        return
+
+    replies = {
+        "m_bulk": "📂 Upload a .txt file — URLs or dorks (auto-detected).",
+        "m_single": "🔍 /dork inurl:login.php?id=",
+        "m_tor": f"🧅 Tor is {'ON' if sess.get('tor') else 'OFF'}",
+        "m_filter": f"🛡 SQL Filter ≥{sess.get('min_score', 30)}",
+        "m_clean": "🧹 URL CLEANER — upload URL list .txt",
+        "m_settings": f"⚙️ Workers:{sess.get('workers', WORKERS_PER_CHUNK)} Pages:{sess.get('pages', [1])}",
+        "m_help": "/dork /clean /pages /workers /tor /engine /filter /stop",
+    }
+    if data == "m_pages":
+        await query.message.reply_text(
+            f"📄 SELECT PAGES\nSelected: {', '.join(str(p) for p in sess.get('pages', [1]))}",
+            reply_markup=page_keyboard(sess.get("pages", [1])),
+        )
+    elif data in replies:
+        await query.message.reply_text(replies[data])
+
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+def main():
+    if not BOT_TOKEN:
+        print("❌ ERROR: BOT_TOKEN environment variable is not set.", file=sys.stderr)
+        print("   In GitHub Actions, add it as a secret and pass via 'env:'", file=sys.stderr)
+        sys.exit(1)
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # Core commands
+    app.add_handler(CommandHandler("start",    cmd_start))
+    app.add_handler(CommandHandler("help",     cmd_settings))
+    app.add_handler(CommandHandler("dork",     cmd_dork))
+    app.add_handler(CommandHandler("clean",    cmd_clean))
+    app.add_handler(CommandHandler("pages",    cmd_pages))
+    app.add_handler(CommandHandler("tor",      cmd_tor))
+    app.add_handler(CommandHandler("filter",   cmd_filter))
+    app.add_handler(CommandHandler("settings", cmd_settings))
+    app.add_handler(CommandHandler("workers",  cmd_workers))
+    app.add_handler(CommandHandler("chunks",   cmd_chunks))
+    app.add_handler(CommandHandler("maxres",   cmd_maxres))
+    app.add_handler(CommandHandler("engine",   cmd_engine))
+    app.add_handler(CommandHandler("stop",     cmd_stop))
+    app.add_handler(CommandHandler("status",   cmd_status))
+
+    # Proxy commands
+    app.add_handler(CommandHandler("addproxy",    cmd_addproxy))
+    app.add_handler(CommandHandler("removeproxy", cmd_removeproxy))
+    app.add_handler(CommandHandler("proxylist",   cmd_proxylist))
+    app.add_handler(CommandHandler("testproxy",   cmd_testproxy))
+
+    app.add_handler(MessageHandler(filters.Document.ALL,            handle_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+
+    async def _shutdown():
+        stop_tor_rotation()
+    app.shutdown_handler = _shutdown
+
+    log.info("=" * 60)
+    log.info("  DORK PARSER v19.0 — BURST MODE")
+    log.info(f"  Batches: {BURST_SIZE} dorks each | Workers/batch: {WORKERS_PER_CHUNK} (max {MAX_WORKERS_PER_CHUNK})")
+    log.info(f"  Delay: {MIN_DELAY}–{MAX_DELAY}s | Fast: {FAST_MIN_DELAY}–{FAST_MAX_DELAY}s")
+    log.info(f"  TLS: Chrome110 fingerprint")
+    log.info(f"  Proxies: {len(_proxy_pool)} loaded | PROXY_ENABLED={PROXY_ENABLED}")
+    log.info(f"  Engines: {', '.join(ENGINES)}")
+    log.info("=" * 60)
+
+    try:
+        app.run_polling(drop_pending_updates=True)
+    except Exception as e:
+        log.critical(f"Bot crashed: {e}", exc_info=True)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
