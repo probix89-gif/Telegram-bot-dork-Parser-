@@ -1,15 +1,15 @@
 """
-╔══════════════════════════════════════════════════════════╗
-║   DORK PARSER BOT v18.1 — STEALTH PARALLEL ARCHITECTURE ║
-║   curl_cffi TLS fingerprint spoofing (chrome110)        ║
-║   Parallel page fetching per dork (asyncio.gather)      ║
-║   Full browser header rotation | Dynamic adaptive delay  ║
-║   Proxy rotation (HTTP/SOCKS) | DuckDuckGo engine        ║
-║   CAPTCHA detection hook | DNS caching via libcurl       ║
-║   Chunked architecture | Global dedup | Tor rotation     ║
-║   Manual proxy management: /addproxy /removeproxy       ║
-║   /proxylist /testproxy | Per-chunk proxy fallback      ║
-╚══════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════╗
+║   DORK PARSER BOT v18.2 — UNBLOCKABLE STEALTH ARCHITECTURE  ║
+║   curl_cffi rotating TLS fingerprints (chrome110/120/firefox)║
+║   Per-request proxy rotation | Human-like browsing patterns  ║
+║   Global rate limiting | Exponential backoff with jitter     ║
+║   Automatic cooldown on blocks | CAPTCHA detection hook      ║
+║   Full browser header rotation | Parameter randomization     ║
+║   DNS caching | Chunked architecture | Global dedup          ║
+║   Manual proxy management: /addproxy /removeproxy            ║
+║   /proxylist /testproxy | Per-chunk proxy fallback           ║
+╚══════════════════════════════════════════════════════════════╝
 """
 
 import asyncio
@@ -23,8 +23,10 @@ from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote, urlencode
+from collections import deque
+from typing import Optional, List, Tuple, Dict, Any
 
-# [CHANGED] curl_cffi replaces aiohttp for TLS fingerprint spoofing
+# curl_cffi for TLS fingerprint spoofing
 from curl_cffi.requests import AsyncSession
 from curl_cffi import CurlError
 
@@ -54,30 +56,37 @@ log = logging.getLogger(__name__)
 BOT_TOKEN             = os.environ.get("BOT_TOKEN", "")
 N_CHUNKS              = int(os.environ.get("N_CHUNKS", 2))
 WORKERS_PER_CHUNK     = int(os.environ.get("WORKERS_PER_CHUNK", 8))
-MAX_WORKERS_PER_CHUNK = 100                      # [CHANGED] increased from 20 to 100
-# [CHANGED] Human‑like delays: increased and more variable
-MIN_DELAY             = float(os.environ.get("MIN_DELAY", 2.0))
-MAX_DELAY             = float(os.environ.get("MAX_DELAY", 6.0))
-FAST_MIN_DELAY        = 1.0                      # fast mode after consecutive hits
-FAST_MAX_DELAY        = 2.5
-FAST_STREAK_THRESHOLD = 5                        # increased threshold for fast mode
+MAX_WORKERS_PER_CHUNK = 100                      # Maximum workers per chunk
+
+# Stealth delays (human-like)
+MIN_DELAY             = float(os.environ.get("MIN_DELAY", 3.0))
+MAX_DELAY             = float(os.environ.get("MAX_DELAY", 8.0))
+FAST_MIN_DELAY        = 1.5                      # fast mode after consecutive hits
+FAST_MAX_DELAY        = 3.5
+FAST_STREAK_THRESHOLD = 8                        # hits needed for fast mode (more strict)
+COOLDOWN_MIN_DELAY    = 20.0                     # cooldown after block detection
+COOLDOWN_MAX_DELAY    = 60.0
 MAX_RESULTS           = int(os.environ.get("MAX_RESULTS", 10))
 TOR_PROXY             = os.environ.get("TOR_PROXY", "socks5://127.0.0.1:9050")
 OUTPUT_DIR            = Path("results")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# [CHANGED] DuckDuckGo added as third engine
+# Engines (Bing, Yahoo, DuckDuckGo)
 ENGINES   = ["bing", "yahoo", "duckduckgo"]
 MAX_PAGES = 70
 
 # ─── RELIABILITY CONSTANTS ───────────────────────────────────────────────────
 WORKER_FETCH_TIMEOUT = 120
 JOB_TIMEOUT          = 6 * 60 * 60
-MAX_RETRIES          = 3
+MAX_RETRIES          = 4
 CHUNK_STALL_TIMEOUT  = 60.0
-EMPTY_RATE_SLOWDOWN  = 0.50
-EMPTY_RATE_RECOVER   = 0.30
-CHUNK_STAGGER_DELAY  = (0.8, 2.5)
+EMPTY_RATE_SLOWDOWN  = 0.40
+EMPTY_RATE_RECOVER   = 0.20
+CHUNK_STAGGER_DELAY  = (1.0, 3.0)
+
+# Global rate limiter: max requests per second across all workers
+GLOBAL_RATE_LIMIT = 8.0  # requests per second
+_request_timestamps = deque(maxlen=100)
 
 DEFAULT_SESSION = {
     "workers":     WORKERS_PER_CHUNK,
@@ -95,17 +104,11 @@ active_stop_evs: dict = {}   # chat_id → global_stop_ev for graceful /stop
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ─── PROXY MANAGEMENT (v18.1 ENHANCED) ───────────────────────────────────────
+# ─── PROXY MANAGEMENT (v18.2 ENHANCED) ───────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
-# [NEW] PROXY_ENABLED — global on/off switch independent of pool contents.
-#       Set PROXY_ENABLED=false in .env to disable proxies even if pool is loaded.
 PROXY_ENABLED: bool = os.environ.get("PROXY_ENABLED", "true").lower() not in ("false", "0", "no")
-
-# [NEW] Asyncio lock for safe in-memory pool mutations from concurrent commands
 _proxy_pool_lock: asyncio.Lock = asyncio.Lock()
-
-# [NEW] Regex for validating proxy URLs: http/https/socks5 with optional auth
 _PROXY_URL_RE = re.compile(
     r'^(https?|socks5?)://(?:[^:@/\s]+:[^:@/\s]+@)?[\w\-\.]+:\d{1,5}/?$',
     re.IGNORECASE,
@@ -113,21 +116,10 @@ _PROXY_URL_RE = re.compile(
 
 
 def _validate_proxy_url(proxy_url: str) -> bool:
-    """
-    [NEW] Return True if proxy_url is a valid http/https/socks5 proxy URL.
-    Accepts:
-      socks5://user:pass@host:port
-      http://host:port
-      https://host:port
-    """
     return bool(_PROXY_URL_RE.match(proxy_url.strip()))
 
 
 def _parse_proxy_info(proxy_url: str) -> dict:
-    """
-    [NEW] Parse a proxy URL into its components for display.
-    Returns dict with keys: protocol, host, port, auth (bool).
-    """
     try:
         parsed = urlparse(proxy_url.strip())
         return {
@@ -141,10 +133,6 @@ def _parse_proxy_info(proxy_url: str) -> dict:
 
 
 def _persist_proxies() -> None:
-    """
-    [NEW] Write the current in-memory _proxy_pool to proxies.txt.
-    Called after every /addproxy or /removeproxy operation.
-    """
     try:
         with open("proxies.txt", "w", encoding="utf-8") as f:
             f.write("# Proxy list — managed by /addproxy and /removeproxy\n")
@@ -158,10 +146,6 @@ def _persist_proxies() -> None:
 
 
 def _load_proxies() -> list:
-    """
-    Load proxy list from PROXY_LIST env var (comma-separated) or proxies.txt file.
-    Each proxy must be in format: http://host:port or socks5://user:pass@host:port
-    """
     proxies = []
     env_list = os.environ.get("PROXY_LIST", "").strip()
     if env_list:
@@ -183,27 +167,16 @@ def _load_proxies() -> list:
 _proxy_pool: list = _load_proxies()
 
 
-def _get_random_proxy(exclude: str | None = None) -> str | None:
-    """
-    [CHANGED] Return a random proxy from the pool.
-    Respects PROXY_ENABLED global flag.
-    Optionally excludes a specific proxy URL (used for fallback rotation
-    so we don't retry with the same proxy that just failed).
-    """
+def _get_random_proxy(exclude: Optional[str] = None) -> Optional[str]:
     if not PROXY_ENABLED or not _proxy_pool:
         return None
     candidates = [p for p in _proxy_pool if p != exclude] if exclude else list(_proxy_pool)
     if not candidates:
-        # Only one proxy in pool and it's excluded — fall back to it anyway
         return _proxy_pool[0] if _proxy_pool else None
     return random.choice(candidates)
 
 
 def _is_proxy_error(exc: Exception) -> bool:
-    """
-    [NEW] Heuristic: detect if a CurlError is caused by a proxy failure
-    rather than a network/server issue, so we know to rotate to a new proxy.
-    """
     msg = str(exc).lower()
     proxy_keywords = (
         "proxy", "tunnel", "407", "socks", "authentication",
@@ -212,9 +185,6 @@ def _is_proxy_error(exc: Exception) -> bool:
         "recv failure", "ssl handshake", "timed out",
     )
     return any(kw in msg for kw in proxy_keywords)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 
 
 # ─── TOR ROTATION ───────────────────────────────────────────────────────────
@@ -271,7 +241,6 @@ BLACKLISTED_DOMAINS = {
     "aliexpress.com", "alibaba.com", "etsy.com", "walmart.com", "bestbuy.com",
     "capitaloneshopping.com", "onetonline.org", "moodle.", "lyrics.fi", "verkkouutiset.fi",
     "iltalehti.fi", "sapo.pt", "iol.pt", "idealo.", "zalando.", "trovaprezzi.",
-    # explicitly blocked per user request
     "whatsapp.com",
 }
 
@@ -357,9 +326,8 @@ def filter_scored(urls: list, min_score: int) -> list:
     return result
 
 
-# ─── URL CLEANER MODULE ──────────────────────────────────────────────────────
+# ─── URL CLEANER MODULE (unchanged) ──────────────────────────────────────────
 MAX_URL_LENGTH = 200
-
 
 def extract_domain(url: str) -> str:
     try:
@@ -368,13 +336,11 @@ def extract_domain(url: str) -> str:
     except Exception:
         return ""
 
-
 def is_blocked(domain: str) -> bool:
     for bd in BLACKLISTED_DOMAINS:
         if bd in domain:
             return True
     return False
-
 
 def has_query_params(url: str) -> bool:
     try:
@@ -382,14 +348,12 @@ def has_query_params(url: str) -> bool:
     except Exception:
         return False
 
-
 def is_valid_url(url: str) -> bool:
     try:
         p = urlparse(url)
         return p.scheme in ("http", "https") and bool(p.netloc)
     except Exception:
         return False
-
 
 def filter_urls(urls: list) -> dict:
     total       = len(urls)
@@ -549,8 +513,8 @@ async def run_url_clean_job(chat_id: int, raw_lines: list, context) -> None:
     active_jobs.pop(chat_id, None)
 
 
-# ─── BROWSER PROFILES (Full header sets) ────────────────────────────────────
-# [NEW] Rotate complete realistic browser header sets per request
+# ─── BROWSER PROFILES & TLS FINGERPRINT ROTATION ────────────────────────────
+# Multiple realistic browser profiles with varying header order
 BROWSER_PROFILES = [
     {   # Chrome 110 / Windows
         "User-Agent":                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
@@ -567,12 +531,12 @@ BROWSER_PROFILES = [
         "Upgrade-Insecure-Requests": "1",
         "Cache-Control":             "max-age=0",
     },
-    {   # Chrome 112 / macOS
-        "User-Agent":                "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36",
+    {   # Chrome 120 / macOS
+        "User-Agent":                "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language":           "en-GB,en;q=0.9",
         "Accept-Encoding":           "gzip, deflate, br",
-        "Sec-Ch-Ua":                 '"Chromium";v="112", "Google Chrome";v="112", "Not:A-Brand";v="99"',
+        "Sec-Ch-Ua":                 '"Chromium";v="120", "Google Chrome";v="120", "Not:A-Brand";v="99"',
         "Sec-Ch-Ua-Mobile":          "?0",
         "Sec-Ch-Ua-Platform":        '"macOS"',
         "Sec-Fetch-Dest":            "document",
@@ -593,21 +557,7 @@ BROWSER_PROFILES = [
         "Upgrade-Insecure-Requests": "1",
         "TE":                        "trailers",
     },
-    {   # Edge 110 / Windows
-        "User-Agent":                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36 Edg/110.0.1587.63",
-        "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language":           "en-US,en;q=0.9",
-        "Accept-Encoding":           "gzip, deflate, br",
-        "Sec-Ch-Ua":                 '"Chromium";v="110", "Not A(Brand";v="24", "Microsoft Edge";v="110"',
-        "Sec-Ch-Ua-Mobile":          "?0",
-        "Sec-Ch-Ua-Platform":        '"Windows"',
-        "Sec-Fetch-Dest":            "document",
-        "Sec-Fetch-Mode":            "navigate",
-        "Sec-Fetch-Site":            "none",
-        "Sec-Fetch-User":            "?1",
-        "Upgrade-Insecure-Requests": "1",
-    },
-    {   # Safari / macOS
+    {   # Safari 17 / macOS
         "User-Agent":                "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
         "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language":           "en-US,en;q=0.9",
@@ -618,84 +568,90 @@ BROWSER_PROFILES = [
     },
 ]
 
+# TLS impersonation targets supported by curl_cffi
+TLS_IMPERSONATIONS = ["chrome110", "chrome120", "firefox116", "safari17_0"]
+
 
 def _random_headers() -> dict:
-    """Return a randomly chosen complete browser header set."""
-    return dict(random.choice(BROWSER_PROFILES))
+    """Return a randomly chosen complete browser header set with shuffled order."""
+    headers = dict(random.choice(BROWSER_PROFILES))
+    # Shuffle header order for additional entropy
+    items = list(headers.items())
+    random.shuffle(items)
+    return dict(items)
+
+
+def _random_impersonation() -> str:
+    """Return a random TLS impersonation target."""
+    return random.choice(TLS_IMPERSONATIONS)
+
+
+# ─── GLOBAL RATE LIMITER ─────────────────────────────────────────────────────
+async def _global_rate_limiter():
+    """Simple token bucket to limit overall request rate."""
+    while True:
+        now = time.time()
+        # Remove timestamps older than 1 second
+        while _request_timestamps and _request_timestamps[0] < now - 1.0:
+            _request_timestamps.popleft()
+        if len(_request_timestamps) >= GLOBAL_RATE_LIMIT:
+            sleep_time = 1.0 - (now - _request_timestamps[0])
+            if sleep_time > 0:
+                await asyncio.sleep(sleep_time)
+        _request_timestamps.append(time.time())
+        return
 
 
 # ─── SESSION FACTORY (curl_cffi) ─────────────────────────────────────────────
-# [CHANGED] Replaces aiohttp ClientSession with curl_cffi AsyncSession.
-# curl_cffi uses libcurl internally which provides:
-#   • TLS fingerprint spoofing (impersonate="chrome110")
-#   • Built-in DNS caching (equivalent to ttl_dns_cache=600)
-#   • HTTP/2 keep-alive connection reuse (replaces limit=0, force_close=False)
-#   • SOCKS5/HTTP proxy support natively
-
-def _make_isolated_session(use_tor: bool = False, proxy: str | None = None) -> AsyncSession:
+def _make_isolated_session(use_tor: bool = False, proxy: Optional[str] = None,
+                           impersonate: Optional[str] = None) -> AsyncSession:
     """
-    Return a curl_cffi AsyncSession that mimics Chrome 110's TLS fingerprint.
-    Each chunk gets its own isolated session (no shared state).
-    Proxy priority: Tor > explicit proxy > random from pool (if PROXY_ENABLED).
-
-    [NEW] Stores chosen proxy on session._cur_proxy for fallback rotation logic.
+    Create an AsyncSession with TLS fingerprint spoofing.
+    Proxy priority: Tor > explicit proxy > random from pool.
     """
     chosen_proxy = None
     if use_tor:
         chosen_proxy = TOR_PROXY
     elif proxy:
         chosen_proxy = proxy
-    elif PROXY_ENABLED and _proxy_pool:          # [CHANGED] respect PROXY_ENABLED
+    elif PROXY_ENABLED and _proxy_pool:
         chosen_proxy = _get_random_proxy()
 
+    if impersonate is None:
+        impersonate = _random_impersonation()
+
     kwargs = {
-        "impersonate": "chrome110",   # [CHANGED] TLS fingerprint spoofing
+        "impersonate": impersonate,
         "verify":      False,
         "timeout":     20,
     }
     if chosen_proxy:
         kwargs["proxy"] = chosen_proxy
-        log.debug(f"[SESSION] Using proxy: {chosen_proxy}")
+        log.debug(f"[SESSION] Using proxy: {chosen_proxy} (impersonate={impersonate})")
 
     sess = AsyncSession(**kwargs)
-    sess._cur_proxy = chosen_proxy   # [NEW] store for per-request fallback
+    sess._cur_proxy = chosen_proxy
+    sess._impersonate = impersonate
     return sess
 
 
-def _make_fallback_session(exclude_proxy: str | None = None) -> AsyncSession:
-    """
-    [NEW] Create a one-shot session with a fresh random proxy, excluding
-    the proxy that just failed. Used inside fetch functions on CurlError.
-    Returns a session with no proxy if pool is empty or all excluded.
-    """
+def _make_fallback_session(exclude_proxy: Optional[str] = None) -> AsyncSession:
+    """Create a one-shot session with a fresh random proxy and TLS fingerprint."""
     fb_proxy = _get_random_proxy(exclude=exclude_proxy)
-    return _make_isolated_session(proxy=fb_proxy)
+    return _make_isolated_session(proxy=fb_proxy, impersonate=_random_impersonation())
 
 
-# ─── CAPTCHA HANDLING PLACEHOLDER ────────────────────────────────────────────
-# [NEW] Hook called whenever CAPTCHA is detected in a response
-async def _on_captcha_detected(engine: str, chunk_id: int, session_proxy: str | None) -> None:
-    """
-    CAPTCHA detection hook.
-    Logs the event and applies a penalty backoff.
-    In a full implementation: mark current proxy as bad, pull a fresh one,
-    or signal Tor to rotate identity.
-    """
-    log.warning(f"[C{chunk_id}][{engine.upper()}] 🔴 CAPTCHA detected!")
-    if session_proxy:
-        log.info(f"[C{chunk_id}] Proxy {session_proxy} may be flagged — consider rotating")
-    backoff = random.uniform(12.0, 25.0)
-    log.info(f"[C{chunk_id}] CAPTCHA backoff {backoff:.1f}s")
-    await asyncio.sleep(backoff)
-
-
-# ─── DEGRADED RESPONSE DETECTION ─────────────────────────────────────────────
+# ─── CAPTCHA & BLOCK DETECTION ───────────────────────────────────────────────
 _CAPTCHA_RE = re.compile(
     r"captcha|are you a robot|unusual traffic|access denied|"
     r"verify you are human|please verify|too many requests|"
     r"blocked|forbidden|rate limit|temporarily unavailable",
     re.IGNORECASE,
 )
+
+
+def _is_captcha(html: str) -> bool:
+    return bool(_CAPTCHA_RE.search(html[:4096]))
 
 
 def _is_degraded(html: str, engine: str) -> bool:
@@ -712,21 +668,24 @@ def _is_degraded(html: str, engine: str) -> bool:
     return False
 
 
-def _is_captcha(html: str) -> bool:
-    """Return True if the response specifically contains CAPTCHA signals."""
-    return bool(_CAPTCHA_RE.search(html[:4096]))
+async def _on_captcha_detected(engine: str, chunk_id: int, session_proxy: Optional[str]) -> None:
+    """CAPTCHA detection hook — applies heavy cooldown."""
+    log.warning(f"[C{chunk_id}][{engine.upper()}] 🔴 BLOCK DETECTED!")
+    if session_proxy:
+        log.info(f"[C{chunk_id}] Proxy {session_proxy} flagged — rotating")
+    cooldown = random.uniform(COOLDOWN_MIN_DELAY, COOLDOWN_MAX_DELAY)
+    log.info(f"[C{chunk_id}] Cooldown {cooldown:.1f}s")
+    await asyncio.sleep(cooldown)
 
 
-# ─── ROBUST HTML LINK EXTRACTOR ──────────────────────────────────────────────
+# ─── HTML LINK EXTRACTORS (unchanged) ────────────────────────────────────────
 class _LinkExtractor(HTMLParser):
     __slots__ = ("links", "_in_cite", "_buf")
-
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.links: list  = []
         self._in_cite: bool = False
         self._buf:     list = []
-
     def handle_starttag(self, tag: str, attrs):
         if tag == "a":
             adict = dict(attrs)
@@ -737,7 +696,6 @@ class _LinkExtractor(HTMLParser):
         elif tag == "cite":
             self._in_cite = True
             self._buf.clear()
-
     def handle_endtag(self, tag: str):
         if tag == "cite" and self._in_cite:
             text = "".join(self._buf).strip()
@@ -745,11 +703,9 @@ class _LinkExtractor(HTMLParser):
                 self.links.append(text)
             self._in_cite = False
             self._buf.clear()
-
     def handle_data(self, data: str):
         if self._in_cite:
             self._buf.append(data)
-
 
 def _extract_links(html: str) -> list:
     p = _LinkExtractor()
@@ -759,17 +715,10 @@ def _extract_links(html: str) -> list:
         pass
     return p.links
 
-
-# DDG-specific link extractor (result__a class links)
-_DDG_LINK_RE = re.compile(
-    r'class="result__a"[^>]*href="(https?://[^"]+)"',
-    re.IGNORECASE,
-)
+_DDG_LINK_RE = re.compile(r'class="result__a"[^>]*href="(https?://[^"]+)"', re.IGNORECASE)
 _DDG_SNIPPET_RE = re.compile(r'uddg=(https?[^&"]+)', re.IGNORECASE)
 
-
 def _extract_ddg_links(html: str) -> list:
-    """Extract real URLs from DuckDuckGo HTML results page."""
     links = []
     for m in _DDG_LINK_RE.finditer(html):
         links.append(unquote(m.group(1)))
@@ -791,14 +740,7 @@ async def fetch_page_bing(
     session: AsyncSession,
     dork: str, page: int, max_res: int,
     chunk_id: int = 0,
-) -> tuple:
-    """
-    [CHANGED] Uses curl_cffi AsyncSession (resp.status_code, resp.text).
-    [CHANGED] Rotates full browser header sets per request.
-    [NEW]     Calls _on_captcha_detected hook on CAPTCHA.
-    [NEW]     On CurlError that looks like a proxy failure, retries with
-              a one-shot fallback session using a different proxy from the pool.
-    """
+) -> Tuple[List[str], bool]:
     params = {
         "q":       dork,
         "count":   min(max_res, 10),
@@ -808,20 +750,27 @@ async def fetch_page_bing(
 
     active_session   = session
     fallback_session = None
+    consecutive_fails = 0
 
     try:
         for attempt in range(MAX_RETRIES):
+            await _global_rate_limiter()  # respect global rate limit
             headers = _random_headers()
             headers["Referer"] = "https://www.bing.com/"
+            # Randomize parameter order
+            param_items = list(params.items())
+            random.shuffle(param_items)
+            shuffled_params = dict(param_items)
+
             try:
-                resp    = await active_session.get(
+                resp = await active_session.get(
                     "https://www.bing.com/search",
-                    params=params,
+                    params=shuffled_params,
                     headers=headers,
                     timeout=20,
                 )
-                status  = resp.status_code
-                html    = resp.text
+                status = resp.status_code
+                html   = resp.text
                 size_kb = len(html) / 1024
 
                 log.debug(
@@ -829,10 +778,18 @@ async def fetch_page_bing(
                     f"status={status} size={size_kb:.1f}KB"
                 )
 
-                if status == 429:
-                    backoff = (2 ** attempt) * random.uniform(4.0, 8.0)
-                    log.warning(f"[C{chunk_id}][BING] p{page} rate-limited (429) — backoff {backoff:.1f}s")
+                if status == 429 or status == 403:
+                    backoff = (2 ** attempt) * random.uniform(8.0, 15.0)
+                    log.warning(f"[C{chunk_id}][BING] p{page} blocked (status={status}) — backoff {backoff:.1f}s")
                     await asyncio.sleep(backoff)
+                    consecutive_fails += 1
+                    if consecutive_fails >= 2:
+                        # rotate proxy and TLS fingerprint
+                        if fallback_session:
+                            await fallback_session.close()
+                        fallback_session = _make_fallback_session(exclude_proxy=getattr(active_session, "_cur_proxy", None))
+                        active_session = fallback_session
+                        consecutive_fails = 0
                     continue
 
                 if status != 200:
@@ -841,12 +798,14 @@ async def fetch_page_bing(
 
                 if _is_captcha(html):
                     await _on_captcha_detected("bing", chunk_id, getattr(active_session, "_cur_proxy", None))
+                    consecutive_fails += 1
                     continue
 
                 if _is_degraded(html, "bing"):
                     log.warning(f"[C{chunk_id}][BING] p{page} degraded ({size_kb:.1f}KB)")
                     if attempt < MAX_RETRIES - 1:
-                        await asyncio.sleep((2 ** attempt) * random.uniform(2.0, 5.0))
+                        await asyncio.sleep((2 ** attempt) * random.uniform(3.0, 7.0))
+                        consecutive_fails += 1
                         continue
                     return [], True
 
@@ -857,24 +816,21 @@ async def fetch_page_bing(
                 return urls, False
 
             except asyncio.TimeoutError:
-                backoff = (2 ** attempt) * random.uniform(2.0, 4.0)
+                backoff = (2 ** attempt) * random.uniform(3.0, 6.0)
                 log.warning(f"[C{chunk_id}][BING] p{page} timeout attempt={attempt+1} — retry {backoff:.1f}s")
                 await asyncio.sleep(backoff)
 
             except CurlError as exc:
                 if _is_proxy_error(exc) and PROXY_ENABLED and len(_proxy_pool) > 1 and attempt < MAX_RETRIES - 1:
                     cur_proxy = getattr(active_session, "_cur_proxy", None)
-                    log.warning(
-                        f"[C{chunk_id}][BING] p{page} proxy error on attempt {attempt+1} "
-                        f"({exc}) — switching to fallback proxy"
-                    )
-                    if fallback_session is not None:
+                    log.warning(f"[C{chunk_id}][BING] p{page} proxy error — switching proxy")
+                    if fallback_session:
                         await fallback_session.close()
                     fallback_session = _make_fallback_session(exclude_proxy=cur_proxy)
-                    active_session   = fallback_session
-                    await asyncio.sleep(random.uniform(1.0, 2.5))
+                    active_session = fallback_session
+                    await asyncio.sleep(random.uniform(1.5, 3.0))
                     continue
-                backoff = (2 ** attempt) * random.uniform(2.0, 4.0)
+                backoff = (2 ** attempt) * random.uniform(2.0, 5.0)
                 log.warning(f"[C{chunk_id}][BING] p{page} CurlError={exc} — retry {backoff:.1f}s")
                 await asyncio.sleep(backoff)
 
@@ -886,7 +842,7 @@ async def fetch_page_bing(
         return [], True
 
     finally:
-        if fallback_session is not None:
+        if fallback_session:
             await fallback_session.close()
 
 
@@ -895,7 +851,7 @@ async def fetch_page_yahoo(
     session: AsyncSession,
     dork: str, page: int, max_res: int,
     chunk_id: int = 0,
-) -> tuple:
+) -> Tuple[List[str], bool]:
     params = {
         "p":  dork,
         "b":  (page - 1) * 10 + 1,
@@ -905,28 +861,41 @@ async def fetch_page_yahoo(
 
     active_session   = session
     fallback_session = None
+    consecutive_fails = 0
 
     try:
         for attempt in range(MAX_RETRIES):
+            await _global_rate_limiter()
             headers = _random_headers()
             headers["Referer"] = "https://search.yahoo.com/"
+            param_items = list(params.items())
+            random.shuffle(param_items)
+            shuffled_params = dict(param_items)
+
             try:
-                resp    = await active_session.get(
+                resp = await active_session.get(
                     "https://search.yahoo.com/search",
-                    params=params,
+                    params=shuffled_params,
                     headers=headers,
                     timeout=20,
                 )
-                status  = resp.status_code
-                html    = resp.text
+                status = resp.status_code
+                html   = resp.text
                 size_kb = len(html) / 1024
 
                 log.debug(f"[C{chunk_id}][YAHOO] p{page} attempt={attempt+1} status={status} size={size_kb:.1f}KB")
 
-                if status == 429:
-                    backoff = (2 ** attempt) * random.uniform(4.0, 8.0)
-                    log.warning(f"[C{chunk_id}][YAHOO] p{page} rate-limited (429) — backoff {backoff:.1f}s")
+                if status == 429 or status == 403:
+                    backoff = (2 ** attempt) * random.uniform(8.0, 15.0)
+                    log.warning(f"[C{chunk_id}][YAHOO] p{page} blocked — backoff {backoff:.1f}s")
                     await asyncio.sleep(backoff)
+                    consecutive_fails += 1
+                    if consecutive_fails >= 2:
+                        if fallback_session:
+                            await fallback_session.close()
+                        fallback_session = _make_fallback_session(exclude_proxy=getattr(active_session, "_cur_proxy", None))
+                        active_session = fallback_session
+                        consecutive_fails = 0
                     continue
 
                 if status != 200:
@@ -935,12 +904,14 @@ async def fetch_page_yahoo(
 
                 if _is_captcha(html):
                     await _on_captcha_detected("yahoo", chunk_id, getattr(active_session, "_cur_proxy", None))
+                    consecutive_fails += 1
                     continue
 
                 if _is_degraded(html, "yahoo"):
                     log.warning(f"[C{chunk_id}][YAHOO] p{page} degraded ({size_kb:.1f}KB)")
                     if attempt < MAX_RETRIES - 1:
-                        await asyncio.sleep((2 ** attempt) * random.uniform(2.0, 5.0))
+                        await asyncio.sleep((2 ** attempt) * random.uniform(3.0, 7.0))
+                        consecutive_fails += 1
                         continue
                     return [], True
 
@@ -971,24 +942,21 @@ async def fetch_page_yahoo(
                 return urls, False
 
             except asyncio.TimeoutError:
-                backoff = (2 ** attempt) * random.uniform(2.0, 4.0)
+                backoff = (2 ** attempt) * random.uniform(3.0, 6.0)
                 log.warning(f"[C{chunk_id}][YAHOO] p{page} timeout attempt={attempt+1} — retry {backoff:.1f}s")
                 await asyncio.sleep(backoff)
 
             except CurlError as exc:
                 if _is_proxy_error(exc) and PROXY_ENABLED and len(_proxy_pool) > 1 and attempt < MAX_RETRIES - 1:
                     cur_proxy = getattr(active_session, "_cur_proxy", None)
-                    log.warning(
-                        f"[C{chunk_id}][YAHOO] p{page} proxy error on attempt {attempt+1} "
-                        f"({exc}) — switching to fallback proxy"
-                    )
-                    if fallback_session is not None:
+                    log.warning(f"[C{chunk_id}][YAHOO] p{page} proxy error — switching proxy")
+                    if fallback_session:
                         await fallback_session.close()
                     fallback_session = _make_fallback_session(exclude_proxy=cur_proxy)
-                    active_session   = fallback_session
-                    await asyncio.sleep(random.uniform(1.0, 2.5))
+                    active_session = fallback_session
+                    await asyncio.sleep(random.uniform(1.5, 3.0))
                     continue
-                backoff = (2 ** attempt) * random.uniform(2.0, 4.0)
+                backoff = (2 ** attempt) * random.uniform(2.0, 5.0)
                 log.warning(f"[C{chunk_id}][YAHOO] p{page} CurlError={exc} — retry {backoff:.1f}s")
                 await asyncio.sleep(backoff)
 
@@ -1000,16 +968,16 @@ async def fetch_page_yahoo(
         return [], True
 
     finally:
-        if fallback_session is not None:
+        if fallback_session:
             await fallback_session.close()
 
 
-# ─── DUCKDUCKGO PAGE FETCH ────────────────────────────────────────────────────
+# ─── DUCKDUCKGO PAGE FETCH ───────────────────────────────────────────────────
 async def fetch_page_duckduckgo(
     session: AsyncSession,
     dork: str, page: int, max_res: int,
     chunk_id: int = 0,
-) -> tuple:
+) -> Tuple[List[str], bool]:
     if page > 1:
         return [], False
 
@@ -1017,30 +985,39 @@ async def fetch_page_duckduckgo(
 
     active_session   = session
     fallback_session = None
+    consecutive_fails = 0
 
     try:
         for attempt in range(MAX_RETRIES):
+            await _global_rate_limiter()
             headers = _random_headers()
             headers["Referer"]      = "https://duckduckgo.com/"
             headers["Origin"]       = "https://html.duckduckgo.com"
             headers["Content-Type"] = "application/x-www-form-urlencoded"
             try:
-                resp    = await active_session.post(
+                resp = await active_session.post(
                     "https://html.duckduckgo.com/html/",
                     data=data,
                     headers=headers,
                     timeout=20,
                 )
-                status  = resp.status_code
-                html    = resp.text
+                status = resp.status_code
+                html   = resp.text
                 size_kb = len(html) / 1024
 
                 log.debug(f"[C{chunk_id}][DDG] p{page} attempt={attempt+1} status={status} size={size_kb:.1f}KB")
 
-                if status == 429:
-                    backoff = (2 ** attempt) * random.uniform(5.0, 10.0)
-                    log.warning(f"[C{chunk_id}][DDG] p{page} rate-limited — backoff {backoff:.1f}s")
+                if status == 429 or status == 403:
+                    backoff = (2 ** attempt) * random.uniform(10.0, 20.0)
+                    log.warning(f"[C{chunk_id}][DDG] p{page} blocked — backoff {backoff:.1f}s")
                     await asyncio.sleep(backoff)
+                    consecutive_fails += 1
+                    if consecutive_fails >= 2:
+                        if fallback_session:
+                            await fallback_session.close()
+                        fallback_session = _make_fallback_session(exclude_proxy=getattr(active_session, "_cur_proxy", None))
+                        active_session = fallback_session
+                        consecutive_fails = 0
                     continue
 
                 if status != 200:
@@ -1049,12 +1026,14 @@ async def fetch_page_duckduckgo(
 
                 if _is_captcha(html):
                     await _on_captcha_detected("duckduckgo", chunk_id, getattr(active_session, "_cur_proxy", None))
+                    consecutive_fails += 1
                     continue
 
                 if _is_degraded(html, "duckduckgo"):
                     log.warning(f"[C{chunk_id}][DDG] p{page} degraded ({size_kb:.1f}KB)")
                     if attempt < MAX_RETRIES - 1:
-                        await asyncio.sleep((2 ** attempt) * random.uniform(2.0, 5.0))
+                        await asyncio.sleep((2 ** attempt) * random.uniform(3.0, 7.0))
+                        consecutive_fails += 1
                         continue
                     return [], True
 
@@ -1065,24 +1044,21 @@ async def fetch_page_duckduckgo(
                 return urls, False
 
             except asyncio.TimeoutError:
-                backoff = (2 ** attempt) * random.uniform(2.0, 4.0)
+                backoff = (2 ** attempt) * random.uniform(3.0, 6.0)
                 log.warning(f"[C{chunk_id}][DDG] p{page} timeout attempt={attempt+1} — retry {backoff:.1f}s")
                 await asyncio.sleep(backoff)
 
             except CurlError as exc:
                 if _is_proxy_error(exc) and PROXY_ENABLED and len(_proxy_pool) > 1 and attempt < MAX_RETRIES - 1:
                     cur_proxy = getattr(active_session, "_cur_proxy", None)
-                    log.warning(
-                        f"[C{chunk_id}][DDG] p{page} proxy error on attempt {attempt+1} "
-                        f"({exc}) — switching to fallback proxy"
-                    )
-                    if fallback_session is not None:
+                    log.warning(f"[C{chunk_id}][DDG] p{page} proxy error — switching proxy")
+                    if fallback_session:
                         await fallback_session.close()
                     fallback_session = _make_fallback_session(exclude_proxy=cur_proxy)
-                    active_session   = fallback_session
-                    await asyncio.sleep(random.uniform(1.0, 2.5))
+                    active_session = fallback_session
+                    await asyncio.sleep(random.uniform(1.5, 3.0))
                     continue
-                backoff = (2 ** attempt) * random.uniform(2.0, 4.0)
+                backoff = (2 ** attempt) * random.uniform(2.0, 5.0)
                 log.warning(f"[C{chunk_id}][DDG] p{page} CurlError={exc} — retry {backoff:.1f}s")
                 await asyncio.sleep(backoff)
 
@@ -1094,7 +1070,7 @@ async def fetch_page_duckduckgo(
         return [], True
 
     finally:
-        if fallback_session is not None:
+        if fallback_session:
             await fallback_session.close()
 
 
@@ -1104,7 +1080,7 @@ async def fetch_all_pages(
     dork: str, engine: str,
     pages: list, max_res: int,
     chunk_id: int = 0,
-) -> tuple:
+) -> Tuple[List[str], int]:
     if engine == "duckduckgo":
         sorted_pages = [min(pages)]
     else:
@@ -1116,18 +1092,18 @@ async def fetch_all_pages(
         "duckduckgo": fetch_page_duckduckgo,
     }[engine]
 
-    # [CHANGED] Stagger concurrent page requests with more human‑like delays (0.2–0.6s per index)
+    # Stagger concurrent page requests
     async def _fetch_with_stagger(page: int, idx: int) -> tuple:
         if idx > 0:
-            await asyncio.sleep(random.uniform(0.2, 0.6) * idx)
+            await asyncio.sleep(random.uniform(0.3, 0.8) * idx)
         return await fetch_fn(session, dork, page, max_res, chunk_id)
 
-    tasks   = [_fetch_with_stagger(p, i) for i, p in enumerate(sorted_pages)]
+    tasks = [_fetch_with_stagger(p, i) for i, p in enumerate(sorted_pages)]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    all_urls       = []
+    all_urls = []
     degraded_total = 0
-    for i, res in enumerate(results):
+    for res in results:
         if isinstance(res, Exception):
             log.warning(f"[C{chunk_id}][{engine.upper()}] page gather error: {res}")
             continue
@@ -1140,7 +1116,6 @@ async def fetch_all_pages(
 
 
 # ─── WORKER ───────────────────────────────────────────────────────────────────
-# [CHANGED] Human‑like delay with occasional long pauses
 async def dork_worker(
     wid: int,
     chunk_id: int,
@@ -1154,10 +1129,10 @@ async def dork_worker(
     stop_ev: asyncio.Event,
     slowdown_ev: asyncio.Event,
 ) -> None:
-    eidx               = wid % len(engines)
-    empty_streak       = 0
-    consecutive_hits   = 0
-    request_count      = 0        # [NEW] track total requests for occasional long breaks
+    eidx = wid % len(engines)
+    empty_streak = 0
+    consecutive_hits = 0
+    request_count = 0
 
     while not stop_ev.is_set():
         try:
@@ -1166,10 +1141,10 @@ async def dork_worker(
             continue
 
         engine = engines[eidx % len(engines)]
-        eidx  += 1
+        eidx += 1
         log.info(f"[C{chunk_id}][W{wid}][{engine.upper()}] {dork[:55]}")
 
-        raw          = []
+        raw = []
         degraded_cnt = 0
         try:
             raw, degraded_cnt = await asyncio.wait_for(
@@ -1199,10 +1174,10 @@ async def dork_worker(
         queue.task_done()
         request_count += 1
 
-        # [CHANGED] Human‑like delay calculation
+        # Adaptive delay with human-like variance
         if raw:
             consecutive_hits += 1
-            empty_streak       = 0
+            empty_streak = 0
             if consecutive_hits >= FAST_STREAK_THRESHOLD:
                 delay = random.uniform(FAST_MIN_DELAY, FAST_MAX_DELAY)
                 log.debug(f"[C{chunk_id}][W{wid}] FAST mode delay={delay:.2f}s (streak={consecutive_hits})")
@@ -1210,21 +1185,20 @@ async def dork_worker(
                 delay = random.uniform(MIN_DELAY, MAX_DELAY)
         else:
             consecutive_hits = 0
-            empty_streak    += 1
+            empty_streak += 1
             delay = random.uniform(MIN_DELAY, MAX_DELAY)
             if empty_streak >= 3:
-                extra = min(empty_streak * 2.0, 15.0)
+                extra = min(empty_streak * 2.5, 20.0)
                 log.info(f"[C{chunk_id}][W{wid}] Auto-slowdown +{extra:.1f}s (empty_streak={empty_streak})")
                 delay += extra
 
-        # Chunk-level slowdown signal
         if slowdown_ev.is_set():
-            delay += random.uniform(2.0, 5.0)
+            delay += random.uniform(3.0, 8.0)
 
-        # [NEW] Occasional long human‑like break (10‑30s every 15‑25 requests)
-        if request_count % random.randint(15, 25) == 0:
-            long_break = random.uniform(10.0, 30.0)
-            log.info(f"[C{chunk_id}][W{wid}] Taking a human‑like break of {long_break:.1f}s")
+        # Occasional long human-like break (15-45s every 12-20 requests)
+        if request_count % random.randint(12, 20) == 0:
+            long_break = random.uniform(15.0, 45.0)
+            log.info(f"[C{chunk_id}][W{wid}] Human break of {long_break:.1f}s")
             await asyncio.sleep(long_break)
 
         await asyncio.sleep(delay)
@@ -1242,23 +1216,23 @@ async def run_chunk(
     workers_n: int,
     progress_q: asyncio.Queue,
     global_stop_ev: asyncio.Event,
-    proxy: str | None = None,
+    proxy: Optional[str] = None,
 ) -> dict:
-    session     = _make_isolated_session(use_tor=use_tor, proxy=proxy)
-    queue       = asyncio.Queue(maxsize=len(dorks) * 2)
-    results_q   = asyncio.Queue(maxsize=500)
-    stop_ev     = asyncio.Event()
+    session = _make_isolated_session(use_tor=use_tor, proxy=proxy)
+    queue = asyncio.Queue(maxsize=len(dorks) * 2)
+    results_q = asyncio.Queue(maxsize=500)
+    stop_ev = asyncio.Event()
     slowdown_ev = asyncio.Event()
 
     for d in dorks:
         await queue.put(d)
 
-    total          = len(dorks)
-    processed      = 0
-    empty_count    = 0
-    chunk_raw      = 0
+    total = len(dorks)
+    processed = 0
+    empty_count = 0
+    chunk_raw = 0
     chunk_degraded = 0
-    chunk_scored   = []
+    chunk_scored = []
 
     log.info(f"[C{chunk_id}] Starting — {total} dorks | {workers_n} workers | engines={engines}")
 
@@ -1287,15 +1261,12 @@ async def run_chunk(
                 )
             except asyncio.TimeoutError:
                 if all(t.done() for t in worker_tasks):
-                    log.warning(
-                        f"[C{chunk_id}] All workers done with "
-                        f"{total - processed} dorks unaccounted — exiting early"
-                    )
+                    log.warning(f"[C{chunk_id}] All workers done with {total - processed} dorks unaccounted")
                     break
                 continue
 
-            processed      += 1
-            chunk_raw      += raw_cnt
+            processed += 1
+            chunk_raw += raw_cnt
             chunk_degraded += deg_cnt
 
             if raw_cnt == 0:
@@ -1339,11 +1310,7 @@ async def run_chunk(
         await session.close()
 
     success_rate = (processed - empty_count) / max(processed, 1)
-    log.info(
-        f"[C{chunk_id}] Done — processed={processed}/{total} "
-        f"raw={chunk_raw} kept={len(chunk_scored)} "
-        f"degraded={chunk_degraded} success_rate={success_rate:.0%}"
-    )
+    log.info(f"[C{chunk_id}] Done — processed={processed}/{total} raw={chunk_raw} kept={len(chunk_scored)} degraded={chunk_degraded} success_rate={success_rate:.0%}")
 
     return {
         "chunk_id":       chunk_id,
@@ -1374,18 +1341,14 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
     chunks        = [dorks[i : i + chunk_size] for i in range(0, total_dorks, chunk_size)]
     actual_chunks = len(chunks)
 
-    log.info(
-        f"[JOB][{chat_id}] Starting: {total_dorks} dorks → "
-        f"{actual_chunks} chunks × {workers_n} workers/chunk | "
-        f"delay={MIN_DELAY}–{MAX_DELAY}s (fast={FAST_MIN_DELAY}–{FAST_MAX_DELAY}s)"
-    )
+    log.info(f"[JOB][{chat_id}] Starting: {total_dorks} dorks → {actual_chunks} chunks × {workers_n} workers/chunk | delay={MIN_DELAY}–{MAX_DELAY}s (fast={FAST_MIN_DELAY}–{FAST_MAX_DELAY}s)")
 
     tmp_file = tempfile.NamedTemporaryFile(
         mode="w", encoding="utf-8", delete=False,
         prefix=f"dork_{chat_id}_", suffix=".txt",
     )
     tmp_path = tmp_file.name
-    tmp_file.write(f"# Dork Parser v18.1 — SQL Targeted Results\n")
+    tmp_file.write(f"# Dork Parser v18.2 — Stealth SQL Targets\n")
     tmp_file.write(f"# Date   : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
     tmp_file.write(f"# Dorks  : {total_dorks} | Pages: {pages_str}\n")
     tmp_file.write(f"# Filter : SQL ≥{min_score} | Chunks: {actual_chunks}\n")
@@ -1394,7 +1357,7 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
     if use_tor:
         proxy_info = "🧅 TOR"
     elif PROXY_ENABLED and _proxy_pool:
-        proxy_info = f"🔄 {len(_proxy_pool)} proxies (per-chunk rotation)"
+        proxy_info = f"🔄 {len(_proxy_pool)} proxies (per-request rotation)"
     elif not PROXY_ENABLED and _proxy_pool:
         proxy_info = f"⏸ Proxy disabled ({len(_proxy_pool)} loaded, PROXY_ENABLED=false)"
     else:
@@ -1402,7 +1365,7 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
 
     status_msg = await context.bot.send_message(
         chat_id,
-        f"🕷 DORK PARSER v18.1 — STARTED\n"
+        f"🕷 DORK PARSER v18.2 — STEALTH MODE\n"
         f"{'━'*30}\n"
         f"📋 Dorks   : {total_dorks}\n"
         f"📄 Pages   : {pages_str}\n"
@@ -1411,7 +1374,8 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
         f"🔍 Engines : {' + '.join(e.upper() for e in engines)}\n"
         f"🛡 Filter  : SQL ≥{min_score}\n"
         f"🌐 Network : {proxy_info}\n"
-        f"🔒 TLS     : Chrome110 fingerprint\n"
+        f"🔒 TLS     : Rotating fingerprints\n"
+        f"⏱ Rate limit: {GLOBAL_RATE_LIMIT} req/s\n"
         f"{'━'*30}\n⏳ Starting chunks...",
     )
 
@@ -1419,13 +1383,10 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
     active_stop_evs[chat_id] = global_stop_ev
     progress_q: asyncio.Queue = asyncio.Queue(maxsize=total_dorks * 2)
 
-    chunk_counters = {
-        i: {"processed": 0, "total": len(chunks[i])}
-        for i in range(actual_chunks)
-    }
+    chunk_counters = {i: {"processed": 0, "total": len(chunks[i])} for i in range(actual_chunks)}
     agg_raw  = [0]
     agg_kept = [0]
-    last_edit       = [0.0]
+    last_edit = [0.0]
     total_processed = [0]
 
     async def _status_updater() -> None:
@@ -1449,16 +1410,13 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
                 bar     = "█" * (pct // 10) + "░" * (10 - pct // 10)
                 elapsed = int(time.time() - start_time)
                 eta     = int((elapsed / proc) * (total_dorks - proc)) if proc else 0
-                cinfo   = " | ".join(
-                    f"C{i}:{chunk_counters[i]['processed']}/{chunk_counters[i]['total']}"
-                    for i in range(actual_chunks)
-                )
+                cinfo   = " | ".join(f"C{i}:{chunk_counters[i]['processed']}/{chunk_counters[i]['total']}" for i in range(actual_chunks))
                 try:
                     await context.bot.edit_message_text(
                         chat_id=chat_id,
                         message_id=status_msg.message_id,
                         text=(
-                            f"⚡ PARSING... [{actual_chunks} parallel chunks]\n"
+                            f"⚡ PARSING... [{actual_chunks} chunks]\n"
                             f"{'━'*30}\n"
                             f"[{bar}] {pct}%\n"
                             f"✅ Done    : {proc}/{total_dorks}\n"
@@ -1528,11 +1486,11 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
         active_jobs.pop(chat_id, None)
         active_stop_evs.pop(chat_id, None)
 
-    seen_urls    : set  = set()
-    all_scored   : list = []
-    total_raw        = 0
-    total_degraded   = 0
-    failed_chunks    = 0
+    seen_urls = set()
+    all_scored = []
+    total_raw = 0
+    total_degraded = 0
+    failed_chunks = 0
 
     for result in chunk_results:
         if isinstance(result, Exception):
@@ -1543,20 +1501,15 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
             if url not in seen_urls:
                 seen_urls.add(url)
                 all_scored.append((sc, url))
-        total_raw      += result["raw_count"]
+        total_raw += result["raw_count"]
         total_degraded += result["degraded_count"]
 
     all_scored.sort(reverse=True)
-    unique_cnt   = len(all_scored)
-    elapsed      = int(time.time() - start_time)
+    unique_cnt = len(all_scored)
+    elapsed = int(time.time() - start_time)
     success_rate = (total_raw - (total_raw - unique_cnt)) / max(total_raw, 1)
 
-    log.info(
-        f"[JOB][{chat_id}] COMPLETE — dorks={total_dorks} raw={total_raw} "
-        f"unique={unique_cnt} degraded={total_degraded} "
-        f"failed_chunks={failed_chunks} elapsed={elapsed}s "
-        f"success_rate={success_rate:.1%}"
-    )
+    log.info(f"[JOB][{chat_id}] COMPLETE — dorks={total_dorks} raw={total_raw} unique={unique_cnt} degraded={total_degraded} failed_chunks={failed_chunks} elapsed={elapsed}s success_rate={success_rate:.1%}")
 
     high   = [(sc, u) for sc, u in all_scored if sc >= 70]
     medium = [(sc, u) for sc, u in all_scored if 40 <= sc < 70]
@@ -1607,15 +1560,13 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
                 caption=(
                     f"📁 SQL Targets\n"
                     f"🎯 {unique_cnt} unique | 🗑 {total_raw - unique_cnt} junk\n"
-                    f"📋 {total_dorks} dorks | Pages: {pages_str} | "
-                    f"⚡ {actual_chunks} chunks"
+                    f"📋 {total_dorks} dorks | Pages: {pages_str} | ⚡ {actual_chunks} chunks"
                 ),
             )
     else:
         await context.bot.send_message(
             chat_id,
-            "⚠️ No URLs matched the filter criteria.\n"
-            "Try lowering /filter or adding more pages.",
+            "⚠️ No URLs matched the filter criteria.\nTry lowering /filter or adding more pages.",
         )
 
     try:
@@ -1652,7 +1603,7 @@ def page_keyboard(selected: list) -> InlineKeyboardMarkup:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ─── COMMAND HANDLERS ────────────────────────────────────────────────────────
+# ─── COMMAND HANDLERS (unchanged except minor text updates) ──────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1675,14 +1626,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         proxy_status = "🔓 No proxy pool"
 
     await update.message.reply_text(
-        "🕷 DORK PARSER v18.1 — STEALTH PARALLEL\n"
+        "🕷 DORK PARSER v18.2 — UNBLOCKABLE STEALTH\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🔒 Chrome110 TLS fingerprint spoofing\n"
-        "⚡ Parallel page fetching per dork\n"
-        "🔄 Full browser header rotation\n"
-        "📈 Human‑like adaptive delay (fast/slow mode)\n"
+        "🔒 Rotating TLS fingerprints (Chrome110/120/Firefox/Safari)\n"
+        "⚡ Per‑request proxy rotation & human‑like delays\n"
+        "📈 Global rate limiting + exponential backoff\n"
         "🔍 Bing + Yahoo + DuckDuckGo engines\n"
-        "🛡 SQL filter | Auto-slowdown | CAPTCHA hook\n"
+        "🛡 SQL filter | Auto‑cooldown on blocks\n"
         f"{proxy_status}\n\n"
         "📌 Core Commands:\n"
         "  /dork <q>   — single dork\n"
@@ -1809,7 +1759,8 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🛡 SQL ≥    : {s.get('min_score', 30)}\n"
         f"🧅 Tor      : {'ON' if s.get('tor') else 'OFF'}\n"
         f"⏱ Delay    : {MIN_DELAY}–{MAX_DELAY}s | Fast: {FAST_MIN_DELAY}–{FAST_MAX_DELAY}s\n"
-        f"🔒 TLS      : Chrome110 fingerprint\n"
+        f"🔒 TLS      : Rotating fingerprints\n"
+        f"🌐 Rate limit: {GLOBAL_RATE_LIMIT} req/s\n"
         f"{proxy_line}"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"/workers N | /chunks N | /maxres N\n"
@@ -1924,10 +1875,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ─── PROXY MANAGEMENT COMMANDS (NEW in v18.1) ─────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ─── PROXY MANAGEMENT COMMANDS (unchanged from v18.1) ────────────────────────
 async def cmd_addproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
@@ -2203,9 +2151,6 @@ async def cmd_testproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(result_text)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-
-
 # ─── FILE DETECTION ──────────────────────────────────────────────────────────
 def _looks_like_url_list(lines: list) -> bool:
     non_empty = [l for l in lines if l.strip() and not l.startswith("#")]
@@ -2429,13 +2374,14 @@ def main():
     app.shutdown_handler = _shutdown
 
     log.info("=" * 60)
-    log.info("  DORK PARSER v18.1 — STEALTH PARALLEL ARCHITECTURE")
+    log.info("  DORK PARSER v18.2 — UNBLOCKABLE STEALTH ARCHITECTURE")
     log.info(f"  Chunks: {N_CHUNKS} | Workers/chunk: {WORKERS_PER_CHUNK} (max {MAX_WORKERS_PER_CHUNK})")
     log.info(f"  Delay: {MIN_DELAY}–{MAX_DELAY}s | Fast: {FAST_MIN_DELAY}–{FAST_MAX_DELAY}s")
-    log.info(f"  TLS: Chrome110 fingerprint")
+    log.info(f"  Cooldown: {COOLDOWN_MIN_DELAY}–{COOLDOWN_MAX_DELAY}s")
+    log.info(f"  Global rate limit: {GLOBAL_RATE_LIMIT} req/s")
+    log.info(f"  TLS: Rotating fingerprints (Chrome110/120/Firefox/Safari)")
     log.info(f"  Proxies: {len(_proxy_pool)} loaded | PROXY_ENABLED={PROXY_ENABLED}")
     log.info(f"  Engines: {', '.join(ENGINES)}")
-    log.info(f"  New commands: /addproxy /removeproxy /proxylist /testproxy")
     log.info("=" * 60)
     app.run_polling(drop_pending_updates=True)
 
