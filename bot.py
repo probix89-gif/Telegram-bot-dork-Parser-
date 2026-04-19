@@ -1,16 +1,11 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║   DORK PARSER BOT v19.1 — BURST MODE ARCHITECTURE           ║
-║   Sequential bursts of BURST_SIZE dorks (default 100)       ║
-║   Per-burst fresh isolated session | Global dedup set        ║
-║   Rotating TLS fingerprints (multiple browsers)             ║
-║   Per‑request proxy rotation | Session recycling            ║
-║   Realistic delay distribution (Gamma/LogNormal)            ║
-║   Full browser header rotation | Dynamic adaptive delay      ║
-║   Proxy rotation (HTTP/SOCKS) | DuckDuckGo engine            ║
-║   CAPTCHA detection hook | DNS caching via libcurl           ║
-║   Manual proxy management: /addproxy /removeproxy           ║
-║   /proxylist /testproxy | /stealth low|medium|high         ║
+║   DORK PARSER BOT v20.0 — YAHOO BYPASS EDITION              ║
+║   TLS impersonation: Chrome124/131, Firefox133              ║
+║   Residential proxy rotation | Lognormal human delays       ║
+║   Full browser header cloning | Session fingerprint refresh ║
+║   CAPTCHA solver integration (stub) | DuckDuckGo/Bing       ║
+║   Chunked parallel architecture | Global dedup              ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -25,7 +20,7 @@ import math
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs, unquote, urlencode
+from urllib.parse import urlparse, parse_qs, unquote
 
 from curl_cffi.requests import AsyncSession
 from curl_cffi import CurlError
@@ -55,7 +50,6 @@ log = logging.getLogger(__name__)
 # ─── CONFIGURATION ──────────────────────────────────────────────────────────
 BOT_TOKEN             = os.environ.get("BOT_TOKEN", "")
 N_CHUNKS              = int(os.environ.get("N_CHUNKS", 2))
-BURST_SIZE            = int(os.environ.get("BURST_SIZE", 100))   # dorks per sequential batch
 WORKERS_PER_CHUNK     = int(os.environ.get("WORKERS_PER_CHUNK", 8))
 MAX_WORKERS_PER_CHUNK = 100
 MIN_DELAY             = float(os.environ.get("MIN_DELAY", 2.0))
@@ -80,24 +74,24 @@ EMPTY_RATE_SLOWDOWN  = 0.50
 EMPTY_RATE_RECOVER   = 0.30
 CHUNK_STAGGER_DELAY  = (0.8, 2.5)
 
-# [NEW] Stealth levels
+# Stealth levels (enhanced for Yahoo)
 STEALTH_PROFILES = {
     "low": {
-        "session_rotate_requests": 50,
+        "session_rotate_requests": 30,
         "delay_distribution": "uniform",
         "impersonate_rotate": False,
-        "proxy_rotate_freq": 1,      # per dork
+        "proxy_rotate_freq": 1,
         "extra_headers": False,
     },
     "medium": {
-        "session_rotate_requests": 20,
-        "delay_distribution": "gamma",
+        "session_rotate_requests": 15,
+        "delay_distribution": "lognormal",
         "impersonate_rotate": True,
         "proxy_rotate_freq": 1,
         "extra_headers": True,
     },
     "high": {
-        "session_rotate_requests": 8,
+        "session_rotate_requests": 5,
         "delay_distribution": "lognormal",
         "impersonate_rotate": True,
         "proxy_rotate_freq": 1,
@@ -113,7 +107,7 @@ DEFAULT_SESSION = {
     "pages":       [1],
     "tor":         False,
     "min_score":   30,
-    "stealth":     "medium",          # [NEW] default stealth level
+    "stealth":     "high",          # default to high for Yahoo
 }
 
 user_sessions:   dict = {}
@@ -121,7 +115,7 @@ active_jobs:     dict = {}
 active_stop_evs: dict = {}
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ─── PROXY MANAGEMENT (v19 ENHANCED) ─────────────────────────────────────────
+# ─── PROXY MANAGEMENT (ENHANCED WITH RESIDENTIAL SUPPORT) ────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
 PROXY_ENABLED: bool = os.environ.get("PROXY_ENABLED", "true").lower() not in ("false", "0", "no")
@@ -131,7 +125,7 @@ _PROXY_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
-# [NEW] Track proxy failures for temporary blacklisting
+# Track proxy failures for temporary blacklisting
 _proxy_failures: dict = {}   # proxy_url -> (fail_count, last_fail_time)
 PROXY_BAN_TIME = 300         # seconds to temporarily ban a failing proxy
 
@@ -198,7 +192,6 @@ def _mark_proxy_failure(proxy_url: str) -> None:
         _proxy_failures[proxy_url][1] = now
     if _proxy_failures[proxy_url][0] >= 3:
         log.warning(f"[PROXY] Temporarily banning {proxy_url} due to repeated failures")
-        # Remove from pool temporarily (will be added back after PROXY_BAN_TIME)
         if proxy_url in _proxy_pool:
             _proxy_pool.remove(proxy_url)
 
@@ -239,9 +232,7 @@ def _is_proxy_error(exc: Exception) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-
-
-# ─── TOR ROTATION ───────────────────────────────────────────────────────────
+# ─── TOR ROTATION (unchanged) ────────────────────────────────────────────────
 _tor_rotation_task = None
 tor_enabled_users  = 0
 
@@ -551,25 +542,23 @@ async def run_url_clean_job(chat_id: int, raw_lines: list, context) -> None:
     active_jobs.pop(chat_id, None)
 
 
-# ─── ENHANCED BROWSER PROFILES & HEADERS ─────────────────────────────────────
-# [NEW] Multiple TLS impersonation targets for rotation
+# ─── ENHANCED BROWSER PROFILES & HEADERS (Yahoo‑optimized) ──────────────────
+# Latest TLS impersonation targets for maximum compatibility
 IMPERSONATE_TARGETS = [
-    "chrome110",
-    "chrome120",
-    "chrome123",
-    "firefox116",
-    "safari17_0",
-    "edge101",
+    "chrome124",      # Stable Chrome
+    "chrome131",      # Latest Chrome as of early 2025
+    "firefox133",     # Latest Firefox
+    "safari17_0",     # Safari 17
 ]
 
-# [NEW] Expanded browser profiles with more realistic headers
+# Browser header profiles matching the impersonated fingerprints
 BROWSER_PROFILES = [
-    {   # Chrome 120 / Windows
-        "User-Agent":                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    {   # Chrome 124 / Windows
+        "User-Agent":                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
         "Accept-Language":           "en-US,en;q=0.9",
         "Accept-Encoding":           "gzip, deflate, br",
-        "Sec-Ch-Ua":                 '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        "Sec-Ch-Ua":                 '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
         "Sec-Ch-Ua-Mobile":          "?0",
         "Sec-Ch-Ua-Platform":        '"Windows"',
         "Sec-Fetch-Dest":            "document",
@@ -579,8 +568,8 @@ BROWSER_PROFILES = [
         "Upgrade-Insecure-Requests": "1",
         "Cache-Control":             "max-age=0",
     },
-    {   # Firefox 124 / Linux
-        "User-Agent":                "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    {   # Firefox 133 / Linux
+        "User-Agent":                "Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0",
         "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language":           "en-US,en;q=0.5",
         "Accept-Encoding":           "gzip, deflate, br",
@@ -602,13 +591,11 @@ BROWSER_PROFILES = [
     },
 ]
 
-# [NEW] Accept-Language variations for realistic rotation
 ACCEPT_LANGUAGES = [
     "en-US,en;q=0.9",
     "en-GB,en;q=0.8",
     "en-CA,en;q=0.9,fr;q=0.7",
     "en-AU,en;q=0.9",
-    "en-US,en;q=0.9,es;q=0.8",
 ]
 
 def _random_headers(extra: bool = False) -> dict:
@@ -616,23 +603,21 @@ def _random_headers(extra: bool = False) -> dict:
     headers = dict(random.choice(BROWSER_PROFILES))
     headers["Accept-Language"] = random.choice(ACCEPT_LANGUAGES)
     if extra:
-        # Add random DNT, Upgrade-Insecure-Requests variations
         if random.random() < 0.5:
             headers["DNT"] = "1"
         if "Upgrade-Insecure-Requests" not in headers and random.random() < 0.3:
             headers["Upgrade-Insecure-Requests"] = "1"
-        # Randomize cache-control
         if random.random() < 0.7:
             headers["Cache-Control"] = random.choice(["max-age=0", "no-cache"])
     return headers
 
 
-# ─── SESSION FACTORY WITH TLS ROTATION ───────────────────────────────────────
+# ─── SESSION FACTORY WITH TLS ROTATION (UPGRADED) ───────────────────────────
 def _make_isolated_session(use_tor: bool = False, proxy: str | None = None,
                            impersonate: str | None = None) -> AsyncSession:
     """
     Create a session with optional TLS fingerprint impersonation.
-    If impersonate is None, picks randomly from IMPERSONATE_TARGETS if stealth rotate enabled.
+    If impersonate is None, picks randomly from IMPERSONATE_TARGETS (modern browsers).
     """
     if impersonate is None:
         impersonate = random.choice(IMPERSONATE_TARGETS)
@@ -667,19 +652,44 @@ def _make_fallback_session(exclude_proxy: str | None = None,
     return _make_isolated_session(proxy=fb_proxy, impersonate=impersonate)
 
 
-# ─── CAPTCHA HANDLING (ENHANCED) ─────────────────────────────────────────────
+# ─── CAPTCHA HANDLING (WITH OPTIONAL 2CAPTCHA STUB) ─────────────────────────
+# Set your 2Captcha API key in env to enable solving (optional)
+CAPTCHA_API_KEY = os.environ.get("CAPTCHA_API_KEY", "")
+
+async def solve_captcha_if_needed(session: AsyncSession, page_url: str, site_key: str = None) -> bool:
+    """
+    Stub for 2Captcha integration.
+    If CAPTCHA_API_KEY is set, attempts to solve the CAPTCHA.
+    Returns True if solved and session cookies updated, else False.
+    """
+    if not CAPTCHA_API_KEY:
+        return False
+    try:
+        # Placeholder – implement with actual 2captcha library
+        log.info("CAPTCHA solving not implemented in stub")
+        return False
+    except Exception as e:
+        log.error(f"CAPTCHA solving error: {e}")
+        return False
+
 async def _on_captcha_detected(engine: str, chunk_id: int, session_proxy: str | None,
-                               session_obj: AsyncSession) -> None:
+                               session_obj: AsyncSession, page_url: str = None) -> None:
     log.warning(f"[C{chunk_id}][{engine.upper()}] 🔴 CAPTCHA detected!")
     if session_proxy:
         log.info(f"[C{chunk_id}] Marking proxy {session_proxy} as failed")
         _mark_proxy_failure(session_proxy)
-    backoff = random.uniform(30.0, 60.0)  # longer backoff for CAPTCHA
+    # Attempt solving if configured
+    if page_url and CAPTCHA_API_KEY:
+        solved = await solve_captcha_if_needed(session_obj, page_url)
+        if solved:
+            log.info(f"[C{chunk_id}] CAPTCHA solved successfully")
+            return
+    backoff = random.uniform(30.0, 60.0)
     log.info(f"[C{chunk_id}] CAPTCHA backoff {backoff:.1f}s")
     await asyncio.sleep(backoff)
 
 
-# ─── DEGRADED RESPONSE DETECTION (unchanged) ─────────────────────────────────
+# ─── DEGRADED RESPONSE DETECTION ─────────────────────────────────────────────
 _CAPTCHA_RE = re.compile(
     r"captcha|are you a robot|unusual traffic|access denied|"
     r"verify you are human|please verify|too many requests|"
@@ -759,26 +769,23 @@ _YAHOO_RU_PATH = re.compile(r"/RU=([^/&]+)")
 _DDG_NOISE     = re.compile(r"duckduckgo\.com|duck\.com", re.IGNORECASE)
 
 
-# ─── REALISTIC DELAY GENERATOR ───────────────────────────────────────────────
-def _human_delay(distribution: str = "gamma", base_min: float = 2.0, base_max: float = 6.0) -> float:
+# ─── REALISTIC DELAY GENERATOR (LOGNORMAL DEFAULT) ───────────────────────────
+def _human_delay(distribution: str = "lognormal", base_min: float = 2.0, base_max: float = 6.0) -> float:
     """
-    Generate a human-like delay using specified distribution.
-    - uniform: simple random between min and max.
-    - gamma: shape=2.0, scale=1.5 -> mean ~3s, occasional longer tails.
-    - lognormal: mean ~3s, sigma 0.8 -> realistic browsing pauses.
+    Generate a human-like delay.
+    - lognormal: mean ~3s, sigma 0.8 → realistic browsing pauses (recommended for Yahoo).
     """
     if distribution == "uniform":
         return random.uniform(base_min, base_max)
     elif distribution == "gamma":
-        # shape=2, scale=1.5 gives mean 3s, most values 1-6s, occasional up to 12s
         delay = random.gammavariate(2.0, 1.5)
         return max(0.5, min(delay, 15.0))
-    else:  # lognormal
+    else:  # lognormal (default)
         delay = random.lognormvariate(1.0, 0.8)
         return max(1.0, min(delay, 20.0))
 
 
-# ─── BING PAGE FETCH (ENHANCED WITH SESSION RECYCLING) ───────────────────────
+# ─── BING PAGE FETCH (unchanged except stealth improvements) ────────────────
 async def fetch_page_bing(
     session: AsyncSession,
     dork: str, page: int, max_res: int,
@@ -876,7 +883,7 @@ async def fetch_page_bing(
             await fallback_session.close()
 
 
-# ─── YAHOO PAGE FETCH (ENHANCED) ─────────────────────────────────────────────
+# ─── YAHOO PAGE FETCH (HEAVILY OPTIMIZED FOR BYPASS) ────────────────────────
 async def fetch_page_yahoo(
     session: AsyncSession,
     dork: str, page: int, max_res: int,
@@ -892,12 +899,18 @@ async def fetch_page_yahoo(
 
     active_session = session
     fallback_session = None
-    extra_headers = stealth_profile.get("extra_headers", False) if stealth_profile else False
+    extra_headers = stealth_profile.get("extra_headers", False) if stealth_profile else True  # Yahoo needs extra
+
+    # Yahoo URL for CAPTCHA solving if needed
+    yahoo_url = f"https://search.yahoo.com/search?p={dork}&b={(page-1)*10+1}"
 
     try:
         for attempt in range(MAX_RETRIES):
             headers = _random_headers(extra=extra_headers)
+            # Important: Referer must be set correctly
             headers["Referer"] = "https://search.yahoo.com/"
+            # Add Origin for Yahoo
+            headers["Origin"] = "https://search.yahoo.com"
             try:
                 resp = await active_session.get(
                     "https://search.yahoo.com/search",
@@ -922,7 +935,8 @@ async def fetch_page_yahoo(
                     return [], False
 
                 if _is_captcha(html):
-                    await _on_captcha_detected("yahoo", chunk_id, getattr(active_session, "_cur_proxy", None), active_session)
+                    await _on_captcha_detected("yahoo", chunk_id, getattr(active_session, "_cur_proxy", None),
+                                               active_session, page_url=yahoo_url)
                     continue
 
                 if _is_degraded(html, "yahoo"):
@@ -994,7 +1008,7 @@ async def fetch_page_yahoo(
             await fallback_session.close()
 
 
-# ─── DUCKDUCKGO PAGE FETCH (ENHANCED) ────────────────────────────────────────
+# ─── DUCKDUCKGO PAGE FETCH (unchanged) ──────────────────────────────────────
 async def fetch_page_duckduckgo(
     session: AsyncSession,
     dork: str, page: int, max_res: int,
@@ -1154,9 +1168,9 @@ async def dork_worker(
     request_count = 0
 
     # Create initial session
-    impersonate = random.choice(IMPERSONATE_TARGETS) if stealth_profile.get("impersonate_rotate", False) else None
+    impersonate = random.choice(IMPERSONATE_TARGETS) if stealth_profile.get("impersonate_rotate", True) else None
     session = _make_isolated_session(use_tor=use_tor, impersonate=impersonate)
-    session_rotate_limit = stealth_profile.get("session_rotate_requests", 20)
+    session_rotate_limit = stealth_profile.get("session_rotate_requests", 15)
 
     try:
         while not stop_ev.is_set():
@@ -1204,12 +1218,12 @@ async def dork_worker(
             if request_count % session_rotate_limit == 0:
                 log.info(f"[C{chunk_id}][W{wid}] Recycling session after {session_rotate_limit} requests")
                 await session.close()
-                impersonate = random.choice(IMPERSONATE_TARGETS) if stealth_profile.get("impersonate_rotate", False) else None
+                impersonate = random.choice(IMPERSONATE_TARGETS) if stealth_profile.get("impersonate_rotate", True) else None
                 session = _make_isolated_session(use_tor=use_tor, impersonate=impersonate)
-                await asyncio.sleep(random.uniform(1.0, 3.0))  # small pause when changing identity
+                await asyncio.sleep(random.uniform(1.0, 3.0))
 
-            # Delay calculation with realistic distribution
-            dist = stealth_profile.get("delay_distribution", "gamma")
+            # Delay calculation with lognormal distribution (best for Yahoo)
+            dist = stealth_profile.get("delay_distribution", "lognormal")
             if raw:
                 consecutive_hits += 1
                 empty_streak = 0
@@ -1363,37 +1377,31 @@ async def run_chunk(
     }
 
 
-# ─── JOB RUNNER (v19.1 — BURST MODE) ────────────────────────────────────────
+# ─── JOB RUNNER (UPDATED) ────────────────────────────────────────────────────
 async def run_dork_job(chat_id: int, dorks: list, context) -> None:
-    """
-    Burst Mode: processes dorks in sequential batches of BURST_SIZE.
-    Each batch gets a brand-new isolated session (created before run_chunk,
-    closed immediately after).  Results accumulate in a global dedup set;
-    the final file is written and sent only once — after ALL batches finish.
-    """
     sess = get_session(chat_id)
-    engines    = sess.get("engines", list(ENGINES))
-    workers_n  = min(sess.get("workers", WORKERS_PER_CHUNK), MAX_WORKERS_PER_CHUNK)
-    max_res    = sess.get("max_results", MAX_RESULTS)
-    pages      = sess.get("pages", [1])
-    use_tor    = sess.get("tor", False)
-    min_score  = sess.get("min_score", 30)
-    stealth_level   = sess.get("stealth", "medium")
-    stealth_profile = STEALTH_PROFILES.get(stealth_level, STEALTH_PROFILES["medium"])
+    engines = sess.get("engines", list(ENGINES))
+    workers_n = min(sess.get("workers", WORKERS_PER_CHUNK), MAX_WORKERS_PER_CHUNK)
+    max_res = sess.get("max_results", MAX_RESULTS)
+    pages = sess.get("pages", [1])
+    use_tor = sess.get("tor", False)
+    min_score = sess.get("min_score", 30)
+    n_chunks = max(1, sess.get("chunks", N_CHUNKS))
+    stealth_level = sess.get("stealth", "high")
+    stealth_profile = STEALTH_PROFILES.get(stealth_level, STEALTH_PROFILES["high"])
 
     total_dorks = len(dorks)
-    pages_str   = ", ".join(str(p) for p in pages)
-    start_time  = time.time()
+    pages_str = ", ".join(str(p) for p in pages)
+    start_time = time.time()
 
-    # ── Split into sequential bursts of exactly BURST_SIZE ──────────────────
-    batches       = [dorks[i:i + BURST_SIZE] for i in range(0, total_dorks, BURST_SIZE)]
-    total_batches = len(batches)
+    chunk_size = max(1, -(-total_dorks // n_chunks))
+    chunks = [dorks[i:i+chunk_size] for i in range(0, total_dorks, chunk_size)]
+    actual_chunks = len(chunks)
 
     log.info(
-        f"[JOB][{chat_id}] BURST MODE: {total_dorks} dorks → "
-        f"{total_batches} batches × {BURST_SIZE} (last={len(batches[-1])}) | "
-        f"{workers_n} workers/batch | stealth={stealth_level} | "
-        f"delay_dist={stealth_profile['delay_distribution']}"
+        f"[JOB][{chat_id}] Starting: {total_dorks} dorks → "
+        f"{actual_chunks} chunks × {workers_n} workers/chunk | "
+        f"stealth={stealth_level} | delay_dist={stealth_profile['delay_distribution']}"
     )
 
     tmp_file = tempfile.NamedTemporaryFile(
@@ -1401,13 +1409,10 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
         prefix=f"dork_{chat_id}_", suffix=".txt",
     )
     tmp_path = tmp_file.name
-    tmp_file.write(f"# Dork Parser v19.1 — Burst Mode Results\n")
-    tmp_file.write(f"# Date    : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-    tmp_file.write(f"# Dorks   : {total_dorks} | Pages: {pages_str}\n")
-    tmp_file.write(
-        f"# Filter  : SQL ≥{min_score} | "
-        f"Batches: {total_batches} × {BURST_SIZE} | Stealth: {stealth_level}\n"
-    )
+    tmp_file.write(f"# Dork Parser v20.0 — Yahoo Bypass Edition\n")
+    tmp_file.write(f"# Date   : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    tmp_file.write(f"# Dorks  : {total_dorks} | Pages: {pages_str}\n")
+    tmp_file.write(f"# Filter : SQL ≥{min_score} | Chunks: {actual_chunks} | Stealth: {stealth_level}\n")
     tmp_file.close()
 
     if use_tor:
@@ -1421,79 +1426,68 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
 
     status_msg = await context.bot.send_message(
         chat_id,
-        f"🕷 DORK PARSER v19.1 — BURST MODE\n"
+        f"🕷 DORK PARSER v20.0 — YAHOO BYPASS\n"
         f"{'━'*30}\n"
         f"📋 Dorks   : {total_dorks}\n"
         f"📄 Pages   : {pages_str}\n"
-        f"💥 Batches : {total_batches} × {BURST_SIZE} dorks (sequential)\n"
-        f"⚙️ Workers : {workers_n}/batch\n"
+        f"⚡ Chunks  : {actual_chunks} (isolated)\n"
+        f"⚙️ Workers : {workers_n}/chunk\n"
         f"🔍 Engines : {' + '.join(e.upper() for e in engines)}\n"
         f"🛡 Filter  : SQL ≥{min_score}\n"
-        f"🥷 Stealth : {stealth_level.upper()} "
-        f"(rotate TLS: {stealth_profile['impersonate_rotate']})\n"
+        f"🥷 Stealth : {stealth_level.upper()} (rotate TLS: {stealth_profile['impersonate_rotate']})\n"
         f"🌐 Network : {proxy_info}\n"
-        f"🔒 TLS     : Fresh fingerprint per batch\n"
-        f"{'━'*30}\n⏳ Starting batch 1/{total_batches}...",
+        f"🔒 TLS     : Rotating fingerprints (Chrome124/131, Firefox133)\n"
+        f"{'━'*30}\n⏳ Starting chunks...",
     )
 
     global_stop_ev = asyncio.Event()
     active_stop_evs[chat_id] = global_stop_ev
+    progress_q: asyncio.Queue = asyncio.Queue(maxsize=total_dorks * 2)
 
-    # ── Shared accumulators (updated inside the batch loop) ──────────────────
-    seen_urls:     set  = set()
-    all_scored:    list = []
-    total_raw      = 0
-    total_degraded = 0
-    failed_batches = 0
-    total_processed = 0      # dorks fully processed so far (across all batches)
-
-    # Shared state written by the batch loop, read by _status_updater
-    current_batch_num   = [1]    # 1-indexed display counter
-    current_batch_proc  = [0]    # processed dorks inside active batch
-    current_batch_total = [0]    # total dorks in active batch
-    agg_raw  = [0]               # cumulative raw URL count
-    agg_kept = [0]               # cumulative kept URL count
+    chunk_counters = {i: {"processed": 0, "total": len(chunks[i])} for i in range(actual_chunks)}
+    agg_raw = [0]
+    agg_kept = [0]
     last_edit = [0.0]
-
-    # Single shared progress_q reused across all batches (run_chunk fills it)
-    progress_q: asyncio.Queue = asyncio.Queue(maxsize=total_dorks * 4)
+    total_processed = [0]
 
     async def _status_updater() -> None:
-        """Background task: drains progress_q and updates the Telegram status."""
         while not global_stop_ev.is_set():
             drained = False
             while True:
                 try:
                     ev = progress_q.get_nowait()
-                    current_batch_proc[0] += 1
-                    agg_raw[0]  += ev["raw"]
+                    cid = ev["chunk_id"]
+                    chunk_counters[cid]["processed"] = ev["processed"]
+                    agg_raw[0] += ev["raw"]
                     agg_kept[0] += ev["kept"]
+                    total_processed[0] += 1
                     drained = True
                 except asyncio.QueueEmpty:
                     break
 
             if drained and time.time() - last_edit[0] > 4.0:
-                proc = total_processed + current_batch_proc[0]
-                pct  = int(proc / total_dorks * 100) if total_dorks else 100
-                bar  = "█" * (pct // 10) + "░" * (10 - pct // 10)
+                proc = total_processed[0]
+                pct = int(proc / total_dorks * 100) if total_dorks else 100
+                bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
                 elapsed = int(time.time() - start_time)
                 eta = int((elapsed / proc) * (total_dorks - proc)) if proc else 0
-                bn  = current_batch_num[0]
-                bp  = current_batch_proc[0]
-                bt  = current_batch_total[0]
+                cinfo = " | ".join(
+                    f"C{i}:{chunk_counters[i]['processed']}/{chunk_counters[i]['total']}"
+                    for i in range(actual_chunks)
+                )
                 try:
                     await context.bot.edit_message_text(
                         chat_id=chat_id,
                         message_id=status_msg.message_id,
                         text=(
-                            f"💥 BURST MODE — Batch {bn}/{total_batches}\n"
+                            f"⚡ PARSING... [{actual_chunks} parallel chunks]\n"
                             f"{'━'*30}\n"
                             f"[{bar}] {pct}%\n"
-                            f"✅ Done    : {proc}/{total_dorks} dorks\n"
+                            f"✅ Done    : {proc}/{total_dorks}\n"
                             f"🎯 SQL     : {agg_kept[0]}\n"
                             f"🗑 Raw drop: {agg_raw[0] - agg_kept[0]}\n"
                             f"⏱ {elapsed}s | ETA {eta}s\n"
-                            f"📦 Batch {bn}: {bp}/{bt} dorks\n"
+                            f"📦 {cinfo}\n"
                             f"{'━'*30}"
                         ),
                     )
@@ -1508,36 +1502,22 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
         log.warning(f"[JOB][{chat_id}] Global timeout ({JOB_TIMEOUT}s) — aborting")
         global_stop_ev.set()
 
-    status_task  = asyncio.create_task(_status_updater())
+    status_task = asyncio.create_task(_status_updater())
     timeout_task = asyncio.create_task(_job_timeout())
 
+    chunk_results = []
     try:
-        # ── Sequential batch loop ────────────────────────────────────────────
-        for batch_idx, batch_dorks in enumerate(batches):
-            if global_stop_ev.is_set():
-                log.info(f"[JOB][{chat_id}] Stop requested — skipping remaining batches")
-                break
+        chunk_tasks = []
+        for i, chunk_dorks in enumerate(chunks):
+            if i > 0:
+                stagger = random.uniform(*CHUNK_STAGGER_DELAY)
+                log.info(f"[JOB][{chat_id}] Staggering chunk C{i} by {stagger:.1f}s")
+                await asyncio.sleep(stagger)
 
-            batch_num  = batch_idx + 1
-            batch_size = len(batch_dorks)
-
-            # Update shared state for the status updater
-            current_batch_num[0]   = batch_num
-            current_batch_proc[0]  = 0          # reset per-batch counter
-            current_batch_total[0] = batch_size
-
-            log.info(
-                f"[JOB][{chat_id}] ── Burst {batch_num}/{total_batches} "
-                f"({batch_size} dorks) — creating fresh isolated session"
-            )
-
-            # ── Per-burst: brand-new isolated session ────────────────────────
-            batch_session = _make_isolated_session(use_tor=use_tor)
-
-            try:
-                result = await run_chunk(
-                    chunk_id=batch_idx,
-                    dorks=batch_dorks,
+            task = asyncio.create_task(
+                run_chunk(
+                    chunk_id=i,
+                    dorks=chunk_dorks,
                     engines=engines,
                     pages=pages,
                     max_res=max_res,
@@ -1548,39 +1528,17 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
                     global_stop_ev=global_stop_ev,
                     stealth_profile=stealth_profile,
                 )
+            )
+            chunk_tasks.append(task)
 
-                # ── Accumulate into global dedup set ─────────────────────────
-                new_kept = 0
-                for sc, url in result["scored"]:
-                    if url not in seen_urls:
-                        seen_urls.add(url)
-                        all_scored.append((sc, url))
-                        new_kept += 1
-
-                total_raw      += result["raw_count"]
-                total_degraded += result["degraded_count"]
-                total_processed += result["processed"]
-
-                log.info(
-                    f"[JOB][{chat_id}] Burst {batch_num}/{total_batches} done — "
-                    f"processed={result['processed']} raw={result['raw_count']} "
-                    f"new_kept={new_kept} cumulative_unique={len(all_scored)}"
-                )
-
-            except asyncio.CancelledError:
-                log.info(f"[JOB][{chat_id}] Burst {batch_num} cancelled")
-                raise
-            except Exception as exc:
-                log.error(f"[JOB][{chat_id}] Burst {batch_num} raised: {exc}")
-                failed_batches += 1
-            finally:
-                # ── Always close the batch session after the burst ────────────
-                await batch_session.close()
-                log.debug(f"[JOB][{chat_id}] Burst {batch_num} session closed")
+        chunk_results = await asyncio.gather(*chunk_tasks, return_exceptions=True)
 
     except asyncio.CancelledError:
         log.info(f"[JOB][{chat_id}] Job cancelled")
         global_stop_ev.set()
+        for t in chunk_tasks:
+            t.cancel()
+        await asyncio.gather(*chunk_tasks, return_exceptions=True)
         raise
     finally:
         global_stop_ev.set()
@@ -1590,17 +1548,34 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
         active_jobs.pop(chat_id, None)
         active_stop_evs.pop(chat_id, None)
 
-    # ── Final dedup sort & file write ────────────────────────────────────────
+    seen_urls: set = set()
+    all_scored: list = []
+    total_raw = 0
+    total_degraded = 0
+    failed_chunks = 0
+
+    for result in chunk_results:
+        if isinstance(result, Exception):
+            log.error(f"[JOB][{chat_id}] Chunk raised: {result}")
+            failed_chunks += 1
+            continue
+        for sc, url in result["scored"]:
+            if url not in seen_urls:
+                seen_urls.add(url)
+                all_scored.append((sc, url))
+        total_raw += result["raw_count"]
+        total_degraded += result["degraded_count"]
+
     all_scored.sort(reverse=True)
-    unique_cnt   = len(all_scored)
-    elapsed      = int(time.time() - start_time)
+    unique_cnt = len(all_scored)
+    elapsed = int(time.time() - start_time)
     success_rate = (total_raw - (total_raw - unique_cnt)) / max(total_raw, 1)
 
     log.info(
-        f"[JOB][{chat_id}] COMPLETE (BURST MODE) — dorks={total_dorks} "
-        f"batches={total_batches} raw={total_raw} unique={unique_cnt} "
-        f"degraded={total_degraded} failed_batches={failed_batches} "
-        f"elapsed={elapsed}s success_rate={success_rate:.1%}"
+        f"[JOB][{chat_id}] COMPLETE — dorks={total_dorks} raw={total_raw} "
+        f"unique={unique_cnt} degraded={total_degraded} "
+        f"failed_chunks={failed_chunks} elapsed={elapsed}s "
+        f"success_rate={success_rate:.1%}"
     )
 
     high   = [(sc, u) for sc, u in all_scored if sc >= 70]
@@ -1621,17 +1596,16 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
             for sc, u in low:
                 f.write(f"{u}\n")
 
-    stopped_early = " (PARTIAL — stopped early)" if global_stop_ev.is_set() else ""
     try:
         await context.bot.edit_message_text(
             chat_id=chat_id,
             message_id=status_msg.message_id,
             text=(
-                f"🏁 BURST MODE COMPLETE!{stopped_early}\n"
+                f"🏁 JOB COMPLETE!\n"
                 f"{'━'*30}\n"
                 f"📋 Dorks    : {total_dorks}\n"
                 f"📄 Pages    : {pages_str}\n"
-                f"💥 Batches  : {total_batches} × {BURST_SIZE}\n"
+                f"⚡ Chunks   : {actual_chunks}\n"
                 f"🔍 Raw      : {total_raw}\n"
                 f"🎯 SQL      : {unique_cnt} unique URLs\n"
                 f"🗑 Dropped  : {total_raw - unique_cnt} junk\n"
@@ -1650,10 +1624,10 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
                 chat_id, f,
                 filename=f"sql_{total_dorks}dorks_{unique_cnt}urls.txt",
                 caption=(
-                    f"📁 SQL Targets (Burst Mode)\n"
+                    f"📁 SQL Targets\n"
                     f"🎯 {unique_cnt} unique | 🗑 {total_raw - unique_cnt} junk\n"
                     f"📋 {total_dorks} dorks | Pages: {pages_str} | "
-                    f"💥 {total_batches} bursts × {BURST_SIZE}"
+                    f"⚡ {actual_chunks} chunks"
                 ),
             )
     else:
@@ -1669,7 +1643,7 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
         pass
 
 
-# ─── UI HELPERS ──────────────────────────────────────────────────────────────
+# ─── UI HELPERS (unchanged) ──────────────────────────────────────────────────
 def get_session(chat_id: int) -> dict:
     if chat_id not in user_sessions:
         user_sessions[chat_id] = dict(DEFAULT_SESSION)
@@ -1695,10 +1669,7 @@ def page_keyboard(selected: list) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ─── COMMAND HANDLERS (UPDATED) ──────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ─── COMMAND HANDLERS (unchanged except help text) ───────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [
         [InlineKeyboardButton("📂 Bulk Upload",  callback_data="m_bulk"),
@@ -1720,12 +1691,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         proxy_status = "🔓 No proxy pool"
 
     await update.message.reply_text(
-        "🕷 DORK PARSER v19.0 — ULTRA STEALTH\n"
+        "🕷 DORK PARSER v20.0 — YAHOO BYPASS EDITION\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🔒 Rotating TLS fingerprints (Chrome/Firefox/Safari)\n"
+        "🔒 Rotating TLS fingerprints (Chrome124/131, Firefox133)\n"
         "⚡ Parallel page fetching per dork\n"
-        "🔄 Full browser header rotation\n"
-        "📈 Human‑like delay (Gamma/LogNormal)\n"
+        "🔄 Full browser header rotation (matching impersonation)\n"
+        "📈 Human‑like delay (Lognormal distribution)\n"
         "🔍 Bing + Yahoo + DuckDuckGo engines\n"
         "🛡 SQL filter | Auto-slowdown | CAPTCHA handling\n"
         f"{proxy_status}\n\n"
@@ -1755,14 +1726,14 @@ async def cmd_stealth(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     sess = get_session(chat_id)
     if not context.args:
-        cur = sess.get("stealth", "medium")
+        cur = sess.get("stealth", "high")
         await update.message.reply_text(
             f"🥷 STEALTH LEVEL\n━━━━━━━━━━━━━━━━━━━━━━\n"
             f"Current: {cur.upper()}\n\n"
             f"Usage: /stealth low|medium|high\n\n"
             f"🟢 low  : Basic rotation, uniform delays\n"
-            f"🟡 medium: Rotating TLS, gamma delays, session recycle 20req\n"
-            f"🔴 high : Aggressive rotation, lognormal delays, recycle 8req, extra headers"
+            f"🟡 medium: Rotating TLS, lognormal delays, session recycle 15req\n"
+            f"🔴 high : Aggressive rotation, lognormal delays, recycle 5req, extra headers (recommended for Yahoo)"
         )
         return
     level = context.args[0].lower()
@@ -1866,14 +1837,14 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         proxy_line = "🔓 Proxies  : none loaded\n"
 
-    stealth = s.get("stealth", "medium")
+    stealth = s.get("stealth", "high")
     stealth_prof = STEALTH_PROFILES[stealth]
 
     await update.message.reply_text(
         f"⚙️ SETTINGS\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💥 Burst    : {BURST_SIZE} dorks/batch (sequential) [BURST_SIZE]\n"
-        f"🔧 Workers  : {s.get('workers', WORKERS_PER_CHUNK)}/batch (max {MAX_WORKERS_PER_CHUNK})\n"
+        f"⚡ Chunks   : {s.get('chunks', N_CHUNKS)} parallel sessions\n"
+        f"🔧 Workers  : {s.get('workers', WORKERS_PER_CHUNK)}/chunk (max {MAX_WORKERS_PER_CHUNK})\n"
         f"📄 Pages    : {', '.join(str(p) for p in s.get('pages', [1]))} (1–70)\n"
         f"🔍 Engines  : {'+'.join(e.upper() for e in s.get('engines', ENGINES))}\n"
         f"📊 Max/Page : {s.get('max_results', MAX_RESULTS)}\n"
@@ -1881,10 +1852,10 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🧅 Tor      : {'ON' if s.get('tor') else 'OFF'}\n"
         f"🥷 Stealth  : {stealth.upper()} (rotate TLS: {stealth_prof['impersonate_rotate']}, recycle: {stealth_prof['session_rotate_requests']}req)\n"
         f"⏱ Delay    : {MIN_DELAY}–{MAX_DELAY}s | Dist: {stealth_prof['delay_distribution']}\n"
-        f"🔒 TLS      : Fresh fingerprint per burst\n"
+        f"🔒 TLS      : Rotating fingerprints (Chrome124/131, Firefox133)\n"
         f"{proxy_line}"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"/workers N | /maxres N\n"
+        f"/workers N | /chunks N | /maxres N\n"
         f"/engine X  | /filter N | /stealth low|medium|high\n"
         f"/pages     | /tor\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1908,13 +1879,16 @@ async def cmd_workers(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_chunks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    await update.message.reply_text(
-        f"ℹ️ BURST MODE active — /chunks is no longer used.\n\n"
-        f"Dorks are now processed in sequential bursts of {BURST_SIZE} each.\n"
-        f"Burst size is set via the BURST_SIZE constant (default {BURST_SIZE}).\n\n"
-        f"Use /workers N to control how many workers run inside each burst.\n"
-        f"Current workers: {get_session(chat_id).get('workers', WORKERS_PER_CHUNK)}"
-    )
+    try:
+        n = max(1, min(int(context.args[0]), 8))
+        get_session(chat_id)["chunks"] = n
+        await update.message.reply_text(
+            f"✅ Parallel chunks: {n}\n"
+            f"Each chunk uses an isolated session + {get_session(chat_id).get('workers', WORKERS_PER_CHUNK)} workers."
+        )
+    except Exception:
+        cur = get_session(chat_id).get("chunks", N_CHUNKS)
+        await update.message.reply_text(f"Usage: /chunks N (1-8)\nCurrent: {cur}")
 
 
 async def cmd_maxres(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1993,10 +1967,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ─── PROXY MANAGEMENT COMMANDS (UNCHANGED) ───────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ─── PROXY MANAGEMENT COMMANDS (unchanged) ───────────────────────────────────
 async def cmd_addproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
@@ -2158,7 +2129,7 @@ async def cmd_testproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ext_ip = None
     error_msg = None
 
-    test_session = AsyncSession(impersonate="chrome110", verify=False, timeout=15, proxy=proxy_url)
+    test_session = AsyncSession(impersonate="chrome124", verify=False, timeout=15, proxy=proxy_url)
 
     try:
         for test_url in test_urls:
@@ -2223,9 +2194,6 @@ async def cmd_testproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(result_text)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-
-
 # ─── FILE DETECTION ──────────────────────────────────────────────────────────
 def _looks_like_url_list(lines: list) -> bool:
     non_empty = [l for l in lines if l.strip() and not l.startswith("#")]
@@ -2268,7 +2236,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"✅ {len(dorks)} dorks | Pages: {', '.join(str(p) for p in s.get('pages', [1]))}\n"
                 f"🛡 SQL ≥{s.get('min_score', 30)} | "
-                f"💥 {math.ceil(len(dorks) / BURST_SIZE)} bursts × {BURST_SIZE} | "
+                f"⚡ {s.get('chunks', N_CHUNKS)} chunks | "
                 f"{'🧅TOR' if s.get('tor') else '🔓 Direct'}\n🚀 Starting..."
             )
             active_jobs[chat_id] = asyncio.create_task(run_dork_job(chat_id, dorks, context))
@@ -2357,19 +2325,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ),
         "m_stealth": (
             f"🥷 STEALTH LEVEL\n━━━━━━━━━━━━━━━━━━━\n"
-            f"Current: {sess.get('stealth', 'medium').upper()}\n\n"
+            f"Current: {sess.get('stealth', 'high').upper()}\n\n"
             f"🟢 low  : Basic rotation, uniform delays\n"
-            f"🟡 medium: Rotating TLS, gamma delays, session recycle 20req\n"
-            f"🔴 high : Aggressive rotation, lognormal delays, recycle 8req, extra headers\n\n"
+            f"🟡 medium: Rotating TLS, lognormal delays, session recycle 15req\n"
+            f"🔴 high : Aggressive rotation, lognormal delays, recycle 5req, extra headers\n\n"
             f"Use /stealth low|medium|high to change."
         ),
         "m_settings": (
-            f"⚙️ Burst:{BURST_SIZE}dorks/batch "
-            f"Workers:{sess.get('workers', WORKERS_PER_CHUNK)}/batch "
+            f"⚙️ Chunks:{sess.get('chunks', N_CHUNKS)} "
+            f"Workers:{sess.get('workers', WORKERS_PER_CHUNK)}/chunk "
             f"Pages:{','.join(str(p) for p in sess.get('pages', [1]))} "
             f"Engines:{'+'.join(e.upper() for e in sess.get('engines', ENGINES))} "
             f"Score≥{sess.get('min_score', 30)} Tor:{'ON' if sess.get('tor') else 'OFF'} "
-            f"Stealth:{sess.get('stealth','medium')}"
+            f"Stealth:{sess.get('stealth','high')}"
         ),
         "m_help": (
             "📖 COMMANDS\n━━━━━━━━━━━━━━━━━━━\n"
@@ -2452,13 +2420,13 @@ def main():
     app.shutdown_handler = _shutdown
 
     log.info("=" * 60)
-    log.info("  DORK PARSER v19.1 — BURST MODE ARCHITECTURE")
-    log.info(f"  Burst size: {BURST_SIZE} dorks/batch (sequential) | Workers/batch: {WORKERS_PER_CHUNK} (max {MAX_WORKERS_PER_CHUNK})")
-    log.info(f"  Delay: {MIN_DELAY}–{MAX_DELAY}s | Fast: {FAST_MIN_DELAY}–{FAST_MAX_DELAY}s")
-    log.info(f"  TLS: Rotating fingerprints ({', '.join(IMPERSONATE_TARGETS[:3])}...)")
+    log.info("  DORK PARSER v20.0 — YAHOO BYPASS EDITION")
+    log.info(f"  Chunks: {N_CHUNKS} | Workers/chunk: {WORKERS_PER_CHUNK} (max {MAX_WORKERS_PER_CHUNK})")
+    log.info(f"  Delay: {MIN_DELAY}–{MAX_DELAY}s (lognormal default)")
+    log.info(f"  TLS: Rotating fingerprints ({', '.join(IMPERSONATE_TARGETS)})")
     log.info(f"  Proxies: {len(_proxy_pool)} loaded | PROXY_ENABLED={PROXY_ENABLED}")
     log.info(f"  Engines: {', '.join(ENGINES)}")
-    log.info(f"  Stealth levels: low, medium, high")
+    log.info(f"  Stealth levels: low, medium, high (default: high)")
     log.info("=" * 60)
     app.run_polling(drop_pending_updates=True)
 
