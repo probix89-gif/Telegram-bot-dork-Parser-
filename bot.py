@@ -1,13 +1,11 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║   DORK PARSER BOT v20.1 — ADVANCED YAHOO RATE LIMIT BYPASS      ║
+║   DORK PARSER BOT v20.2 — ULTIMATE YAHOO RATE LIMIT BYPASS      ║
 ║   TLS impersonation: Chrome124/131, Firefox133, Safari17        ║
-║   Residential proxy rotation | Lognormal human delays           ║
-║   Full browser header cloning | Session fingerprint refresh     ║
-║   CAPTCHA solver integration (stub) | DuckDuckGo/Bing           ║
+║   Per‑request proxy rotation | Aggressive session recycling     ║
+║   Cookie jar isolation | Subdomain + param noise | Offset jitter║
+║   Human‑like delays with adaptive backoff | CAPTCHA solver stub ║
 ║   Chunked parallel architecture | Global dedup                  ║
-║   Yahoo‑specific: rotating subdomains, query param noise,       ║
-║                   per‑request impersonation, exponential jitter ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -76,6 +74,11 @@ EMPTY_RATE_SLOWDOWN  = 0.50
 EMPTY_RATE_RECOVER   = 0.30
 CHUNK_STAGGER_DELAY  = (0.8, 2.5)
 
+# ─── ADVANCED BYPASS CONFIG ──────────────────────────────────────────────────
+PROXY_ROTATE_PER_REQUEST = os.environ.get("PROXY_ROTATE_PER_REQUEST", "true").lower() in ("true", "1", "yes")
+CLEAR_COOKIES_PER_DORK   = os.environ.get("CLEAR_COOKIES_PER_DORK", "true").lower() in ("true", "1", "yes")
+YAHOO_AGGRESSIVE_BACKOFF = True   # Use longer delays on rate limit detection
+
 # Stealth levels (enhanced for Yahoo)
 STEALTH_PROFILES = {
     "low": {
@@ -93,7 +96,7 @@ STEALTH_PROFILES = {
         "extra_headers": True,
     },
     "high": {
-        "session_rotate_requests": 5,
+        "session_rotate_requests": 3,      # More aggressive recycling
         "delay_distribution": "lognormal",
         "impersonate_rotate": True,
         "proxy_rotate_freq": 1,
@@ -109,7 +112,7 @@ DEFAULT_SESSION = {
     "pages":       [1],
     "tor":         False,
     "min_score":   30,
-    "stealth":     "high",          # default to high for Yahoo
+    "stealth":     "high",
 }
 
 user_sessions:   dict = {}
@@ -129,7 +132,8 @@ _PROXY_URL_RE = re.compile(
 
 # Track proxy failures for temporary blacklisting
 _proxy_failures: dict = {}   # proxy_url -> (fail_count, last_fail_time)
-PROXY_BAN_TIME = 300         # seconds to temporarily ban a failing proxy
+PROXY_BAN_TIME = 600         # seconds to temporarily ban a failing proxy (10 min)
+PROXY_COOLDOWN = {}          # proxy_url -> next_available_time
 
 
 def _validate_proxy_url(proxy_url: str) -> bool:
@@ -184,7 +188,7 @@ def _load_proxies() -> list:
 _proxy_pool: list = _load_proxies()
 
 
-def _mark_proxy_failure(proxy_url: str) -> None:
+def _mark_proxy_failure(proxy_url: str, permanent_ban: bool = False) -> None:
     """Record a proxy failure; if too many failures, temporarily remove."""
     now = time.time()
     if proxy_url not in _proxy_failures:
@@ -192,8 +196,13 @@ def _mark_proxy_failure(proxy_url: str) -> None:
     else:
         _proxy_failures[proxy_url][0] += 1
         _proxy_failures[proxy_url][1] = now
-    if _proxy_failures[proxy_url][0] >= 3:
-        log.warning(f"[PROXY] Temporarily banning {proxy_url} due to repeated failures")
+
+    fail_count = _proxy_failures[proxy_url][0]
+    ban_time = PROXY_BAN_TIME * (2 ** (fail_count - 1))  # exponential backoff for proxy
+    PROXY_COOLDOWN[proxy_url] = now + ban_time
+
+    if fail_count >= 3 or permanent_ban:
+        log.warning(f"[PROXY] Temporarily banning {proxy_url} due to {fail_count} failures (cooldown {ban_time}s)")
         if proxy_url in _proxy_pool:
             _proxy_pool.remove(proxy_url)
 
@@ -202,21 +211,30 @@ def _clean_proxy_bans() -> None:
     """Reinstate proxies whose ban time has expired."""
     now = time.time()
     to_reinstate = []
-    for proxy_url, (count, last_fail) in list(_proxy_failures.items()):
-        if now - last_fail > PROXY_BAN_TIME:
+    for proxy_url, avail_time in list(PROXY_COOLDOWN.items()):
+        if now >= avail_time:
             to_reinstate.append(proxy_url)
-            del _proxy_failures[proxy_url]
+            del PROXY_COOLDOWN[proxy_url]
+            if proxy_url in _proxy_failures:
+                del _proxy_failures[proxy_url]  # reset failure count
+
     for proxy_url in to_reinstate:
         if proxy_url not in _proxy_pool:
             _proxy_pool.append(proxy_url)
-            log.info(f"[PROXY] Reinstated {proxy_url} after ban timeout")
+            log.info(f"[PROXY] Reinstated {proxy_url} after cooldown")
 
 
-def _get_random_proxy(exclude: str | None = None) -> str | None:
+def _get_random_proxy(exclude: str | None = None, force_available: bool = True) -> str | None:
     if not PROXY_ENABLED or not _proxy_pool:
         return None
     _clean_proxy_bans()
     candidates = [p for p in _proxy_pool if p != exclude] if exclude else list(_proxy_pool)
+    if force_available:
+        now = time.time()
+        candidates = [p for p in candidates if PROXY_COOLDOWN.get(p, 0) <= now]
+    if not candidates:
+        # Fallback to any proxy in pool (even if cooldown not expired)
+        candidates = [p for p in _proxy_pool if p != exclude] if exclude else list(_proxy_pool)
     if not candidates:
         return _proxy_pool[0] if _proxy_pool else None
     return random.choice(candidates)
@@ -545,15 +563,13 @@ async def run_url_clean_job(chat_id: int, raw_lines: list, context) -> None:
 
 
 # ─── ENHANCED BROWSER PROFILES & HEADERS (Yahoo‑optimized) ──────────────────
-# Latest TLS impersonation targets for maximum compatibility
 IMPERSONATE_TARGETS = [
-    "chrome124",      # Stable Chrome
-    "chrome131",      # Latest Chrome as of early 2025
-    "firefox133",     # Latest Firefox
-    "safari17_0",     # Safari 17
+    "chrome124",
+    "chrome131",
+    "firefox133",
+    "safari17_0",
 ]
 
-# Browser header profiles matching the impersonated fingerprints
 BROWSER_PROFILES = [
     {   # Chrome 124 / Windows
         "User-Agent":                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -601,7 +617,6 @@ ACCEPT_LANGUAGES = [
 ]
 
 def _random_headers(extra: bool = False) -> dict:
-    """Return randomized headers with optional extra headers for high stealth."""
     headers = dict(random.choice(BROWSER_PROFILES))
     headers["Accept-Language"] = random.choice(ACCEPT_LANGUAGES)
     if extra:
@@ -617,10 +632,6 @@ def _random_headers(extra: bool = False) -> dict:
 # ─── SESSION FACTORY WITH TLS ROTATION (UPGRADED) ───────────────────────────
 def _make_isolated_session(use_tor: bool = False, proxy: str | None = None,
                            impersonate: str | None = None) -> AsyncSession:
-    """
-    Create a session with optional TLS fingerprint impersonation.
-    If impersonate is None, picks randomly from IMPERSONATE_TARGETS (modern browsers).
-    """
     if impersonate is None:
         impersonate = random.choice(IMPERSONATE_TARGETS)
 
@@ -655,19 +666,12 @@ def _make_fallback_session(exclude_proxy: str | None = None,
 
 
 # ─── CAPTCHA HANDLING (WITH OPTIONAL 2CAPTCHA STUB) ─────────────────────────
-# Set your 2Captcha API key in env to enable solving (optional)
 CAPTCHA_API_KEY = os.environ.get("CAPTCHA_API_KEY", "")
 
 async def solve_captcha_if_needed(session: AsyncSession, page_url: str, site_key: str = None) -> bool:
-    """
-    Stub for 2Captcha integration.
-    If CAPTCHA_API_KEY is set, attempts to solve the CAPTCHA.
-    Returns True if solved and session cookies updated, else False.
-    """
     if not CAPTCHA_API_KEY:
         return False
     try:
-        # Placeholder – implement with actual 2captcha library
         log.info("CAPTCHA solving not implemented in stub")
         return False
     except Exception as e:
@@ -679,8 +683,7 @@ async def _on_captcha_detected(engine: str, chunk_id: int, session_proxy: str | 
     log.warning(f"[C{chunk_id}][{engine.upper()}] 🔴 CAPTCHA detected!")
     if session_proxy:
         log.info(f"[C{chunk_id}] Marking proxy {session_proxy} as failed")
-        _mark_proxy_failure(session_proxy)
-    # Attempt solving if configured
+        _mark_proxy_failure(session_proxy, permanent_ban=True)
     if page_url and CAPTCHA_API_KEY:
         solved = await solve_captcha_if_needed(session_obj, page_url)
         if solved:
@@ -773,21 +776,17 @@ _DDG_NOISE     = re.compile(r"duckduckgo\.com|duck\.com", re.IGNORECASE)
 
 # ─── REALISTIC DELAY GENERATOR (LOGNORMAL DEFAULT) ───────────────────────────
 def _human_delay(distribution: str = "lognormal", base_min: float = 2.0, base_max: float = 6.0) -> float:
-    """
-    Generate a human-like delay.
-    - lognormal: mean ~3s, sigma 0.8 → realistic browsing pauses (recommended for Yahoo).
-    """
     if distribution == "uniform":
         return random.uniform(base_min, base_max)
     elif distribution == "gamma":
         delay = random.gammavariate(2.0, 1.5)
         return max(0.5, min(delay, 15.0))
-    else:  # lognormal (default)
+    else:  # lognormal
         delay = random.lognormvariate(1.0, 0.8)
         return max(1.0, min(delay, 20.0))
 
 
-# ─── BING PAGE FETCH (unchanged except stealth improvements) ────────────────
+# ─── BING PAGE FETCH (unchanged) ────────────────────────────────────────────
 async def fetch_page_bing(
     session: AsyncSession,
     dork: str, page: int, max_res: int,
@@ -886,10 +885,9 @@ async def fetch_page_bing(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ─── ADVANCED YAHOO RATE LIMIT BYPASS ────────────────────────────────────────
+# ─── ULTIMATE YAHOO RATE LIMIT BYPASS ────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Subdomain rotation to avoid rate‑limit clustering
 _YAHOO_SUBDOMAINS = [
     "search.yahoo.com",
     "search.yahoo.co.jp",
@@ -898,13 +896,19 @@ _YAHOO_SUBDOMAINS = [
     "search.yahoo.com.au",
     "search.yahoo.de",
     "search.yahoo.fr",
+    "search.yahoo.com.br",
+    "search.yahoo.com.mx",
+    "search.yahoo.com.sg",
+    "search.yahoo.com.hk",
+    "search.yahoo.co.id",
+    "search.yahoo.co.in",
 ]
 
-# Additional noise parameters that Yahoo accepts (vary per request)
 _YAHOO_NOISE_PARAMS = [
     ("fr", lambda: f"yfp-t-{random.randint(100,999)}"),
     ("fr2", lambda: f"sb-top-{random.choice(['us','uk','jp','ca','au','de','fr'])}"),
-    ("b", lambda: None),  # we already use 'b' for pagination offset; jitter applied
+    ("ei", lambda: f"UTF-8"),
+    ("tsrc", lambda: "tled"),
 ]
 
 async def fetch_page_yahoo(
@@ -914,20 +918,18 @@ async def fetch_page_yahoo(
     stealth_profile: dict = None,
 ) -> tuple:
     """
-    Fetch Yahoo search results with advanced rate‑limit bypass:
-      - Rotates subdomains (search.yahoo.com, .co.jp, .co.uk, etc.)
-      - Adds random noise query parameters (fr, fr2)
-      - Applies jitter to pagination offset 'b'
-      - Per‑request TLS impersonation rotation
-      - Exponential backoff with jitter on 429
-      - Proxy rotation on failure
+    Fetch Yahoo search results with ultimate rate‑limit bypass:
+      - Rotates subdomains per attempt
+      - Adds random noise query parameters (fr, fr2, ei, tsrc)
+      - Applies jitter to pagination offset 'b' (0-2 positions)
+      - Per‑request TLS impersonation rotation (if enabled)
+      - Per‑request proxy rotation (if PROXY_ROTATE_PER_REQUEST)
+      - Aggressive exponential backoff with jitter on 429/403
+      - Cookie jar isolation per dork (if CLEAR_COOKIES_PER_DORK)
     """
-    # Pick a random subdomain for this request (spread load across regional endpoints)
     subdomain = random.choice(_YAHOO_SUBDOMAINS)
 
-    # Base parameters
     base_offset = (page - 1) * 10 + 1
-    # Jitter the offset by ±0‑2 positions to break predictable pagination patterns
     jitter = random.randint(0, 2)
     offset = base_offset + jitter
 
@@ -938,28 +940,37 @@ async def fetch_page_yahoo(
         "vl": "lang_en",
     }
 
-    # Add random noise parameters
     for param_name, value_gen in _YAHOO_NOISE_PARAMS:
         if param_name == "b":
-            continue  # already handled
-        if random.random() < 0.7:  # 70% chance to include each noise param
+            continue
+        if random.random() < 0.8:  # 80% chance
             params[param_name] = value_gen()
 
     active_session = session
     fallback_session = None
-    extra_headers = stealth_profile.get("extra_headers", True) if stealth_profile else True  # Yahoo needs extra headers
+    extra_headers = stealth_profile.get("extra_headers", True) if stealth_profile else True
 
-    # Build the URL for logging and CAPTCHA solving reference
     yahoo_url = f"https://{subdomain}/search?{ '&'.join(f'{k}={quote_plus(str(v))}' for k,v in params.items()) }"
 
     try:
         for attempt in range(MAX_RETRIES):
-            # Rotate impersonation for every attempt (even within the same session)
+            # Rotate impersonation per attempt
             if stealth_profile and stealth_profile.get("impersonate_rotate", True):
                 active_session._impersonate = random.choice(IMPERSONATE_TARGETS)
 
+            # Per-request proxy rotation (if enabled)
+            if PROXY_ROTATE_PER_REQUEST and PROXY_ENABLED and len(_proxy_pool) > 1:
+                cur_proxy = getattr(active_session, "_cur_proxy", None)
+                new_proxy = _get_random_proxy(exclude=cur_proxy)
+                if new_proxy and new_proxy != cur_proxy:
+                    log.debug(f"[C{chunk_id}][YAHOO] Rotating proxy to {new_proxy}")
+                    if fallback_session is not None:
+                        await fallback_session.close()
+                    fallback_session = _make_isolated_session(proxy=new_proxy,
+                                                              impersonate=getattr(active_session, "_impersonate", None))
+                    active_session = fallback_session
+
             headers = _random_headers(extra=extra_headers)
-            # Referer must match the subdomain used
             headers["Referer"] = f"https://{subdomain}/"
             headers["Origin"] = f"https://{subdomain}"
 
@@ -976,16 +987,17 @@ async def fetch_page_yahoo(
 
                 log.debug(f"[C{chunk_id}][YAHOO] p{page} (offset={offset}) {subdomain} attempt={attempt+1} status={status} size={size_kb:.1f}KB")
 
-                if status == 429:
-                    # Rate limit hit: exponential backoff with jitter
-                    backoff = (2 ** attempt) * random.uniform(8.0, 15.0)
-                    log.warning(f"[C{chunk_id}][YAHOO] p{page} rate-limited (429) — backoff {backoff:.1f}s")
+                if status in (429, 403):
+                    backoff = (2 ** attempt) * random.uniform(10.0, 20.0) if YAHOO_AGGRESSIVE_BACKOFF else (2 ** attempt) * random.uniform(8.0, 15.0)
+                    log.warning(f"[C{chunk_id}][YAHOO] p{page} rate-limited ({status}) — backoff {backoff:.1f}s")
 
-                    # Rotate proxy and subdomain for next attempt
                     cur_proxy = getattr(active_session, "_cur_proxy", None)
-                    if cur_proxy and PROXY_ENABLED and len(_proxy_pool) > 1:
+                    if cur_proxy:
                         _mark_proxy_failure(cur_proxy)
-                        log.info(f"[C{chunk_id}][YAHOO] Switching proxy after 429")
+
+                    # Switch subdomain and proxy for next attempt
+                    subdomain = random.choice(_YAHOO_SUBDOMAINS)
+                    if PROXY_ENABLED and len(_proxy_pool) > 1:
                         if fallback_session is not None:
                             await fallback_session.close()
                         fallback_session = _make_fallback_session(
@@ -993,10 +1005,6 @@ async def fetch_page_yahoo(
                             impersonate=getattr(active_session, "_impersonate", None)
                         )
                         active_session = fallback_session
-
-                    # Also rotate subdomain for next retry
-                    subdomain = random.choice(_YAHOO_SUBDOMAINS)
-                    params["b"] = offset  # keep same offset
 
                     await asyncio.sleep(backoff)
                     continue
@@ -1009,12 +1017,11 @@ async def fetch_page_yahoo(
                     await _on_captcha_detected("yahoo", chunk_id,
                                                getattr(active_session, "_cur_proxy", None),
                                                active_session, page_url=yahoo_url)
-                    # After CAPTCHA, rotate subdomain and proxy
                     subdomain = random.choice(_YAHOO_SUBDOMAINS)
                     if PROXY_ENABLED and len(_proxy_pool) > 1:
                         cur_proxy = getattr(active_session, "_cur_proxy", None)
                         if cur_proxy:
-                            _mark_proxy_failure(cur_proxy)
+                            _mark_proxy_failure(cur_proxy, permanent_ban=True)
                         if fallback_session is not None:
                             await fallback_session.close()
                         fallback_session = _make_fallback_session(
@@ -1027,7 +1034,6 @@ async def fetch_page_yahoo(
                 if _is_degraded(html, "yahoo"):
                     log.warning(f"[C{chunk_id}][YAHOO] p{page} degraded ({size_kb:.1f}KB)")
                     if attempt < MAX_RETRIES - 1:
-                        # Wait and try with a new subdomain/proxy
                         subdomain = random.choice(_YAHOO_SUBDOMAINS)
                         await asyncio.sleep((2 ** attempt) * random.uniform(3.0, 7.0))
                         continue
@@ -1234,7 +1240,7 @@ async def fetch_all_pages(
     return all_urls, degraded_total
 
 
-# ─── WORKER WITH SESSION RECYCLING ───────────────────────────────────────────
+# ─── WORKER WITH AGGRESSIVE SESSION RECYCLING ─────────────────────────────────
 async def dork_worker(
     wid: int,
     chunk_id: int,
@@ -1254,10 +1260,9 @@ async def dork_worker(
     consecutive_hits = 0
     request_count = 0
 
-    # Create initial session
     impersonate = random.choice(IMPERSONATE_TARGETS) if stealth_profile.get("impersonate_rotate", True) else None
     session = _make_isolated_session(use_tor=use_tor, impersonate=impersonate)
-    session_rotate_limit = stealth_profile.get("session_rotate_requests", 15)
+    session_rotate_limit = stealth_profile.get("session_rotate_requests", 5)
 
     try:
         while not stop_ev.is_set():
@@ -1269,6 +1274,10 @@ async def dork_worker(
             engine = engines[eidx % len(engines)]
             eidx += 1
             log.info(f"[C{chunk_id}][W{wid}][{engine.upper()}] {dork[:55]}")
+
+            # Clear cookies per dork if enabled (Yahoo bypass)
+            if CLEAR_COOKIES_PER_DORK and engine == "yahoo":
+                session.cookies.clear()
 
             raw = []
             degraded_cnt = 0
@@ -1301,7 +1310,7 @@ async def dork_worker(
             request_count += 1
             session._request_count = getattr(session, "_request_count", 0) + 1
 
-            # Session recycling: close and create new after N requests
+            # Aggressive session recycling
             if request_count % session_rotate_limit == 0:
                 log.info(f"[C{chunk_id}][W{wid}] Recycling session after {session_rotate_limit} requests")
                 await session.close()
@@ -1309,14 +1318,13 @@ async def dork_worker(
                 session = _make_isolated_session(use_tor=use_tor, impersonate=impersonate)
                 await asyncio.sleep(random.uniform(1.0, 3.0))
 
-            # Delay calculation with lognormal distribution (best for Yahoo)
+            # Delay calculation
             dist = stealth_profile.get("delay_distribution", "lognormal")
             if raw:
                 consecutive_hits += 1
                 empty_streak = 0
                 if consecutive_hits >= FAST_STREAK_THRESHOLD:
                     delay = _human_delay(dist, FAST_MIN_DELAY, FAST_MAX_DELAY)
-                    log.debug(f"[C{chunk_id}][W{wid}] FAST mode delay={delay:.2f}s")
                 else:
                     delay = _human_delay(dist, MIN_DELAY, MAX_DELAY)
             else:
@@ -1331,10 +1339,9 @@ async def dork_worker(
             if slowdown_ev.is_set():
                 delay += random.uniform(3.0, 8.0)
 
-            # Occasional long human-like break (10-40s every 15-30 requests)
             if request_count % random.randint(15, 30) == 0:
                 long_break = random.uniform(10.0, 40.0)
-                log.info(f"[C{chunk_id}][W{wid}] Taking a human‑like break of {long_break:.1f}s")
+                log.info(f"[C{chunk_id}][W{wid}] Human‑like break {long_break:.1f}s")
                 await asyncio.sleep(long_break)
 
             await asyncio.sleep(delay)
@@ -1343,7 +1350,7 @@ async def dork_worker(
         await session.close()
 
 
-# ─── CHUNK RUNNER (UPDATED FOR STEALTH PROFILE) ──────────────────────────────
+# ─── CHUNK RUNNER (UPDATED) ──────────────────────────────────────────────────
 async def run_chunk(
     chunk_id: int,
     dorks: list,
@@ -1496,7 +1503,7 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
         prefix=f"dork_{chat_id}_", suffix=".txt",
     )
     tmp_path = tmp_file.name
-    tmp_file.write(f"# Dork Parser v20.1 — Advanced Yahoo Bypass\n")
+    tmp_file.write(f"# Dork Parser v20.2 — Ultimate Yahoo Bypass\n")
     tmp_file.write(f"# Date   : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
     tmp_file.write(f"# Dorks  : {total_dorks} | Pages: {pages_str}\n")
     tmp_file.write(f"# Filter : SQL ≥{min_score} | Chunks: {actual_chunks} | Stealth: {stealth_level}\n")
@@ -1505,7 +1512,7 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
     if use_tor:
         proxy_info = "🧅 TOR"
     elif PROXY_ENABLED and _proxy_pool:
-        proxy_info = f"🔄 {len(_proxy_pool)} proxies (rotating per dork)"
+        proxy_info = f"🔄 {len(_proxy_pool)} proxies (rotating per request: {PROXY_ROTATE_PER_REQUEST})"
     elif not PROXY_ENABLED and _proxy_pool:
         proxy_info = f"⏸ Proxy disabled ({len(_proxy_pool)} loaded)"
     else:
@@ -1513,7 +1520,7 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
 
     status_msg = await context.bot.send_message(
         chat_id,
-        f"🕷 DORK PARSER v20.1 — ADVANCED YAHOO BYPASS\n"
+        f"🕷 DORK PARSER v20.2 — ULTIMATE YAHOO BYPASS\n"
         f"{'━'*30}\n"
         f"📋 Dorks   : {total_dorks}\n"
         f"📄 Pages   : {pages_str}\n"
@@ -1778,12 +1785,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         proxy_status = "🔓 No proxy pool"
 
     await update.message.reply_text(
-        "🕷 DORK PARSER v20.1 — ADVANCED YAHOO BYPASS EDITION\n"
+        "🕷 DORK PARSER v20.2 — ULTIMATE YAHOO BYPASS\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "🔒 Rotating TLS fingerprints (Chrome124/131, Firefox133, Safari17)\n"
         "⚡ Parallel page fetching per dork\n"
-        "🔄 Full browser header rotation (matching impersonation)\n"
-        "📈 Human‑like delay (Lognormal distribution)\n"
+        "🔄 Per‑request proxy rotation & cookie isolation\n"
+        "📈 Human‑like delay (Lognormal distribution) with adaptive backoff\n"
         "🔍 Bing + Yahoo + DuckDuckGo engines\n"
         "🛡 SQL filter | Auto-slowdown | CAPTCHA handling\n"
         "🥷 Yahoo‑specific: subdomain rotation, query noise, offset jitter\n"
@@ -1821,7 +1828,7 @@ async def cmd_stealth(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Usage: /stealth low|medium|high\n\n"
             f"🟢 low  : Basic rotation, uniform delays\n"
             f"🟡 medium: Rotating TLS, lognormal delays, session recycle 15req\n"
-            f"🔴 high : Aggressive rotation, lognormal delays, recycle 5req, extra headers (recommended for Yahoo)"
+            f"🔴 high : Aggressive rotation, lognormal delays, recycle 3req, extra headers (recommended for Yahoo)"
         )
         return
     level = context.args[0].lower()
@@ -1941,6 +1948,8 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🥷 Stealth  : {stealth.upper()} (rotate TLS: {stealth_prof['impersonate_rotate']}, recycle: {stealth_prof['session_rotate_requests']}req)\n"
         f"⏱ Delay    : {MIN_DELAY}–{MAX_DELAY}s | Dist: {stealth_prof['delay_distribution']}\n"
         f"🔒 TLS      : Rotating fingerprints (Chrome124/131, Firefox133, Safari17)\n"
+        f"🔄 Proxy rotate per request: {PROXY_ROTATE_PER_REQUEST}\n"
+        f"🍪 Clear cookies per dork: {CLEAR_COOKIES_PER_DORK}\n"
         f"{proxy_line}"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"/workers N | /chunks N | /maxres N\n"
@@ -2416,7 +2425,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Current: {sess.get('stealth', 'high').upper()}\n\n"
             f"🟢 low  : Basic rotation, uniform delays\n"
             f"🟡 medium: Rotating TLS, lognormal delays, session recycle 15req\n"
-            f"🔴 high : Aggressive rotation, lognormal delays, recycle 5req, extra headers\n\n"
+            f"🔴 high : Aggressive rotation, lognormal delays, recycle 3req, extra headers\n\n"
             f"Use /stealth low|medium|high to change."
         ),
         "m_settings": (
@@ -2508,11 +2517,12 @@ def main():
     app.shutdown_handler = _shutdown
 
     log.info("=" * 60)
-    log.info("  DORK PARSER v20.1 — ADVANCED YAHOO RATE LIMIT BYPASS")
+    log.info("  DORK PARSER v20.2 — ULTIMATE YAHOO RATE LIMIT BYPASS")
     log.info(f"  Chunks: {N_CHUNKS} | Workers/chunk: {WORKERS_PER_CHUNK} (max {MAX_WORKERS_PER_CHUNK})")
     log.info(f"  Delay: {MIN_DELAY}–{MAX_DELAY}s (lognormal default)")
     log.info(f"  TLS: Rotating fingerprints ({', '.join(IMPERSONATE_TARGETS)})")
-    log.info(f"  Proxies: {len(_proxy_pool)} loaded | PROXY_ENABLED={PROXY_ENABLED}")
+    log.info(f"  Proxies: {len(_proxy_pool)} loaded | PROXY_ENABLED={PROXY_ENABLED} | Per-request rotation: {PROXY_ROTATE_PER_REQUEST}")
+    log.info(f"  Clear cookies per dork: {CLEAR_COOKIES_PER_DORK}")
     log.info(f"  Engines: {', '.join(ENGINES)}")
     log.info(f"  Stealth levels: low, medium, high (default: high)")
     log.info("=" * 60)
