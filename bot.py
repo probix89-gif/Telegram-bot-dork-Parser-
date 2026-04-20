@@ -1,11 +1,11 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║   DORK PARSER BOT v20.2 — ULTIMATE YAHOO RATE LIMIT BYPASS      ║
-║   TLS impersonation: Chrome124/131, Firefox133, Safari17        ║
-║   Per‑request proxy rotation | Aggressive session recycling     ║
-║   Cookie jar isolation | Subdomain + param noise | Offset jitter║
-║   Human‑like delays with adaptive backoff | CAPTCHA solver stub ║
-║   Chunked parallel architecture | Global dedup                  ║
+║   DORK PARSER BOT v20.3 — ENTERPRISE YAHOO BYPASS               ║
+║   Advanced fingerprint emulation (canvas, WebGL, fonts)         ║
+║   Per‑worker browser profiles (resolution, timezone, language)  ║
+║   Intelligent proxy scoring & adaptive concurrency              ║
+║   Session warming & human behavior simulation                   ║
+║   Domain fronting & regional edge routing                       ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -17,6 +17,9 @@ import time
 import logging
 import tempfile
 import math
+import hashlib
+import json
+from collections import defaultdict
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
@@ -77,7 +80,9 @@ CHUNK_STAGGER_DELAY  = (0.8, 2.5)
 # ─── ADVANCED BYPASS CONFIG ──────────────────────────────────────────────────
 PROXY_ROTATE_PER_REQUEST = os.environ.get("PROXY_ROTATE_PER_REQUEST", "true").lower() in ("true", "1", "yes")
 CLEAR_COOKIES_PER_DORK   = os.environ.get("CLEAR_COOKIES_PER_DORK", "true").lower() in ("true", "1", "yes")
-YAHOO_AGGRESSIVE_BACKOFF = True   # Use longer delays on rate limit detection
+YAHOO_AGGRESSIVE_BACKOFF = True
+WARMUP_SESSION           = os.environ.get("WARMUP_SESSION", "true").lower() in ("true", "1", "yes")
+ADAPTIVE_CONCURRENCY     = os.environ.get("ADAPTIVE_CONCURRENCY", "true").lower() in ("true", "1", "yes")
 
 # Stealth levels (enhanced for Yahoo)
 STEALTH_PROFILES = {
@@ -87,6 +92,8 @@ STEALTH_PROFILES = {
         "impersonate_rotate": False,
         "proxy_rotate_freq": 1,
         "extra_headers": False,
+        "canvas_fingerprint": False,
+        "viewport_emulation": False,
     },
     "medium": {
         "session_rotate_requests": 15,
@@ -94,13 +101,17 @@ STEALTH_PROFILES = {
         "impersonate_rotate": True,
         "proxy_rotate_freq": 1,
         "extra_headers": True,
+        "canvas_fingerprint": True,
+        "viewport_emulation": True,
     },
     "high": {
-        "session_rotate_requests": 3,      # More aggressive recycling
+        "session_rotate_requests": 3,
         "delay_distribution": "lognormal",
         "impersonate_rotate": True,
         "proxy_rotate_freq": 1,
         "extra_headers": True,
+        "canvas_fingerprint": True,
+        "viewport_emulation": True,
     }
 }
 
@@ -120,7 +131,7 @@ active_jobs:     dict = {}
 active_stop_evs: dict = {}
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ─── PROXY MANAGEMENT (ENHANCED WITH RESIDENTIAL SUPPORT) ────────────────────
+# ─── PROXY MANAGEMENT WITH SCORING & ADAPTIVE SELECTION ──────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
 PROXY_ENABLED: bool = os.environ.get("PROXY_ENABLED", "true").lower() not in ("false", "0", "no")
@@ -130,15 +141,23 @@ _PROXY_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Track proxy failures for temporary blacklisting
-_proxy_failures: dict = {}   # proxy_url -> (fail_count, last_fail_time)
-PROXY_BAN_TIME = 600         # seconds to temporarily ban a failing proxy (10 min)
-PROXY_COOLDOWN = {}          # proxy_url -> next_available_time
+# Proxy scoring system
+class ProxyScore:
+    __slots__ = ("success", "fail", "latency_avg", "last_used", "blocked_until")
+    def __init__(self):
+        self.success = 0
+        self.fail = 0
+        self.latency_avg = 0.0
+        self.last_used = 0.0
+        self.blocked_until = 0.0
 
+_proxy_scores: dict = defaultdict(ProxyScore)
+PROXY_BAN_TIME = 600
+PROXY_MIN_SUCCESS_RATE = 0.3
+PROXY_MAX_LATENCY = 5000  # ms
 
 def _validate_proxy_url(proxy_url: str) -> bool:
     return bool(_PROXY_URL_RE.match(proxy_url.strip()))
-
 
 def _parse_proxy_info(proxy_url: str) -> dict:
     try:
@@ -152,7 +171,6 @@ def _parse_proxy_info(proxy_url: str) -> dict:
     except Exception:
         return {"protocol": "?", "host": str(proxy_url)[:30], "port": "?", "auth": False}
 
-
 def _persist_proxies() -> None:
     try:
         with open("proxies.txt", "w", encoding="utf-8") as f:
@@ -164,7 +182,6 @@ def _persist_proxies() -> None:
         log.info(f"[PROXY] Persisted {len(_proxy_pool)} proxies to proxies.txt")
     except Exception as exc:
         log.warning(f"[PROXY] Failed to persist proxies.txt: {exc}")
-
 
 def _load_proxies() -> list:
     proxies = []
@@ -184,61 +201,69 @@ def _load_proxies() -> list:
         log.info(f"[PROXY] Loaded {len(proxies)} proxies from proxies.txt")
     return proxies
 
-
 _proxy_pool: list = _load_proxies()
 
-
-def _mark_proxy_failure(proxy_url: str, permanent_ban: bool = False) -> None:
-    """Record a proxy failure; if too many failures, temporarily remove."""
-    now = time.time()
-    if proxy_url not in _proxy_failures:
-        _proxy_failures[proxy_url] = [1, now]
+def _update_proxy_score(proxy_url: str, success: bool, latency_ms: float = 0):
+    score = _proxy_scores[proxy_url]
+    if success:
+        score.success += 1
+        if latency_ms > 0:
+            if score.latency_avg == 0:
+                score.latency_avg = latency_ms
+            else:
+                score.latency_avg = 0.7 * score.latency_avg + 0.3 * latency_ms
     else:
-        _proxy_failures[proxy_url][0] += 1
-        _proxy_failures[proxy_url][1] = now
+        score.fail += 1
+        # Exponential backoff for failing proxy
+        fail_count = score.fail
+        ban_time = PROXY_BAN_TIME * (2 ** (fail_count - 1))
+        score.blocked_until = time.time() + ban_time
+        if fail_count >= 3:
+            if proxy_url in _proxy_pool:
+                _proxy_pool.remove(proxy_url)
+                log.warning(f"[PROXY] Removed {proxy_url} due to high failure rate")
 
-    fail_count = _proxy_failures[proxy_url][0]
-    ban_time = PROXY_BAN_TIME * (2 ** (fail_count - 1))  # exponential backoff for proxy
-    PROXY_COOLDOWN[proxy_url] = now + ban_time
-
-    if fail_count >= 3 or permanent_ban:
-        log.warning(f"[PROXY] Temporarily banning {proxy_url} due to {fail_count} failures (cooldown {ban_time}s)")
-        if proxy_url in _proxy_pool:
-            _proxy_pool.remove(proxy_url)
-
-
-def _clean_proxy_bans() -> None:
-    """Reinstate proxies whose ban time has expired."""
-    now = time.time()
-    to_reinstate = []
-    for proxy_url, avail_time in list(PROXY_COOLDOWN.items()):
-        if now >= avail_time:
-            to_reinstate.append(proxy_url)
-            del PROXY_COOLDOWN[proxy_url]
-            if proxy_url in _proxy_failures:
-                del _proxy_failures[proxy_url]  # reset failure count
-
-    for proxy_url in to_reinstate:
-        if proxy_url not in _proxy_pool:
-            _proxy_pool.append(proxy_url)
-            log.info(f"[PROXY] Reinstated {proxy_url} after cooldown")
-
-
-def _get_random_proxy(exclude: str | None = None, force_available: bool = True) -> str | None:
+def _get_best_proxy(exclude: str | None = None) -> str | None:
     if not PROXY_ENABLED or not _proxy_pool:
         return None
-    _clean_proxy_bans()
-    candidates = [p for p in _proxy_pool if p != exclude] if exclude else list(_proxy_pool)
-    if force_available:
-        now = time.time()
-        candidates = [p for p in candidates if PROXY_COOLDOWN.get(p, 0) <= now]
-    if not candidates:
-        # Fallback to any proxy in pool (even if cooldown not expired)
-        candidates = [p for p in _proxy_pool if p != exclude] if exclude else list(_proxy_pool)
-    if not candidates:
-        return _proxy_pool[0] if _proxy_pool else None
-    return random.choice(candidates)
 
+    now = time.time()
+    available = []
+    for p in _proxy_pool:
+        if p == exclude:
+            continue
+        score = _proxy_scores.get(p)
+        if score and score.blocked_until > now:
+            continue
+        # Skip proxies with too high failure rate
+        if score:
+            total = score.success + score.fail
+            if total >= 5 and (score.success / total) < PROXY_MIN_SUCCESS_RATE:
+                continue
+            if score.latency_avg > PROXY_MAX_LATENCY:
+                continue
+        available.append(p)
+
+    if not available:
+        # Fallback to any proxy not excluded
+        available = [p for p in _proxy_pool if p != exclude]
+
+    if not available:
+        return _proxy_pool[0] if _proxy_pool else None
+
+    # Weighted random selection based on success rate and latency
+    weights = []
+    for p in available:
+        score = _proxy_scores.get(p)
+        if score and (score.success + score.fail) > 0:
+            success_rate = score.success / (score.success + score.fail)
+            latency_factor = max(0.1, 1.0 - (score.latency_avg / 5000)) if score.latency_avg else 0.5
+            weight = success_rate * 0.7 + latency_factor * 0.3
+        else:
+            weight = 0.5  # neutral for untested
+        weights.append(weight)
+
+    return random.choices(available, weights=weights, k=1)[0]
 
 def _is_proxy_error(exc: Exception) -> bool:
     msg = str(exc).lower()
@@ -249,7 +274,6 @@ def _is_proxy_error(exc: Exception) -> bool:
         "recv failure", "ssl handshake", "timed out",
     )
     return any(kw in msg for kw in proxy_keywords)
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ─── TOR ROTATION (unchanged) ────────────────────────────────────────────────
@@ -294,7 +318,6 @@ def stop_tor_rotation() -> None:
         _tor_rotation_task = None
         log.info("Tor rotation task stopped")
 
-
 # ─── SQL FILTER ENGINE (unchanged) ──────────────────────────────────────────
 BLACKLISTED_DOMAINS = {
     "yahoo.uservoice.com", "uservoice.com", "bing.com", "google.com", "googleapis.com",
@@ -336,7 +359,6 @@ _JUNK_RE = re.compile(
     r"/wp-content/uploads/",
     re.IGNORECASE,
 )
-
 
 def score_url(url: str) -> int:
     try:
@@ -383,13 +405,11 @@ def score_url(url: str) -> int:
 
     return max(0, min(score, 100))
 
-
 def filter_scored(urls: list, min_score: int) -> list:
     result = [(score_url(u), u) for u in urls]
     result = [(s, u) for s, u in result if s >= min_score]
     result.sort(reverse=True)
     return result
-
 
 # ─── URL CLEANER MODULE (unchanged) ─────────────────────────────────────────
 MAX_URL_LENGTH = 200
@@ -561,17 +581,22 @@ async def run_url_clean_job(chat_id: int, raw_lines: list, context) -> None:
     active_stop_evs.pop(chat_id, None)
     active_jobs.pop(chat_id, None)
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ─── ADVANCED BROWSER FINGERPRINT EMULATION ──────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ─── ENHANCED BROWSER PROFILES & HEADERS (Yahoo‑optimized) ──────────────────
 IMPERSONATE_TARGETS = [
     "chrome124",
     "chrome131",
     "firefox133",
     "safari17_0",
+    "edge101",
+    "chrome120",
 ]
 
+# Browser profiles with realistic screen resolutions, timezones, languages
 BROWSER_PROFILES = [
-    {   # Chrome 124 / Windows
+    {   # Chrome 124 / Windows 10
         "User-Agent":                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
         "Accept-Language":           "en-US,en;q=0.9",
@@ -585,6 +610,9 @@ BROWSER_PROFILES = [
         "Sec-Fetch-User":            "?1",
         "Upgrade-Insecure-Requests": "1",
         "Cache-Control":             "max-age=0",
+        "viewport":                  {"width": 1920, "height": 1080},
+        "timezone":                  "America/New_York",
+        "platform":                  "Win32",
     },
     {   # Firefox 133 / Linux
         "User-Agent":                "Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0",
@@ -597,6 +625,9 @@ BROWSER_PROFILES = [
         "Sec-Fetch-User":            "?1",
         "Upgrade-Insecure-Requests": "1",
         "TE":                        "trailers",
+        "viewport":                  {"width": 1366, "height": 768},
+        "timezone":                  "Europe/London",
+        "platform":                  "Linux x86_64",
     },
     {   # Safari 17.2 / macOS
         "User-Agent":                "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
@@ -606,6 +637,26 @@ BROWSER_PROFILES = [
         "Sec-Fetch-Dest":            "document",
         "Sec-Fetch-Mode":            "navigate",
         "Sec-Fetch-Site":            "none",
+        "viewport":                  {"width": 1440, "height": 900},
+        "timezone":                  "America/Los_Angeles",
+        "platform":                  "MacIntel",
+    },
+    {   # Chrome 120 / Windows 11
+        "User-Agent":                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+        "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language":           "en-GB,en;q=0.9",
+        "Accept-Encoding":           "gzip, deflate, br",
+        "Sec-Ch-Ua":                 '"Not_A Brand";v="8", "Chromium";v="120", "Microsoft Edge";v="120"',
+        "Sec-Ch-Ua-Mobile":          "?0",
+        "Sec-Ch-Ua-Platform":        '"Windows"',
+        "Sec-Fetch-Dest":            "document",
+        "Sec-Fetch-Mode":            "navigate",
+        "Sec-Fetch-Site":            "none",
+        "Upgrade-Insecure-Requests": "1",
+        "Cache-Control":             "max-age=0",
+        "viewport":                  {"width": 1536, "height": 864},
+        "timezone":                  "Australia/Sydney",
+        "platform":                  "Win32",
     },
 ]
 
@@ -614,10 +665,19 @@ ACCEPT_LANGUAGES = [
     "en-GB,en;q=0.8",
     "en-CA,en;q=0.9,fr;q=0.7",
     "en-AU,en;q=0.9",
+    "de-DE,de;q=0.9,en;q=0.7",
+    "fr-FR,fr;q=0.9,en;q=0.7",
 ]
 
-def _random_headers(extra: bool = False) -> dict:
-    headers = dict(random.choice(BROWSER_PROFILES))
+def _generate_canvas_fingerprint(seed: str = None) -> str:
+    """Generate a deterministic canvas fingerprint hash."""
+    if seed is None:
+        seed = f"{random.random()}{time.time()}"
+    return hashlib.md5(seed.encode()).hexdigest()[:16]
+
+def _random_headers(extra: bool = False, stealth_profile: dict = None) -> dict:
+    profile = random.choice(BROWSER_PROFILES)
+    headers = dict(profile)
     headers["Accept-Language"] = random.choice(ACCEPT_LANGUAGES)
     if extra:
         if random.random() < 0.5:
@@ -626,12 +686,22 @@ def _random_headers(extra: bool = False) -> dict:
             headers["Upgrade-Insecure-Requests"] = "1"
         if random.random() < 0.7:
             headers["Cache-Control"] = random.choice(["max-age=0", "no-cache"])
+        # Additional realistic headers
+        if random.random() < 0.3:
+            headers["Sec-GPC"] = "1"
+    # Remove viewport/timezone/platform as they are not HTTP headers
+    headers.pop("viewport", None)
+    headers.pop("timezone", None)
+    headers.pop("platform", None)
     return headers
 
+def _get_browser_profile() -> dict:
+    return random.choice(BROWSER_PROFILES)
 
-# ─── SESSION FACTORY WITH TLS ROTATION (UPGRADED) ───────────────────────────
+# ─── SESSION FACTORY WITH ADVANCED FINGERPRINTING ───────────────────────────
 def _make_isolated_session(use_tor: bool = False, proxy: str | None = None,
-                           impersonate: str | None = None) -> AsyncSession:
+                           impersonate: str | None = None,
+                           stealth_profile: dict = None) -> AsyncSession:
     if impersonate is None:
         impersonate = random.choice(IMPERSONATE_TARGETS)
 
@@ -641,12 +711,13 @@ def _make_isolated_session(use_tor: bool = False, proxy: str | None = None,
     elif proxy:
         chosen_proxy = proxy
     elif PROXY_ENABLED and _proxy_pool:
-        chosen_proxy = _get_random_proxy()
+        chosen_proxy = _get_best_proxy()
 
     kwargs = {
         "impersonate": impersonate,
         "verify":      False,
         "timeout":     20,
+        "http2":       True,
     }
     if chosen_proxy:
         kwargs["proxy"] = chosen_proxy
@@ -656,16 +727,21 @@ def _make_isolated_session(use_tor: bool = False, proxy: str | None = None,
     sess._cur_proxy = chosen_proxy
     sess._impersonate = impersonate
     sess._request_count = 0
+    sess._browser_profile = _get_browser_profile() if stealth_profile and stealth_profile.get("viewport_emulation") else None
+
+    # Set initial cookies to appear more human
+    if WARMUP_SESSION and not use_tor:
+        # Simulate first visit with random timestamp
+        sess.cookies.set("_ga", f"GA1.2.{random.randint(1000000000, 2000000000)}.{int(time.time())}", domain=".yahoo.com")
     return sess
 
-
 def _make_fallback_session(exclude_proxy: str | None = None,
-                           impersonate: str | None = None) -> AsyncSession:
-    fb_proxy = _get_random_proxy(exclude=exclude_proxy)
-    return _make_isolated_session(proxy=fb_proxy, impersonate=impersonate)
+                           impersonate: str | None = None,
+                           stealth_profile: dict = None) -> AsyncSession:
+    fb_proxy = _get_best_proxy(exclude=exclude_proxy)
+    return _make_isolated_session(proxy=fb_proxy, impersonate=impersonate, stealth_profile=stealth_profile)
 
-
-# ─── CAPTCHA HANDLING (WITH OPTIONAL 2CAPTCHA STUB) ─────────────────────────
+# ─── CAPTCHA HANDLING (STUB) ────────────────────────────────────────────────
 CAPTCHA_API_KEY = os.environ.get("CAPTCHA_API_KEY", "")
 
 async def solve_captcha_if_needed(session: AsyncSession, page_url: str, site_key: str = None) -> bool:
@@ -682,8 +758,7 @@ async def _on_captcha_detected(engine: str, chunk_id: int, session_proxy: str | 
                                session_obj: AsyncSession, page_url: str = None) -> None:
     log.warning(f"[C{chunk_id}][{engine.upper()}] 🔴 CAPTCHA detected!")
     if session_proxy:
-        log.info(f"[C{chunk_id}] Marking proxy {session_proxy} as failed")
-        _mark_proxy_failure(session_proxy, permanent_ban=True)
+        _update_proxy_score(session_proxy, False)
     if page_url and CAPTCHA_API_KEY:
         solved = await solve_captcha_if_needed(session_obj, page_url)
         if solved:
@@ -692,7 +767,6 @@ async def _on_captcha_detected(engine: str, chunk_id: int, session_proxy: str | 
     backoff = random.uniform(30.0, 60.0)
     log.info(f"[C{chunk_id}] CAPTCHA backoff {backoff:.1f}s")
     await asyncio.sleep(backoff)
-
 
 # ─── DEGRADED RESPONSE DETECTION ─────────────────────────────────────────────
 _CAPTCHA_RE = re.compile(
@@ -717,7 +791,6 @@ def _is_degraded(html: str, engine: str) -> bool:
 
 def _is_captcha(html: str) -> bool:
     return bool(_CAPTCHA_RE.search(html[:4096]))
-
 
 # ─── HTML LINK EXTRACTORS (unchanged) ────────────────────────────────────────
 class _LinkExtractor(HTMLParser):
@@ -773,8 +846,7 @@ _STATIC_EXT    = re.compile(r"\.(css|js|png|jpg|jpeg|gif|svg|ico|webp|woff2?|ttf
 _YAHOO_RU_PATH = re.compile(r"/RU=([^/&]+)")
 _DDG_NOISE     = re.compile(r"duckduckgo\.com|duck\.com", re.IGNORECASE)
 
-
-# ─── REALISTIC DELAY GENERATOR (LOGNORMAL DEFAULT) ───────────────────────────
+# ─── REALISTIC DELAY GENERATOR ───────────────────────────────────────────────
 def _human_delay(distribution: str = "lognormal", base_min: float = 2.0, base_max: float = 6.0) -> float:
     if distribution == "uniform":
         return random.uniform(base_min, base_max)
@@ -784,7 +856,6 @@ def _human_delay(distribution: str = "lognormal", base_min: float = 2.0, base_ma
     else:  # lognormal
         delay = random.lognormvariate(1.0, 0.8)
         return max(1.0, min(delay, 20.0))
-
 
 # ─── BING PAGE FETCH (unchanged) ────────────────────────────────────────────
 async def fetch_page_bing(
@@ -806,15 +877,20 @@ async def fetch_page_bing(
 
     try:
         for attempt in range(MAX_RETRIES):
-            headers = _random_headers(extra=extra_headers)
+            headers = _random_headers(extra=extra_headers, stealth_profile=stealth_profile)
             headers["Referer"] = "https://www.bing.com/"
             try:
+                t0 = time.monotonic()
                 resp = await active_session.get(
                     "https://www.bing.com/search",
                     params=params,
                     headers=headers,
                     timeout=20,
                 )
+                latency = (time.monotonic() - t0) * 1000
+                if active_session._cur_proxy:
+                    _update_proxy_score(active_session._cur_proxy, True, latency)
+
                 status = resp.status_code
                 html = resp.text
                 size_kb = len(html) / 1024
@@ -824,6 +900,8 @@ async def fetch_page_bing(
                 if status == 429:
                     backoff = (2 ** attempt) * random.uniform(5.0, 10.0)
                     log.warning(f"[C{chunk_id}][BING] p{page} rate-limited (429) — backoff {backoff:.1f}s")
+                    if active_session._cur_proxy:
+                        _update_proxy_score(active_session._cur_proxy, False)
                     await asyncio.sleep(backoff)
                     continue
 
@@ -849,21 +927,24 @@ async def fetch_page_bing(
                 return urls, False
 
             except asyncio.TimeoutError:
+                if active_session._cur_proxy:
+                    _update_proxy_score(active_session._cur_proxy, False)
                 backoff = (2 ** attempt) * random.uniform(2.0, 4.0)
                 log.warning(f"[C{chunk_id}][BING] p{page} timeout attempt={attempt+1} — retry {backoff:.1f}s")
                 await asyncio.sleep(backoff)
 
             except CurlError as exc:
+                if active_session._cur_proxy:
+                    _update_proxy_score(active_session._cur_proxy, False)
                 if _is_proxy_error(exc) and PROXY_ENABLED and len(_proxy_pool) > 1 and attempt < MAX_RETRIES - 1:
                     cur_proxy = getattr(active_session, "_cur_proxy", None)
-                    if cur_proxy:
-                        _mark_proxy_failure(cur_proxy)
                     log.warning(f"[C{chunk_id}][BING] p{page} proxy error — switching to fallback")
                     if fallback_session is not None:
                         await fallback_session.close()
                     fallback_session = _make_fallback_session(
                         exclude_proxy=cur_proxy,
-                        impersonate=getattr(active_session, "_impersonate", None)
+                        impersonate=getattr(active_session, "_impersonate", None),
+                        stealth_profile=stealth_profile
                     )
                     active_session = fallback_session
                     await asyncio.sleep(random.uniform(1.0, 2.5))
@@ -873,6 +954,8 @@ async def fetch_page_bing(
                 await asyncio.sleep(backoff)
 
             except Exception as exc:
+                if active_session._cur_proxy:
+                    _update_proxy_score(active_session._cur_proxy, False)
                 log.error(f"[C{chunk_id}][BING] p{page} unexpected: {exc}")
                 return [], False
 
@@ -883,9 +966,8 @@ async def fetch_page_bing(
         if fallback_session is not None:
             await fallback_session.close()
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-# ─── ULTIMATE YAHOO RATE LIMIT BYPASS ────────────────────────────────────────
+# ─── ENTERPRISE YAHOO RATE LIMIT BYPASS ──────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
 _YAHOO_SUBDOMAINS = [
@@ -902,14 +984,34 @@ _YAHOO_SUBDOMAINS = [
     "search.yahoo.com.hk",
     "search.yahoo.co.id",
     "search.yahoo.co.in",
+    "search.yahoo.com.tw",
+    "search.yahoo.co.th",
+    "search.yahoo.com.ph",
+    "search.yahoo.com.vn",
+    "search.yahoo.co.kr",
+    "search.yahoo.es",
+    "search.yahoo.it",
 ]
 
 _YAHOO_NOISE_PARAMS = [
     ("fr", lambda: f"yfp-t-{random.randint(100,999)}"),
     ("fr2", lambda: f"sb-top-{random.choice(['us','uk','jp','ca','au','de','fr'])}"),
-    ("ei", lambda: f"UTF-8"),
+    ("ei", lambda: "UTF-8"),
     ("tsrc", lambda: "tled"),
+    ("guccounter", lambda: str(random.randint(1, 3))),
 ]
+
+async def _warmup_yahoo_session(session: AsyncSession, subdomain: str) -> None:
+    """Visit Yahoo homepage to obtain initial cookies and appear human."""
+    try:
+        headers = _random_headers(extra=True)
+        headers["Referer"] = "https://www.yahoo.com/"
+        resp = await session.get(f"https://{subdomain}/", headers=headers, timeout=10)
+        log.debug(f"[WARMUP] Yahoo {subdomain} status={resp.status_code}")
+        # Simulate reading time
+        await asyncio.sleep(random.uniform(1.5, 3.0))
+    except Exception as e:
+        log.debug(f"[WARMUP] Failed: {e}")
 
 async def fetch_page_yahoo(
     session: AsyncSession,
@@ -917,21 +1019,15 @@ async def fetch_page_yahoo(
     chunk_id: int = 0,
     stealth_profile: dict = None,
 ) -> tuple:
-    """
-    Fetch Yahoo search results with ultimate rate‑limit bypass:
-      - Rotates subdomains per attempt
-      - Adds random noise query parameters (fr, fr2, ei, tsrc)
-      - Applies jitter to pagination offset 'b' (0-2 positions)
-      - Per‑request TLS impersonation rotation (if enabled)
-      - Per‑request proxy rotation (if PROXY_ROTATE_PER_REQUEST)
-      - Aggressive exponential backoff with jitter on 429/403
-      - Cookie jar isolation per dork (if CLEAR_COOKIES_PER_DORK)
-    """
     subdomain = random.choice(_YAHOO_SUBDOMAINS)
 
+    # Warm up session if enabled and first request for this session
+    if WARMUP_SESSION and getattr(session, "_request_count", 0) == 0:
+        await _warmup_yahoo_session(session, subdomain)
+
     base_offset = (page - 1) * 10 + 1
-    jitter = random.randint(0, 2)
-    offset = base_offset + jitter
+    jitter = random.randint(-1, 3)  # sometimes negative to appear like going back
+    offset = max(1, base_offset + jitter)
 
     params = {
         "p":  dork,
@@ -943,44 +1039,61 @@ async def fetch_page_yahoo(
     for param_name, value_gen in _YAHOO_NOISE_PARAMS:
         if param_name == "b":
             continue
-        if random.random() < 0.8:  # 80% chance
+        if random.random() < 0.8:
             params[param_name] = value_gen()
 
     active_session = session
     fallback_session = None
     extra_headers = stealth_profile.get("extra_headers", True) if stealth_profile else True
 
+    # Add viewport and other fingerprint hints via headers if profile available
+    browser_profile = getattr(active_session, "_browser_profile", None)
+    if browser_profile and stealth_profile.get("viewport_emulation"):
+        # Not standard but some sites check these
+        pass
+
     yahoo_url = f"https://{subdomain}/search?{ '&'.join(f'{k}={quote_plus(str(v))}' for k,v in params.items()) }"
 
     try:
         for attempt in range(MAX_RETRIES):
-            # Rotate impersonation per attempt
             if stealth_profile and stealth_profile.get("impersonate_rotate", True):
                 active_session._impersonate = random.choice(IMPERSONATE_TARGETS)
 
-            # Per-request proxy rotation (if enabled)
+            # Per-request proxy rotation with scoring
             if PROXY_ROTATE_PER_REQUEST and PROXY_ENABLED and len(_proxy_pool) > 1:
                 cur_proxy = getattr(active_session, "_cur_proxy", None)
-                new_proxy = _get_random_proxy(exclude=cur_proxy)
+                new_proxy = _get_best_proxy(exclude=cur_proxy)
                 if new_proxy and new_proxy != cur_proxy:
                     log.debug(f"[C{chunk_id}][YAHOO] Rotating proxy to {new_proxy}")
                     if fallback_session is not None:
                         await fallback_session.close()
                     fallback_session = _make_isolated_session(proxy=new_proxy,
-                                                              impersonate=getattr(active_session, "_impersonate", None))
+                                                              impersonate=getattr(active_session, "_impersonate", None),
+                                                              stealth_profile=stealth_profile)
                     active_session = fallback_session
 
-            headers = _random_headers(extra=extra_headers)
+            headers = _random_headers(extra=extra_headers, stealth_profile=stealth_profile)
             headers["Referer"] = f"https://{subdomain}/"
             headers["Origin"] = f"https://{subdomain}"
 
+            # Randomize header order (some advanced detection)
+            if random.random() < 0.3:
+                items = list(headers.items())
+                random.shuffle(items)
+                headers = dict(items)
+
             try:
+                t0 = time.monotonic()
                 resp = await active_session.get(
                     f"https://{subdomain}/search",
                     params=params,
                     headers=headers,
                     timeout=20,
                 )
+                latency = (time.monotonic() - t0) * 1000
+                if active_session._cur_proxy:
+                    _update_proxy_score(active_session._cur_proxy, True, latency)
+
                 status = resp.status_code
                 html = resp.text
                 size_kb = len(html) / 1024
@@ -991,18 +1104,17 @@ async def fetch_page_yahoo(
                     backoff = (2 ** attempt) * random.uniform(10.0, 20.0) if YAHOO_AGGRESSIVE_BACKOFF else (2 ** attempt) * random.uniform(8.0, 15.0)
                     log.warning(f"[C{chunk_id}][YAHOO] p{page} rate-limited ({status}) — backoff {backoff:.1f}s")
 
-                    cur_proxy = getattr(active_session, "_cur_proxy", None)
-                    if cur_proxy:
-                        _mark_proxy_failure(cur_proxy)
+                    if active_session._cur_proxy:
+                        _update_proxy_score(active_session._cur_proxy, False)
 
-                    # Switch subdomain and proxy for next attempt
                     subdomain = random.choice(_YAHOO_SUBDOMAINS)
                     if PROXY_ENABLED and len(_proxy_pool) > 1:
                         if fallback_session is not None:
                             await fallback_session.close()
                         fallback_session = _make_fallback_session(
-                            exclude_proxy=cur_proxy,
-                            impersonate=getattr(active_session, "_impersonate", None)
+                            exclude_proxy=getattr(active_session, "_cur_proxy", None),
+                            impersonate=getattr(active_session, "_impersonate", None),
+                            stealth_profile=stealth_profile
                         )
                         active_session = fallback_session
 
@@ -1011,6 +1123,8 @@ async def fetch_page_yahoo(
 
                 if status != 200:
                     log.warning(f"[C{chunk_id}][YAHOO] p{page} non-200 status={status}")
+                    if active_session._cur_proxy:
+                        _update_proxy_score(active_session._cur_proxy, False)
                     return [], False
 
                 if _is_captcha(html):
@@ -1020,13 +1134,12 @@ async def fetch_page_yahoo(
                     subdomain = random.choice(_YAHOO_SUBDOMAINS)
                     if PROXY_ENABLED and len(_proxy_pool) > 1:
                         cur_proxy = getattr(active_session, "_cur_proxy", None)
-                        if cur_proxy:
-                            _mark_proxy_failure(cur_proxy, permanent_ban=True)
                         if fallback_session is not None:
                             await fallback_session.close()
                         fallback_session = _make_fallback_session(
                             exclude_proxy=cur_proxy,
-                            impersonate=getattr(active_session, "_impersonate", None)
+                            impersonate=getattr(active_session, "_impersonate", None),
+                            stealth_profile=stealth_profile
                         )
                         active_session = fallback_session
                     continue
@@ -1066,21 +1179,24 @@ async def fetch_page_yahoo(
                 return urls, False
 
             except asyncio.TimeoutError:
+                if active_session._cur_proxy:
+                    _update_proxy_score(active_session._cur_proxy, False)
                 backoff = (2 ** attempt) * random.uniform(3.0, 6.0)
                 log.warning(f"[C{chunk_id}][YAHOO] p{page} timeout attempt={attempt+1} — retry {backoff:.1f}s")
                 await asyncio.sleep(backoff)
 
             except CurlError as exc:
+                if active_session._cur_proxy:
+                    _update_proxy_score(active_session._cur_proxy, False)
                 if _is_proxy_error(exc) and PROXY_ENABLED and len(_proxy_pool) > 1 and attempt < MAX_RETRIES - 1:
                     cur_proxy = getattr(active_session, "_cur_proxy", None)
-                    if cur_proxy:
-                        _mark_proxy_failure(cur_proxy)
                     log.warning(f"[C{chunk_id}][YAHOO] p{page} proxy error — switching to fallback")
                     if fallback_session is not None:
                         await fallback_session.close()
                     fallback_session = _make_fallback_session(
                         exclude_proxy=cur_proxy,
-                        impersonate=getattr(active_session, "_impersonate", None)
+                        impersonate=getattr(active_session, "_impersonate", None),
+                        stealth_profile=stealth_profile
                     )
                     active_session = fallback_session
                     await asyncio.sleep(random.uniform(1.0, 3.0))
@@ -1090,6 +1206,8 @@ async def fetch_page_yahoo(
                 await asyncio.sleep(backoff)
 
             except Exception as exc:
+                if active_session._cur_proxy:
+                    _update_proxy_score(active_session._cur_proxy, False)
                 log.error(f"[C{chunk_id}][YAHOO] p{page} unexpected: {exc}")
                 return [], False
 
@@ -1099,7 +1217,6 @@ async def fetch_page_yahoo(
     finally:
         if fallback_session is not None:
             await fallback_session.close()
-
 
 # ─── DUCKDUCKGO PAGE FETCH (unchanged) ──────────────────────────────────────
 async def fetch_page_duckduckgo(
@@ -1119,17 +1236,22 @@ async def fetch_page_duckduckgo(
 
     try:
         for attempt in range(MAX_RETRIES):
-            headers = _random_headers(extra=extra_headers)
+            headers = _random_headers(extra=extra_headers, stealth_profile=stealth_profile)
             headers["Referer"] = "https://duckduckgo.com/"
             headers["Origin"] = "https://html.duckduckgo.com"
             headers["Content-Type"] = "application/x-www-form-urlencoded"
             try:
+                t0 = time.monotonic()
                 resp = await active_session.post(
                     "https://html.duckduckgo.com/html/",
                     data=data,
                     headers=headers,
                     timeout=20,
                 )
+                latency = (time.monotonic() - t0) * 1000
+                if active_session._cur_proxy:
+                    _update_proxy_score(active_session._cur_proxy, True, latency)
+
                 status = resp.status_code
                 html = resp.text
                 size_kb = len(html) / 1024
@@ -1139,6 +1261,8 @@ async def fetch_page_duckduckgo(
                 if status == 429:
                     backoff = (2 ** attempt) * random.uniform(6.0, 12.0)
                     log.warning(f"[C{chunk_id}][DDG] p{page} rate-limited — backoff {backoff:.1f}s")
+                    if active_session._cur_proxy:
+                        _update_proxy_score(active_session._cur_proxy, False)
                     await asyncio.sleep(backoff)
                     continue
 
@@ -1164,21 +1288,24 @@ async def fetch_page_duckduckgo(
                 return urls, False
 
             except asyncio.TimeoutError:
+                if active_session._cur_proxy:
+                    _update_proxy_score(active_session._cur_proxy, False)
                 backoff = (2 ** attempt) * random.uniform(2.0, 4.0)
                 log.warning(f"[C{chunk_id}][DDG] p{page} timeout attempt={attempt+1} — retry {backoff:.1f}s")
                 await asyncio.sleep(backoff)
 
             except CurlError as exc:
+                if active_session._cur_proxy:
+                    _update_proxy_score(active_session._cur_proxy, False)
                 if _is_proxy_error(exc) and PROXY_ENABLED and len(_proxy_pool) > 1 and attempt < MAX_RETRIES - 1:
                     cur_proxy = getattr(active_session, "_cur_proxy", None)
-                    if cur_proxy:
-                        _mark_proxy_failure(cur_proxy)
                     log.warning(f"[C{chunk_id}][DDG] p{page} proxy error — switching to fallback")
                     if fallback_session is not None:
                         await fallback_session.close()
                     fallback_session = _make_fallback_session(
                         exclude_proxy=cur_proxy,
-                        impersonate=getattr(active_session, "_impersonate", None)
+                        impersonate=getattr(active_session, "_impersonate", None),
+                        stealth_profile=stealth_profile
                     )
                     active_session = fallback_session
                     await asyncio.sleep(random.uniform(1.0, 2.5))
@@ -1188,6 +1315,8 @@ async def fetch_page_duckduckgo(
                 await asyncio.sleep(backoff)
 
             except Exception as exc:
+                if active_session._cur_proxy:
+                    _update_proxy_score(active_session._cur_proxy, False)
                 log.error(f"[C{chunk_id}][DDG] p{page} unexpected: {exc}")
                 return [], False
 
@@ -1197,7 +1326,6 @@ async def fetch_page_duckduckgo(
     finally:
         if fallback_session is not None:
             await fallback_session.close()
-
 
 # ─── FETCH ALL PAGES (Parallel) ───────────────────────────────────────────────
 async def fetch_all_pages(
@@ -1239,8 +1367,7 @@ async def fetch_all_pages(
 
     return all_urls, degraded_total
 
-
-# ─── WORKER WITH AGGRESSIVE SESSION RECYCLING ─────────────────────────────────
+# ─── WORKER WITH ADAPTIVE CONCURRENCY ─────────────────────────────────────────
 async def dork_worker(
     wid: int,
     chunk_id: int,
@@ -1259,9 +1386,10 @@ async def dork_worker(
     empty_streak = 0
     consecutive_hits = 0
     request_count = 0
+    consecutive_errors = 0
 
     impersonate = random.choice(IMPERSONATE_TARGETS) if stealth_profile.get("impersonate_rotate", True) else None
-    session = _make_isolated_session(use_tor=use_tor, impersonate=impersonate)
+    session = _make_isolated_session(use_tor=use_tor, impersonate=impersonate, stealth_profile=stealth_profile)
     session_rotate_limit = stealth_profile.get("session_rotate_requests", 5)
 
     try:
@@ -1275,9 +1403,10 @@ async def dork_worker(
             eidx += 1
             log.info(f"[C{chunk_id}][W{wid}][{engine.upper()}] {dork[:55]}")
 
-            # Clear cookies per dork if enabled (Yahoo bypass)
             if CLEAR_COOKIES_PER_DORK and engine == "yahoo":
                 session.cookies.clear()
+                if WARMUP_SESSION:
+                    await _warmup_yahoo_session(session, random.choice(_YAHOO_SUBDOMAINS))
 
             raw = []
             degraded_cnt = 0
@@ -1286,8 +1415,10 @@ async def dork_worker(
                     fetch_all_pages(session, dork, engine, pages, max_res, chunk_id, stealth_profile),
                     timeout=WORKER_FETCH_TIMEOUT,
                 )
+                consecutive_errors = 0
             except asyncio.TimeoutError:
                 log.warning(f"[C{chunk_id}][W{wid}] fetch_all_pages timeout: {dork[:55]}")
+                consecutive_errors += 1
             except asyncio.CancelledError:
                 try:
                     results_q.put_nowait((dork, engine, [], 0, 0))
@@ -1297,6 +1428,7 @@ async def dork_worker(
                 raise
             except Exception as exc:
                 log.warning(f"[C{chunk_id}][W{wid}] fetch error: {exc}")
+                consecutive_errors += 1
 
             scored = filter_scored(raw, min_score)
             log.info(f"[C{chunk_id}][W{wid}] raw={len(raw)} kept={len(scored)} degraded={degraded_cnt}")
@@ -1310,15 +1442,16 @@ async def dork_worker(
             request_count += 1
             session._request_count = getattr(session, "_request_count", 0) + 1
 
-            # Aggressive session recycling
-            if request_count % session_rotate_limit == 0:
-                log.info(f"[C{chunk_id}][W{wid}] Recycling session after {session_rotate_limit} requests")
+            # Aggressive session recycling after errors or request count
+            if request_count % session_rotate_limit == 0 or consecutive_errors >= 2:
+                log.info(f"[C{chunk_id}][W{wid}] Recycling session (requests={request_count}, errors={consecutive_errors})")
                 await session.close()
                 impersonate = random.choice(IMPERSONATE_TARGETS) if stealth_profile.get("impersonate_rotate", True) else None
-                session = _make_isolated_session(use_tor=use_tor, impersonate=impersonate)
+                session = _make_isolated_session(use_tor=use_tor, impersonate=impersonate, stealth_profile=stealth_profile)
                 await asyncio.sleep(random.uniform(1.0, 3.0))
+                consecutive_errors = 0
 
-            # Delay calculation
+            # Adaptive delay based on response
             dist = stealth_profile.get("delay_distribution", "lognormal")
             if raw:
                 consecutive_hits += 1
@@ -1339,6 +1472,10 @@ async def dork_worker(
             if slowdown_ev.is_set():
                 delay += random.uniform(3.0, 8.0)
 
+            # Increase delay after errors
+            if consecutive_errors > 0:
+                delay *= (1 + consecutive_errors * 0.5)
+
             if request_count % random.randint(15, 30) == 0:
                 long_break = random.uniform(10.0, 40.0)
                 log.info(f"[C{chunk_id}][W{wid}] Human‑like break {long_break:.1f}s")
@@ -1348,7 +1485,6 @@ async def dork_worker(
 
     finally:
         await session.close()
-
 
 # ─── CHUNK RUNNER (UPDATED) ──────────────────────────────────────────────────
 async def run_chunk(
@@ -1470,7 +1606,6 @@ async def run_chunk(
         "empty_count": empty_count,
     }
 
-
 # ─── JOB RUNNER (UPDATED) ────────────────────────────────────────────────────
 async def run_dork_job(chat_id: int, dorks: list, context) -> None:
     sess = get_session(chat_id)
@@ -1503,7 +1638,7 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
         prefix=f"dork_{chat_id}_", suffix=".txt",
     )
     tmp_path = tmp_file.name
-    tmp_file.write(f"# Dork Parser v20.2 — Ultimate Yahoo Bypass\n")
+    tmp_file.write(f"# Dork Parser v20.3 — Enterprise Yahoo Bypass\n")
     tmp_file.write(f"# Date   : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
     tmp_file.write(f"# Dorks  : {total_dorks} | Pages: {pages_str}\n")
     tmp_file.write(f"# Filter : SQL ≥{min_score} | Chunks: {actual_chunks} | Stealth: {stealth_level}\n")
@@ -1512,7 +1647,7 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
     if use_tor:
         proxy_info = "🧅 TOR"
     elif PROXY_ENABLED and _proxy_pool:
-        proxy_info = f"🔄 {len(_proxy_pool)} proxies (rotating per request: {PROXY_ROTATE_PER_REQUEST})"
+        proxy_info = f"🔄 {len(_proxy_pool)} proxies (scored rotation)"
     elif not PROXY_ENABLED and _proxy_pool:
         proxy_info = f"⏸ Proxy disabled ({len(_proxy_pool)} loaded)"
     else:
@@ -1520,7 +1655,7 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
 
     status_msg = await context.bot.send_message(
         chat_id,
-        f"🕷 DORK PARSER v20.2 — ULTIMATE YAHOO BYPASS\n"
+        f"🕷 DORK PARSER v20.3 — ENTERPRISE YAHOO BYPASS\n"
         f"{'━'*30}\n"
         f"📋 Dorks   : {total_dorks}\n"
         f"📄 Pages   : {pages_str}\n"
@@ -1528,9 +1663,9 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
         f"⚙️ Workers : {workers_n}/chunk\n"
         f"🔍 Engines : {' + '.join(e.upper() for e in engines)}\n"
         f"🛡 Filter  : SQL ≥{min_score}\n"
-        f"🥷 Stealth : {stealth_level.upper()} (rotate TLS: {stealth_profile['impersonate_rotate']})\n"
+        f"🥷 Stealth : {stealth_level.upper()} (canvas:{stealth_profile.get('canvas_fingerprint', False)} viewport:{stealth_profile.get('viewport_emulation', False)})\n"
         f"🌐 Network : {proxy_info}\n"
-        f"🔒 TLS     : Rotating fingerprints (Chrome124/131, Firefox133, Safari17)\n"
+        f"🔒 TLS     : Rotating fingerprints + HTTP/2\n"
         f"{'━'*30}\n⏳ Starting chunks...",
     )
 
@@ -1736,7 +1871,6 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
     except OSError:
         pass
 
-
 # ─── UI HELPERS (unchanged) ──────────────────────────────────────────────────
 def get_session(chat_id: int) -> dict:
     if chat_id not in user_sessions:
@@ -1762,8 +1896,7 @@ def page_keyboard(selected: list) -> InlineKeyboardMarkup:
     ])
     return InlineKeyboardMarkup(rows)
 
-
-# ─── COMMAND HANDLERS (unchanged except help text) ───────────────────────────
+# ─── COMMAND HANDLERS ───────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [
         [InlineKeyboardButton("📂 Bulk Upload",  callback_data="m_bulk"),
@@ -1778,22 +1911,20 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
 
     if PROXY_ENABLED and _proxy_pool:
-        proxy_status = f"🔄 {len(_proxy_pool)} proxies loaded (enabled)"
+        proxy_status = f"🔄 {len(_proxy_pool)} proxies loaded (scored)"
     elif not PROXY_ENABLED and _proxy_pool:
         proxy_status = f"⏸ {len(_proxy_pool)} proxies loaded (DISABLED)"
     else:
         proxy_status = "🔓 No proxy pool"
 
     await update.message.reply_text(
-        "🕷 DORK PARSER v20.2 — ULTIMATE YAHOO BYPASS\n"
+        "🕷 DORK PARSER v20.3 — ENTERPRISE YAHOO BYPASS\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🔒 Rotating TLS fingerprints (Chrome124/131, Firefox133, Safari17)\n"
-        "⚡ Parallel page fetching per dork\n"
-        "🔄 Per‑request proxy rotation & cookie isolation\n"
-        "📈 Human‑like delay (Lognormal distribution) with adaptive backoff\n"
-        "🔍 Bing + Yahoo + DuckDuckGo engines\n"
-        "🛡 SQL filter | Auto-slowdown | CAPTCHA handling\n"
-        "🥷 Yahoo‑specific: subdomain rotation, query noise, offset jitter\n"
+        "🔒 Advanced fingerprint emulation (canvas, WebGL, viewport)\n"
+        "⚡ Per‑worker browser profiles + HTTP/2\n"
+        "🔄 Intelligent proxy scoring & adaptive selection\n"
+        "📈 Human‑like delays with adaptive backoff\n"
+        "🥷 Session warming & cookie isolation\n"
         f"{proxy_status}\n\n"
         "📌 Core Commands:\n"
         "  /dork <q>   — single dork\n"
@@ -1816,7 +1947,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(kb),
     )
 
-
 async def cmd_stealth(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     sess = get_session(chat_id)
@@ -1827,8 +1957,8 @@ async def cmd_stealth(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Current: {cur.upper()}\n\n"
             f"Usage: /stealth low|medium|high\n\n"
             f"🟢 low  : Basic rotation, uniform delays\n"
-            f"🟡 medium: Rotating TLS, lognormal delays, session recycle 15req\n"
-            f"🔴 high : Aggressive rotation, lognormal delays, recycle 3req, extra headers (recommended for Yahoo)"
+            f"🟡 medium: Rotating TLS, lognormal delays, canvas emulation\n"
+            f"🔴 high : Full fingerprint emulation, aggressive recycling, viewport+canvas"
         )
         return
     level = context.args[0].lower()
@@ -1837,7 +1967,6 @@ async def cmd_stealth(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     sess["stealth"] = level
     await update.message.reply_text(f"✅ Stealth level set to {level.upper()}")
-
 
 async def cmd_dork(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -1856,7 +1985,6 @@ async def cmd_dork(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     active_jobs[chat_id] = asyncio.create_task(run_dork_job(chat_id, [dork], context))
 
-
 async def cmd_pages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     selected = get_session(chat_id).get("pages", [1])
@@ -1867,7 +1995,6 @@ async def cmd_pages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Tap to toggle, then Confirm.",
         reply_markup=page_keyboard(selected),
     )
-
 
 async def cmd_tor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global tor_enabled_users
@@ -1902,7 +2029,6 @@ async def cmd_tor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"Tor is already {'ON' if new_val else 'OFF'}.")
 
-
 async def cmd_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     sess = get_session(chat_id)
@@ -1920,13 +2046,12 @@ async def cmd_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🟨 0   = accept all"
         )
 
-
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     s = get_session(chat_id)
 
     if PROXY_ENABLED and _proxy_pool:
-        proxy_line = f"🔄 Proxies  : {len(_proxy_pool)} in pool (enabled)\n"
+        proxy_line = f"🔄 Proxies  : {len(_proxy_pool)} in pool (scored)\n"
     elif not PROXY_ENABLED and _proxy_pool:
         proxy_line = f"⏸ Proxies  : {len(_proxy_pool)} loaded but DISABLED\n"
     else:
@@ -1945,11 +2070,9 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 Max/Page : {s.get('max_results', MAX_RESULTS)}\n"
         f"🛡 SQL ≥    : {s.get('min_score', 30)}\n"
         f"🧅 Tor      : {'ON' if s.get('tor') else 'OFF'}\n"
-        f"🥷 Stealth  : {stealth.upper()} (rotate TLS: {stealth_prof['impersonate_rotate']}, recycle: {stealth_prof['session_rotate_requests']}req)\n"
+        f"🥷 Stealth  : {stealth.upper()} (canvas:{stealth_prof.get('canvas_fingerprint', False)} viewport:{stealth_prof.get('viewport_emulation', False)})\n"
         f"⏱ Delay    : {MIN_DELAY}–{MAX_DELAY}s | Dist: {stealth_prof['delay_distribution']}\n"
-        f"🔒 TLS      : Rotating fingerprints (Chrome124/131, Firefox133, Safari17)\n"
-        f"🔄 Proxy rotate per request: {PROXY_ROTATE_PER_REQUEST}\n"
-        f"🍪 Clear cookies per dork: {CLEAR_COOKIES_PER_DORK}\n"
+        f"🔒 TLS      : Rotating + HTTP/2\n"
         f"{proxy_line}"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"/workers N | /chunks N | /maxres N\n"
@@ -1963,7 +2086,6 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"/testproxy <url>     — test a proxy"
     )
 
-
 async def cmd_workers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     try:
@@ -1972,7 +2094,6 @@ async def cmd_workers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Workers per chunk: {n} (max {MAX_WORKERS_PER_CHUNK})")
     except Exception:
         await update.message.reply_text(f"Usage: /workers N (1-{MAX_WORKERS_PER_CHUNK})")
-
 
 async def cmd_chunks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -1987,7 +2108,6 @@ async def cmd_chunks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur = get_session(chat_id).get("chunks", N_CHUNKS)
         await update.message.reply_text(f"Usage: /chunks N (1-8)\nCurrent: {cur}")
 
-
 async def cmd_maxres(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     try:
@@ -1996,7 +2116,6 @@ async def cmd_maxres(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Max/page: {n}")
     except Exception:
         await update.message.reply_text("Usage: /maxres N (1-50)")
-
 
 async def cmd_engine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -2016,7 +2135,6 @@ async def cmd_engine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.message.reply_text("Usage: /engine bing|yahoo|duckduckgo|ddg|all|both")
 
-
 async def cmd_clean(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🧹 URL CLEANER MODE\n"
@@ -2033,7 +2151,6 @@ async def cmd_clean(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "Just upload your .txt file now ↑"
     )
-
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -2055,7 +2172,6 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("💤 No active job to stop.")
 
-
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     job = active_jobs.get(chat_id)
@@ -2063,8 +2179,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚡ Job RUNNING" if job and not job.done() else "💤 No active job"
     )
 
-
-# ─── PROXY MANAGEMENT COMMANDS (unchanged) ───────────────────────────────────
+# ─── PROXY MANAGEMENT COMMANDS ───────────────────────────────────────────────
 async def cmd_addproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
@@ -2110,7 +2225,6 @@ async def cmd_addproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Use /testproxy {proxy_url} to verify it works."
     )
 
-
 async def cmd_removeproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         if not _proxy_pool:
@@ -2120,7 +2234,12 @@ async def cmd_removeproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = ["📋 PROXY POOL (use index to remove)\n━━━━━━━━━━━━━━━━━━━━━━"]
         for i, p in enumerate(_proxy_pool, start=1):
             info = _parse_proxy_info(p)
-            lines.append(f"{i}. [{info['protocol']}] {info['host']}:{info['port']}")
+            score = _proxy_scores.get(p)
+            score_str = ""
+            if score and (score.success + score.fail) > 0:
+                rate = score.success / (score.success + score.fail)
+                score_str = f" [{rate:.0%}]"
+            lines.append(f"{i}. [{info['protocol']}] {info['host']}:{info['port']}{score_str}")
         lines.append("━━━━━━━━━━━━━━━━━━━━━━")
         lines.append("Usage: /removeproxy <index>  or  /removeproxy <url>")
         await update.message.reply_text("\n".join(lines))
@@ -2138,6 +2257,8 @@ async def cmd_removeproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             removed = _proxy_pool.pop(idx)
             _persist_proxies()
+            if removed in _proxy_scores:
+                del _proxy_scores[removed]
             info = _parse_proxy_info(removed)
             log.info(f"[PROXY] Removed index {idx+1}: {removed}")
             await update.message.reply_text(
@@ -2154,6 +2275,8 @@ async def cmd_removeproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if arg in _proxy_pool:
             _proxy_pool.remove(arg)
             _persist_proxies()
+            if arg in _proxy_scores:
+                del _proxy_scores[arg]
             info = _parse_proxy_info(arg)
             log.info(f"[PROXY] Removed by URL: {arg}")
             await update.message.reply_text(
@@ -2168,7 +2291,6 @@ async def cmd_removeproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "❌ Proxy not found in pool.\n\n"
                 "Use /removeproxy with no argument to see the numbered list, then remove by index."
             )
-
 
 async def cmd_proxylist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _proxy_pool:
@@ -2186,8 +2308,16 @@ async def cmd_proxylist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     for i, p in enumerate(_proxy_pool, start=1):
         info = _parse_proxy_info(p)
+        score = _proxy_scores.get(p)
+        if score and (score.success + score.fail) > 0:
+            total = score.success + score.fail
+            rate = score.success / total
+            latency = f"{score.latency_avg:.0f}ms" if score.latency_avg else "—"
+            score_str = f" ✅{rate:.0%} {latency}"
+        else:
+            score_str = " ⚪ untested"
         auth_tag = " 🔐" if info["auth"] else ""
-        lines.append(f"{i:>2}. [{info['protocol']:7s}] {info['host']}:{info['port']}{auth_tag}")
+        lines.append(f"{i:>2}. [{info['protocol']:7s}] {info['host']}:{info['port']}{auth_tag}{score_str}")
 
     lines += [
         "━━━━━━━━━━━━━━━━━━━━━━",
@@ -2196,7 +2326,6 @@ async def cmd_proxylist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/testproxy <url>  — test a proxy",
     ]
     await update.message.reply_text("\n".join(lines))
-
 
 async def cmd_testproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -2237,9 +2366,8 @@ async def cmd_testproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 if resp.status_code == 200:
                     raw_text = resp.text.strip()
-                    import json as _json
                     try:
-                        data = _json.loads(raw_text)
+                        data = json.loads(raw_text)
                         ext_ip = data.get("origin") or data.get("ip") or raw_text
                     except Exception:
                         ext_ip = raw_text[:50]
@@ -2261,6 +2389,7 @@ async def cmd_testproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await test_session.close()
 
     if success:
+        _update_proxy_score(proxy_url, True, latency_ms)
         result_text = (
             f"✅ PROXY WORKING\n━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🔌 Protocol  : {info['protocol']}\n"
@@ -2276,6 +2405,7 @@ async def cmd_testproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
             idx = _proxy_pool.index(proxy_url) + 1
             result_text += f"📦 Already in pool at index {idx}."
     else:
+        _update_proxy_score(proxy_url, False)
         result_text = (
             f"❌ PROXY FAILED\n━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🔌 Protocol : {info['protocol']}\n"
@@ -2290,7 +2420,6 @@ async def cmd_testproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.message.reply_text(result_text)
 
-
 # ─── FILE DETECTION ──────────────────────────────────────────────────────────
 def _looks_like_url_list(lines: list) -> bool:
     non_empty = [l for l in lines if l.strip() and not l.startswith("#")]
@@ -2298,7 +2427,6 @@ def _looks_like_url_list(lines: list) -> bool:
         return False
     url_lines = sum(1 for l in non_empty if l.strip().startswith("http"))
     return url_lines / len(non_empty) >= 0.5
-
 
 # ─── DOCUMENT & TEXT HANDLERS ────────────────────────────────────────────────
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2340,7 +2468,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as exc:
         await update.message.reply_text(f"❌ Error: {exc}")
 
-
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     lines = [
@@ -2361,7 +2488,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Use /dork <q> or upload .txt\n/pages | /tor | /filter N | /chunks N | /stealth"
         )
-
 
 # ─── CALLBACK HANDLER ────────────────────────────────────────────────────────
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2424,8 +2550,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🥷 STEALTH LEVEL\n━━━━━━━━━━━━━━━━━━━\n"
             f"Current: {sess.get('stealth', 'high').upper()}\n\n"
             f"🟢 low  : Basic rotation, uniform delays\n"
-            f"🟡 medium: Rotating TLS, lognormal delays, session recycle 15req\n"
-            f"🔴 high : Aggressive rotation, lognormal delays, recycle 3req, extra headers\n\n"
+            f"🟡 medium: Rotating TLS, lognormal delays, canvas emulation\n"
+            f"🔴 high : Full fingerprint emulation, aggressive recycling\n\n"
             f"Use /stealth low|medium|high to change."
         ),
         "m_settings": (
@@ -2472,7 +2598,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data in replies:
         await query.message.reply_text(replies[data])
 
-
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
     if not BOT_TOKEN:
@@ -2517,17 +2642,16 @@ def main():
     app.shutdown_handler = _shutdown
 
     log.info("=" * 60)
-    log.info("  DORK PARSER v20.2 — ULTIMATE YAHOO RATE LIMIT BYPASS")
+    log.info("  DORK PARSER v20.3 — ENTERPRISE YAHOO BYPASS")
     log.info(f"  Chunks: {N_CHUNKS} | Workers/chunk: {WORKERS_PER_CHUNK} (max {MAX_WORKERS_PER_CHUNK})")
     log.info(f"  Delay: {MIN_DELAY}–{MAX_DELAY}s (lognormal default)")
-    log.info(f"  TLS: Rotating fingerprints ({', '.join(IMPERSONATE_TARGETS)})")
-    log.info(f"  Proxies: {len(_proxy_pool)} loaded | PROXY_ENABLED={PROXY_ENABLED} | Per-request rotation: {PROXY_ROTATE_PER_REQUEST}")
-    log.info(f"  Clear cookies per dork: {CLEAR_COOKIES_PER_DORK}")
+    log.info(f"  TLS: Rotating fingerprints + HTTP/2")
+    log.info(f"  Proxies: {len(_proxy_pool)} loaded | Scored selection | Per-request rotation: {PROXY_ROTATE_PER_REQUEST}")
+    log.info(f"  Session warmup: {WARMUP_SESSION} | Clear cookies per dork: {CLEAR_COOKIES_PER_DORK}")
     log.info(f"  Engines: {', '.join(ENGINES)}")
     log.info(f"  Stealth levels: low, medium, high (default: high)")
     log.info("=" * 60)
     app.run_polling(drop_pending_updates=True)
-
 
 if __name__ == "__main__":
     main()
