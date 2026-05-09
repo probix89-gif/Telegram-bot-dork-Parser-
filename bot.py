@@ -1,20 +1,20 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║   DORK PARSER BOT v19.0 — MULTI-THREADED STEALTH ARCHITECTURE║
-║                                                              ║
+║   DORK PARSER BOT v19.1 — FIXED & PRODUCTION‑READY          ║
 ║   • ThreadPoolExecutor with isolated curl_cffi sessions      ║
 ║   • Dynamic TLS fingerprint rotation (9 impersonations)      ║
 ║   • Google + Yahoo + DuckDuckGo (Bing removed)               ║
-║   • Google consent-page auto-handling + CAPTCHA detection    ║
+║   • Google consent‑page auto‑handling + CAPTCHA detection    ║
 ║   • Fully automatic proxy pool (health checks + cooldown)    ║
 ║   • Tor as fallback in proxy rotation                        ║
 ║   • Manual proxy: /addproxy /removeproxy /proxylist /testproxy║
 ║   • Graceful /stop returns partial results                   ║
-║   • Per-thread proxy ownership + thread-safe rotation        ║
+║   • Per‑thread exclusive proxy ownership                     ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
 import asyncio
+import json
 import os
 import random
 import re
@@ -58,7 +58,7 @@ N_CHUNKS               = int(os.environ.get("N_CHUNKS", 2))
 WORKERS_PER_CHUNK      = int(os.environ.get("WORKERS_PER_CHUNK", 4))
 MAX_WORKERS_PER_CHUNK  = 16
 
-# Google-tuned delays (slightly more conservative than other engines)
+# Google‑tuned delays (slightly more conservative than other engines)
 MIN_DELAY              = float(os.environ.get("MIN_DELAY", 2.0))
 MAX_DELAY              = float(os.environ.get("MAX_DELAY", 4.0))
 FAST_MIN_DELAY         = 1.2
@@ -76,6 +76,7 @@ MAX_PAGES              = 70
 WORKER_FETCH_TIMEOUT   = 90
 JOB_TIMEOUT            = 30 * 60
 MAX_RETRIES            = 3
+MAX_GOOGLE_RETRIES     = 5                             # increased for Google
 EMPTY_RATE_SLOWDOWN    = 0.50
 EMPTY_RATE_RECOVER     = 0.30
 CHUNK_STAGGER_DELAY    = (1.0, 3.0)
@@ -107,8 +108,6 @@ active_stop_evs:  dict = {}     # chat_id -> threading.Event
 # ─── BROWSER PROFILES (impersonation + matching headers) ─────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Each profile pairs a curl_cffi impersonation target with a complete, consistent
-# HTTP header set. Mismatching impersonation+UA leaks a detectable inconsistency.
 BROWSER_PROFILES = [
     {
         "impersonate": "chrome110",
@@ -258,12 +257,13 @@ def _random_profile() -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ─── PROXY POOL — FULLY AUTOMATIC, THREAD-SAFE ───────────────────────────────
+# ─── PROXY POOL — FULLY AUTOMATIC, THREAD‑SAFE ───────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ProxyPool:
     """
-    Thread-safe automatic proxy pool with health checks, cooldown, and rotation.
+    Thread‑safe automatic proxy pool with health checks, cooldown, and rotation.
+    Each proxy is exclusively owned by a single thread at a time.
     """
 
     def __init__(self):
@@ -272,6 +272,7 @@ class ProxyPool:
         self._active: deque = deque() # rotation queue of healthy proxies
         self._bad: dict = {}          # proxy -> timestamp when marked bad
         self._tested: set = set()     # proxies that passed at least one test
+        self._acquired: set = set()   # proxies currently held by a thread
         self._tor_in_pool: bool = False
 
     # ── Loading ──────────────────────────────────────────────────────────────
@@ -350,6 +351,7 @@ class ProxyPool:
                     pass
                 self._bad.pop(TOR_PROXY, None)
                 self._tested.discard(TOR_PROXY)
+                self._acquired.discard(TOR_PROXY)
                 self._tor_in_pool = False
                 log.info("[PROXY] Tor removed from pool")
 
@@ -373,6 +375,7 @@ class ProxyPool:
                 pass
             self._bad.pop(proxy, None)
             self._tested.discard(proxy)
+            self._acquired.discard(proxy)
             return True
 
     def remove_by_index(self, idx: int) -> str | None:
@@ -386,13 +389,14 @@ class ProxyPool:
                 pass
             self._bad.pop(proxy, None)
             self._tested.discard(proxy)
+            self._acquired.discard(proxy)
             return proxy
 
     # ── Rotation ─────────────────────────────────────────────────────────────
     def acquire(self, exclude: str | None = None) -> str | None:
         """
-        Pop the next healthy proxy (rotated). Returns None if pool is empty.
-        Auto-recovers proxies whose cooldown has expired.
+        Pop the next healthy proxy from the active deque (exclusive ownership).
+        Returns None if pool is empty. Auto‑recovers proxies whose cooldown has expired.
         """
         if not PROXY_ENABLED:
             return None
@@ -402,14 +406,28 @@ class ProxyPool:
                 return None
             # Try up to len() times to avoid returning the excluded proxy
             for _ in range(len(self._active)):
-                proxy = self._active[0]
-                self._active.rotate(-1)   # cycle
-                if proxy != exclude:
+                proxy = self._active.popleft()          # remove from front
+                if proxy == exclude:
+                    self._active.append(proxy)          # put back at end
+                else:
+                    self._acquired.add(proxy)
+                    log.debug(f"[PROXY] Acquired (exclusive): {proxy}")
                     return proxy
-            return self._active[0] if self._active else None
+            # all proxies in active are excluded; return None
+            return None
+
+    def release(self, proxy: str) -> None:
+        """Return an exclusively held proxy back to the active rotation."""
+        if not proxy:
+            return
+        with self._lock:
+            if proxy in self._all and proxy not in self._active and proxy in self._acquired:
+                self._acquired.discard(proxy)
+                self._active.append(proxy)
+                log.debug(f"[PROXY] Released: {proxy}")
 
     def mark_bad(self, proxy: str) -> None:
-        """Mark proxy temporarily bad; will be retried after PROXY_COOLDOWN."""
+        """Mark proxy temporarily bad; will be retried after PROXY_COOLDOWN. Called by owner thread."""
         if not proxy:
             return
         with self._lock:
@@ -418,6 +436,7 @@ class ProxyPool:
                 self._active.remove(proxy)
             except ValueError:
                 pass
+            self._acquired.discard(proxy)   # owner gives up ownership
             log.warning(f"[PROXY] Marked bad (cooldown {PROXY_COOLDOWN}s): {proxy}")
 
     def mark_good(self, proxy: str) -> None:
@@ -426,8 +445,9 @@ class ProxyPool:
         with self._lock:
             self._tested.add(proxy)
             self._bad.pop(proxy, None)
-            if proxy not in self._active and proxy in self._all:
+            if proxy not in self._active and proxy in self._all and proxy not in self._acquired:
                 self._active.append(proxy)
+                log.debug(f"[PROXY] Marked good and returned to rotation: {proxy}")
 
     def _recover_bad(self) -> None:
         """Move bad proxies back to active if cooldown elapsed (caller holds lock)."""
@@ -438,13 +458,18 @@ class ProxyPool:
                 recovered.append(proxy)
         for proxy in recovered:
             del self._bad[proxy]
-            if proxy in self._all and proxy not in self._active:
+            if proxy in self._all and proxy not in self._active and proxy not in self._acquired:
                 self._active.append(proxy)
                 log.info(f"[PROXY] Recovered after cooldown: {proxy}")
 
     def purge_dead(self, proxy: str) -> None:
-        """Permanently remove a proxy that failed health checks."""
+        """Permanently remove a proxy that failed health checks. Does NOT purge if currently acquired."""
         with self._lock:
+            if proxy in self._acquired:
+                # Proxy is in use – do not purge, just mark it for cooldown so it's not re‑acquired
+                log.warning(f"[PROXY] Attempt to purge acquired proxy {proxy} – marking bad instead")
+                self.mark_bad(proxy)
+                return
             if proxy in self._all:
                 self._all.remove(proxy)
             try:
@@ -527,8 +552,7 @@ def test_proxy(proxy_url: str, attempts: int = PROXY_TEST_ATTEMPTS,
                     txt = resp.text.strip()
                     ext_ip = None
                     try:
-                        import json as _json
-                        data = _json.loads(txt)
+                        data = json.loads(txt)                     # fixed: use global json
                         ext_ip = data.get("origin") or data.get("ip")
                     except Exception:
                         ext_ip = txt[:40]
@@ -640,7 +664,7 @@ def stop_tor_rotation() -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ─── SQL FILTER ENGINE (preserved from v18.1) ────────────────────────────────
+# ─── SQL FILTER ENGINE ───────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
 BLACKLISTED_DOMAINS = {
@@ -740,7 +764,7 @@ def filter_scored(urls: list, min_score: int) -> list:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ─── URL CLEANER (preserved) ─────────────────────────────────────────────────
+# ─── URL CLEANER ─────────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
 MAX_URL_LENGTH = 200
@@ -933,7 +957,7 @@ def _extract_links_generic(html: str) -> list:
     return p.links
 
 
-# Google-specific: extract from /url?q= redirects AND raw href= links
+# Google‑specific: extract from /url?q= redirects AND raw href= links
 _GOOGLE_URL_Q_RE = re.compile(r'/url\?(?:[^"]*?&)?q=(https?[^&"]+)', re.IGNORECASE)
 _GOOGLE_DIRECT_HREF_RE = re.compile(r'<a[^>]+href="(https?://[^"]+)"', re.IGNORECASE)
 
@@ -970,7 +994,7 @@ def _extract_ddg_links(html: str) -> list:
     return links
 
 
-# ── Engine-specific noise filters ────────────────────────────────────────────
+# ── Engine‑specific noise filters ────────────────────────────────────────────
 _GOOGLE_NOISE = re.compile(
     r"google\.com|gstatic\.com|googleusercontent\.com|googleadservices\.com|"
     r"googlesyndication\.com|youtube\.com/redirect|doubleclick\.net|"
@@ -987,7 +1011,6 @@ _YAHOO_RU_PATH = re.compile(r"/RU=([^/&]+)")
 # ─── GOOGLE SEARCH FETCHER (synchronous, with consent + CAPTCHA handling) ────
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Pre-baked consent cookie (well-known accepted-consent value).
 GOOGLE_CONSENT_COOKIES = {
     "CONSENT": "YES+srp.gws-20240101-0-RC1.en+FX+999",
     "SOCS":    "CAESHAgBEhJnd3NfMjAyNDAxMjMtMF9SQzIaAmVuIAEaBgiAuJevBg",
@@ -1000,7 +1023,7 @@ def fetch_page_google(dork: str, page: int, max_res: int,
     """
     Synchronous Google SERP scraper.
     - Fresh TLS+headers session per attempt
-    - Pre-set consent cookies + auto-handle consent page
+    - Pre‑set consent cookies + auto‑handle consent page
     - CAPTCHA detection → mark proxy bad, rotate, exponential backoff
     - Returns (urls, is_degraded)
     """
@@ -1019,7 +1042,7 @@ def fetch_page_google(dork: str, page: int, max_res: int,
     current_proxy = proxy
     last_html_size = 0
 
-    for attempt in range(MAX_RETRIES):
+    for attempt in range(MAX_GOOGLE_RETRIES):               # increased retries
         if stop_ev.is_set():
             return [], False
 
@@ -1066,10 +1089,10 @@ def fetch_page_google(dork: str, page: int, max_res: int,
                 continue
 
             if status != 200:
-                log.warning(f"[C{chunk_id}][GOOGLE] p{page} non-200 status={status}")
+                log.warning(f"[C{chunk_id}][GOOGLE] p{page} non‑200 status={status}")
                 return [], False
 
-            # Consent page → re-set cookies and retry
+            # Consent page → re‑set cookies and retry
             if _is_google_consent(html):
                 log.info(f"[C{chunk_id}][GOOGLE] p{page} consent page detected — retrying with cookies")
                 # Cookies are already set; just retry with backoff
@@ -1091,7 +1114,7 @@ def fetch_page_google(dork: str, page: int, max_res: int,
 
             if _is_degraded(html, "google"):
                 log.warning(f"[C{chunk_id}][GOOGLE] p{page} degraded ({size_kb:.1f}KB)")
-                if attempt < MAX_RETRIES - 1:
+                if attempt < MAX_GOOGLE_RETRIES - 1:
                     _sleep_interruptible((2 ** attempt) * random.uniform(2.0, 5.0), stop_ev)
                     continue
                 return [], True
@@ -1127,7 +1150,7 @@ def fetch_page_google(dork: str, page: int, max_res: int,
             try: sess.close()
             except Exception: pass
 
-    log.warning(f"[C{chunk_id}][GOOGLE] p{page} all {MAX_RETRIES} attempts exhausted")
+    log.warning(f"[C{chunk_id}][GOOGLE] p{page} all {MAX_GOOGLE_RETRIES} attempts exhausted")
     return [], True
 
 
@@ -1359,7 +1382,7 @@ def run_chunk_thread(chunk_id: int, dorks: list, engines: list, pages: list,
                      stop_ev: threading.Event, progress_q: queue_module.Queue) -> dict:
     """
     Process one chunk of dorks in a single thread.
-    Each dork rotates engines round-robin; each thread owns one proxy at a time.
+    Each dork rotates engines round‑robin; each thread owns one proxy at a time.
     """
     threading.current_thread().name = f"chunk-{chunk_id}"
     total = len(dorks)
@@ -1381,68 +1404,76 @@ def run_chunk_thread(chunk_id: int, dorks: list, engines: list, pages: list,
 
     log.info(f"[C{chunk_id}] Starting — {total} dorks | engines={engines} | proxy={proxy or 'direct'}")
 
-    for dork in dorks:
-        if stop_ev.is_set():
-            log.info(f"[C{chunk_id}] Stop requested — exiting at {processed}/{total}")
-            break
+    try:
+        for dork in dorks:
+            if stop_ev.is_set():
+                log.info(f"[C{chunk_id}] Stop requested — exiting at {processed}/{total}")
+                break
 
-        engine = engines[eidx % len(engines)]
-        eidx += 1
+            engine = engines[eidx % len(engines)]
+            eidx += 1
 
-        log.info(f"[C{chunk_id}][{engine.upper()}] {dork[:60]}")
+            log.info(f"[C{chunk_id}][{engine.upper()}] {dork[:60]}")
 
-        try:
-            raw, deg_cnt = fetch_dork_all_pages(
-                dork, engine, pages, max_res, chunk_id, proxy, stop_ev
-            )
-        except Exception as exc:
-            log.warning(f"[C{chunk_id}] fetch error on dork: {exc}")
-            raw, deg_cnt = [], 0
+            try:
+                raw, deg_cnt = fetch_dork_all_pages(
+                    dork, engine, pages, max_res, chunk_id, proxy, stop_ev
+                )
+            except Exception as exc:
+                log.warning(f"[C{chunk_id}] fetch error on dork: {exc}")
+                raw, deg_cnt = [], 0
 
-        scored = filter_scored(raw, min_score)
-        chunk_scored.extend(scored)
-        chunk_raw += len(raw)
-        chunk_degraded += deg_cnt
-        processed += 1
+            scored = filter_scored(raw, min_score)
+            chunk_scored.extend(scored)
+            chunk_raw += len(raw)
+            chunk_degraded += deg_cnt
+            processed += 1
 
-        if len(raw) == 0:
-            empty_count += 1
-            consecutive_hits = 0
-            empty_streak += 1
-        else:
-            consecutive_hits += 1
-            empty_streak = 0
+            if len(raw) == 0:
+                empty_count += 1
+                consecutive_hits = 0
+                empty_streak += 1
+            else:
+                consecutive_hits += 1
+                empty_streak = 0
 
-        # Push progress
-        try:
-            progress_q.put_nowait({
-                "chunk_id": chunk_id,
-                "processed": processed,
-                "total": total,
-                "raw": len(raw),
-                "kept": len(scored),
-            })
-        except queue_module.Full:
-            pass
+            # Push progress
+            try:
+                progress_q.put_nowait({
+                    "chunk_id": chunk_id,
+                    "processed": processed,
+                    "total": total,
+                    "raw": len(raw),
+                    "kept": len(scored),
+                })
+            except queue_module.Full:
+                pass
 
-        # Adaptive delay
-        if consecutive_hits >= FAST_STREAK_THRESHOLD:
-            delay = random.uniform(FAST_MIN_DELAY, FAST_MAX_DELAY)
-        else:
-            delay = random.uniform(MIN_DELAY, MAX_DELAY)
-        if empty_streak >= 3:
-            delay += min(empty_streak * 2.0, 15.0)
+            # Adaptive delay
+            if consecutive_hits >= FAST_STREAK_THRESHOLD:
+                delay = random.uniform(FAST_MIN_DELAY, FAST_MAX_DELAY)
+            else:
+                delay = random.uniform(MIN_DELAY, MAX_DELAY)
+            if empty_streak >= 3:
+                delay += min(empty_streak * 2.0, 15.0)
 
-        # If empty rate is high, swap proxy proactively
-        if processed >= 5:
-            empty_rate = empty_count / processed
-            if empty_rate >= EMPTY_RATE_SLOWDOWN and PROXY_ENABLED and not use_tor:
-                new_proxy = PROXY_POOL.acquire(exclude=proxy)
-                if new_proxy and new_proxy != proxy:
-                    log.info(f"[C{chunk_id}] Empty rate {empty_rate:.0%} — rotating proxy")
-                    proxy = new_proxy
+            # If empty rate is high, swap proxy proactively (release old, acquire new)
+            if processed >= 5:
+                empty_rate = empty_count / processed
+                if empty_rate >= EMPTY_RATE_SLOWDOWN and PROXY_ENABLED and not use_tor:
+                    new_proxy = PROXY_POOL.acquire(exclude=proxy)
+                    if new_proxy and new_proxy != proxy:
+                        PROXY_POOL.release(proxy)           # return old
+                        proxy = new_proxy
+                        log.info(f"[C{chunk_id}] Empty rate {empty_rate:.0%} — rotated proxy")
 
-        _sleep_interruptible(delay, stop_ev)
+            _sleep_interruptible(delay, stop_ev)
+
+    finally:
+        # Release the proxy back to the pool (unless using Tor)
+        if proxy and not use_tor and PROXY_ENABLED:
+            PROXY_POOL.release(proxy)
+            log.debug(f"[C{chunk_id}] Released proxy: {proxy}")
 
     success_rate = (processed - empty_count) / max(processed, 1)
     log.info(
@@ -1540,8 +1571,11 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
     total_processed = [0]
     updater_stop = threading.Event()
 
+    # Capture the running event loop to safely post updates
+    loop = asyncio.get_running_loop()
+
     # ── Status updater (background thread that updates Telegram) ─────────────
-    def _status_updater_thread():
+    def _status_updater_thread(ev_loop):
         while not updater_stop.is_set():
             drained = False
             try:
@@ -1578,20 +1612,16 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
                     f"📦 {cinfo}\n"
                     f"{'━'*30}"
                 )
-                # Schedule edit on the asyncio loop
-                try:
-                    loop = asyncio.get_event_loop()
-                except RuntimeError:
-                    loop = None
-                if loop and loop.is_running():
-                    asyncio.run_coroutine_threadsafe(
-                        _safe_edit(context, chat_id, status_msg.message_id, text),
-                        loop,
-                    )
+                # Schedule edit on the captured asyncio loop
+                asyncio.run_coroutine_threadsafe(
+                    _safe_edit(context, chat_id, status_msg.message_id, text),
+                    ev_loop,
+                )
                 last_edit[0] = time.time()
             time.sleep(0.5)
 
-    updater_thread = threading.Thread(target=_status_updater_thread, name="status-updater", daemon=True)
+    updater_thread = threading.Thread(target=_status_updater_thread, args=(loop,),
+                                      name="status-updater", daemon=True)
     updater_thread.start()
 
     # ── Submit chunks to ThreadPoolExecutor ──────────────────────────────────
@@ -1609,23 +1639,26 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
             )
             future_map[fut] = i
 
-        # Wait for all chunks (with global job timeout)
+        # Wait for all chunks (with global job timeout) using proper asyncio integration
         deadline = time.time() + JOB_TIMEOUT
 
         async def _await_futures():
-            loop = asyncio.get_event_loop()
-            for fut in as_completed(future_map):
+            tasks = [asyncio.wrap_future(fut) for fut in future_map]
+            for coro in asyncio.as_completed(tasks):
+                # Global timeout check
                 if time.time() > deadline:
                     log.warning(f"[JOB][{chat_id}] Global timeout — stopping")
                     stop_ev.set()
+                    for f in future_map:
+                        f.cancel()
+                    break
                 try:
-                    res = await loop.run_in_executor(None, fut.result, 1)
+                    res = await coro
                     chunk_results.append(res)
                 except Exception as exc:
-                    log.error(f"[JOB][{chat_id}] Chunk {future_map[fut]} raised: {exc}")
+                    log.error(f"[JOB][{chat_id}] Chunk raised: {exc}")
                     chunk_results.append(exc)
 
-        # Periodically yield to check stop
         wait_task = asyncio.create_task(_await_futures())
         try:
             await wait_task
@@ -1741,7 +1774,7 @@ async def _safe_edit(context, chat_id, msg_id, text):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ─── URL CLEANER JOB (preserved, simplified) ─────────────────────────────────
+# ─── URL CLEANER JOB ─────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def run_url_clean_job(chat_id: int, raw_lines: list, context) -> None:
@@ -1858,7 +1891,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         proxy_status = "🔓 No proxy pool"
 
     await update.message.reply_text(
-        "🕷 DORK PARSER v19.0 — MULTI-THREADED STEALTH\n"
+        "🕷 DORK PARSER v19.1 — MULTI‑THREADED STEALTH\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "🧵 ThreadPoolExecutor architecture\n"
         "🔒 Dynamic TLS rotation (9 profiles)\n"
@@ -1868,15 +1901,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📌 Core Commands:\n"
         "  /dork <q>   — single dork\n"
         "  /clean      — URL list cleaner mode\n"
-        "  /pages      — pick pages 1-70\n"
-        "  /workers N  — workers per chunk (1-16)\n"
-        "  /chunks N   — parallel chunk count (1-8)\n"
+        "  /pages      — pick pages 1‑70\n"
+        "  /workers N  — workers per chunk (1‑16)\n"
+        "  /chunks N   — parallel chunk count (1‑8)\n"
         "  /engine X   — google|yahoo|ddg|all\n"
         "  /tor        — toggle Tor IP rotation\n"
-        "  /filter N   — SQL score filter (0-100)\n"
+        "  /filter N   — SQL score filter (0‑100)\n"
         "  /stop       — stop & get partial results\n\n"
         "🔄 Proxy Commands:\n"
-        "  /addproxy <url>      — add + auto-test\n"
+        "  /addproxy <url>      — add + auto‑test\n"
         "  /removeproxy [i|url] — remove\n"
         "  /proxylist           — view all\n"
         "  /testproxy <url>     — manual test\n"
@@ -1961,7 +1994,7 @@ async def cmd_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         cur = sess.get("min_score", 30)
         await update.message.reply_text(
-            f"Usage: /filter N (0-100)\nCurrent: {cur}\n\n"
+            f"Usage: /filter N (0‑100)\nCurrent: {cur}\n\n"
             f"🟥 70+ = high (likely SQLi)\n"
             f"🟧 40+ = medium (default 30)\n"
             f"🟨 0   = accept all"
@@ -1998,7 +2031,7 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"/pages     | /tor\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🔄 Proxy Management:\n"
-        f"/addproxy <url>      — add + auto-test\n"
+        f"/addproxy <url>      — add + auto‑test\n"
         f"/removeproxy [i|url] — remove\n"
         f"/proxylist           — view pool\n"
         f"/testproxy <url>     — test"
@@ -2012,7 +2045,7 @@ async def cmd_workers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         get_session(chat_id)["workers"] = n
         await update.message.reply_text(f"✅ Workers per chunk: {n} (max {MAX_WORKERS_PER_CHUNK})")
     except Exception:
-        await update.message.reply_text(f"Usage: /workers N (1-{MAX_WORKERS_PER_CHUNK})")
+        await update.message.reply_text(f"Usage: /workers N (1‑{MAX_WORKERS_PER_CHUNK})")
 
 
 async def cmd_chunks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2026,7 +2059,7 @@ async def cmd_chunks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception:
         cur = get_session(chat_id).get("chunks", N_CHUNKS)
-        await update.message.reply_text(f"Usage: /chunks N (1-8)\nCurrent: {cur}")
+        await update.message.reply_text(f"Usage: /chunks N (1‑8)\nCurrent: {cur}")
 
 
 async def cmd_maxres(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2036,7 +2069,7 @@ async def cmd_maxres(update: Update, context: ContextTypes.DEFAULT_TYPE):
         get_session(chat_id)["max_results"] = n
         await update.message.reply_text(f"✅ Max/page: {n}")
     except Exception:
-        await update.message.reply_text("Usage: /maxres N (1-50)")
+        await update.message.reply_text("Usage: /maxres N (1‑50)")
 
 
 async def cmd_engine(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2065,7 +2098,7 @@ async def cmd_clean(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🧹 URL CLEANER MODE\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "Upload a .txt file containing one URL per line.\n"
-        "Filters: blocked domains, no-query, >200 chars, invalid, dupes.\n"
+        "Filters: blocked domains, no‑query, >200 chars, invalid, dupes.\n"
         "📁 Results → cleaned_urls.txt"
     )
 
@@ -2086,7 +2119,7 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif job and not job.done():
         job.cancel()
         active_jobs.pop(chat_id, None)
-        await update.message.reply_text("🛑 Job force-stopped.")
+        await update.message.reply_text("🛑 Job force‑stopped.")
     else:
         await update.message.reply_text("💤 No active job to stop.")
 
@@ -2381,7 +2414,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     replies = {
-        "m_bulk":     "📂 Upload a .txt file — URLs or dorks (auto-detected).",
+        "m_bulk":     "📂 Upload a .txt file — URLs or dorks (auto‑detected).",
         "m_single":   "🔍 /dork inurl:login.php?id=\nSet pages with /pages",
         "m_tor":      f"🧅 Tor is {'ON' if sess.get('tor') else 'OFF'}",
         "m_filter":   f"🛡 SQL Filter ≥{sess.get('min_score', 30)}\n/filter 70|40|0",
@@ -2402,7 +2435,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/workers N        — workers/chunk\n"
             "/tor              — toggle Tor\n"
             "/engine X         — google|yahoo|ddg|all\n"
-            "/filter N         — SQL score (0-100)\n"
+            "/filter N         — SQL score (0‑100)\n"
             "/settings         — full config\n"
             "/maxres N         — results/page\n"
             "/stop             — stop & partial\n"
@@ -2464,7 +2497,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     log.info("=" * 60)
-    log.info("  DORK PARSER v19.0 — MULTI-THREADED STEALTH")
+    log.info("  DORK PARSER v19.1 — FIXED & PRODUCTION‑READY")
     log.info(f"  Chunks: {N_CHUNKS} | Workers/chunk: {WORKERS_PER_CHUNK}")
     log.info(f"  Delay: {MIN_DELAY}–{MAX_DELAY}s | Fast: {FAST_MIN_DELAY}–{FAST_MAX_DELAY}s")
     log.info(f"  TLS profiles: {len(BROWSER_PROFILES)} (random rotation)")
