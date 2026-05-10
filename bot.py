@@ -525,7 +525,7 @@ async def set_pages(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Bot Initialisation
 # ---------------------------------------------------------------------------
 def main():
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    token = os.getenv("8276628633:AAHGwYFa8dUnRrkWDDBtJ4jY2pltPTDwwog")
     if not token:
         logger.error("TELEGRAM_BOT_TOKEN environment variable not set.")
         return
