@@ -1,5 +1,5 @@
-python-telegram-bot[job-queue]>=20.0
-curl_cffi>=0.7.0
-beautifulsoup4>=4.12
-lxml>=5.0
-aiofiles>=23.0
+python-telegram-bot
+curl-cffi
+beautifulsoup4
+lxml
+aiofiles
