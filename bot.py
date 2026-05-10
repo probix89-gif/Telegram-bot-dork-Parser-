@@ -471,7 +471,8 @@ async def dork(update: Update, context):
 
     proxy = pool.random()
 
-    tls_profile = context.bot_data["tls_manager"].weighted_choice()
+    # sticky TLS selection per worker
+            tls_profile = context.bot_data["tls_manager"].weighted_choice()
             tls = tls_profile["name"]
 
     urls = await DorkEngine.search(
@@ -631,6 +632,7 @@ async def md(update: Update, context):
 
             proxy = pool.random()
 
+            # sticky TLS selection per worker
             tls_profile = context.bot_data["tls_manager"].weighted_choice()
             tls = tls_profile["name"]
 
