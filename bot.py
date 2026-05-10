@@ -28,7 +28,7 @@ from telegram.ext import (
 # CONFIG
 # =========================================================
 
-BOT_TOKEN = "PUT_YOUR_TOKEN"
+BOT_TOKEN = "8661725916:AAHBm0_WMPGc_qqk5WuoAO65uuEkWr_VLq0"
 
 MAX_THREADS = 3
 DEFAULT_THREADS = 2
