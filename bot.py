@@ -19,7 +19,7 @@ import os
 import time
 import logging
 import tempfile
-import shlex
+import json as _json
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
@@ -73,6 +73,12 @@ EMPTY_RATE_SLOWDOWN  = 0.50
 EMPTY_RATE_RECOVER   = 0.30
 CHUNK_STAGGER_DELAY  = (0.8, 2.5)
 
+# TLS FINGERPRINT ROTATION
+TLS_IMPERSONATIONS = [
+    "chrome107", "chrome110", "chrome116", "chrome120", "chrome124",
+    "firefox117", "safari15_5", "safari15_6", "edge99", "edge110",
+]
+
 DEFAULT_SESSION = {
     "workers":     WORKERS_PER_CHUNK,
     "chunks":      N_CHUNKS,
@@ -81,6 +87,8 @@ DEFAULT_SESSION = {
     "pages":       [1],
     "tor":         False,
     "min_score":   30,
+    "speed_mode":  False,    # high-speed 200 URLs/s
+    "xtream":      False,    # xtream mode 1000 URLs/s (Yahoo only)
 }
 
 user_sessions:   dict = {}
@@ -256,7 +264,7 @@ async def _probe_single(host: str, port: int,
     test_url  = random.choice(PROXY_TEST_URLS)
 
     sess = AsyncSession(
-        impersonate="chrome110",
+        impersonate=random.choice(TLS_IMPERSONATIONS),
         verify=False,
         timeout=PROXY_CHECK_TIMEOUT,
         proxy=proxy_url,
@@ -273,7 +281,6 @@ async def _probe_single(host: str, port: int,
         # Extract IP from any of the supported endpoints
         ext_ip = None
         try:
-            import json as _json
             data   = _json.loads(text)
             ext_ip = data.get("ip") or data.get("origin") or data.get("query")
         except Exception:
@@ -785,7 +792,7 @@ def dedupe_dorks(dorks: list[str]) -> list[str]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ─── ─── (FILTER + URL CLEANER + SCORER) — unchanged from v18.1 ─────────────
+# ─── FILTER + URL CLEANER + SCORER — unchanged from v18.1 ────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
 BLACKLISTED_DOMAINS = {
@@ -1095,7 +1102,11 @@ def _random_headers() -> dict:
     return dict(random.choice(BROWSER_PROFILES))
 
 
-# ─── SESSION FACTORY ─────────────────────────────────────────────────────────
+# ─── SESSION FACTORY (with advanced TLS rotation) ────────────────────────────
+
+def _random_impersonate() -> str:
+    return random.choice(TLS_IMPERSONATIONS)
+
 
 def _make_isolated_session(use_tor: bool = False, proxy: str | None = None) -> AsyncSession:
     chosen_proxy = None
@@ -1106,13 +1117,21 @@ def _make_isolated_session(use_tor: bool = False, proxy: str | None = None) -> A
     elif PROXY_ENABLED and _proxy_pool:
         chosen_proxy = get_random_proxy_url()
 
-    kwargs = {"impersonate": "chrome110", "verify": False, "timeout": 20}
+    impersonate = _random_impersonate()
+    kwargs = {
+        "impersonate": impersonate,
+        "verify": False,
+        "timeout": 20,
+    }
     if chosen_proxy:
         kwargs["proxy"] = chosen_proxy
-        log.debug(f"[SESSION] Using proxy: {chosen_proxy}")
+        log.debug(f"[SESSION] Proxy: {chosen_proxy}, TLS: {impersonate}")
+    else:
+        log.debug(f"[SESSION] Direct, TLS: {impersonate}")
 
     sess = AsyncSession(**kwargs)
     sess._cur_proxy = chosen_proxy
+    sess._tls_impersonate = impersonate
     return sess
 
 
@@ -1246,8 +1265,7 @@ _YAHOO_RU_PATH = re.compile(r"/RU=([^/&]+)")
 _DDG_NOISE     = re.compile(r"duckduckgo\.com|duck\.com", re.IGNORECASE)
 
 
-# ─── ENGINE FETCH FUNCTIONS ──────────────────────────────────────────────────
-# (Same retry/CAPTCHA/proxy-fallback pattern as v18.1 but using translated dorks)
+# ─── ENGINE FETCH FUNCTIONS (TLS rotation integrated) ────────────────────────
 
 async def _generic_engine_fetch(
     session: AsyncSession,
@@ -1417,10 +1435,10 @@ async def fetch_all_pages(session, dork, engine, pages, max_res, chunk_id=0):
     return all_urls, degraded_total
 
 
-# ─── WORKER / CHUNK / JOB (mostly unchanged) ─────────────────────────────────
+# ─── WORKER / CHUNK / JOB ────────────────────────────────────────────────────
 
 async def dork_worker(wid, chunk_id, queue, results_q, engines, pages, max_res,
-                      session, min_score, stop_ev, slowdown_ev):
+                      session, min_score, stop_ev, slowdown_ev, speed_mode=False):
     eidx = wid % len(engines)
     empty_streak = consecutive_hits = 0
 
@@ -1453,24 +1471,28 @@ async def dork_worker(wid, chunk_id, queue, results_q, engines, pages, max_res,
         except asyncio.QueueFull: await results_q.put((dork, engine, scored, len(raw), degraded_cnt))
         queue.task_done()
 
-        if raw:
-            consecutive_hits += 1; empty_streak = 0
-            if consecutive_hits >= FAST_STREAK_THRESHOLD:
-                delay = random.uniform(FAST_MIN_DELAY, FAST_MAX_DELAY)
-            else:
-                delay = random.uniform(MIN_DELAY, MAX_DELAY)
+        # Dynamic delay based on speed mode
+        if speed_mode:
+            delay = random.uniform(0.1, 0.25) if raw else random.uniform(0.3, 0.6)
         else:
-            consecutive_hits = 0; empty_streak += 1
-            delay = random.uniform(MIN_DELAY, MAX_DELAY)
-            if empty_streak >= 3:
-                delay += min(empty_streak * 2.0, 15.0)
+            if raw:
+                consecutive_hits += 1; empty_streak = 0
+                if consecutive_hits >= FAST_STREAK_THRESHOLD:
+                    delay = random.uniform(FAST_MIN_DELAY, FAST_MAX_DELAY)
+                else:
+                    delay = random.uniform(MIN_DELAY, MAX_DELAY)
+            else:
+                consecutive_hits = 0; empty_streak += 1
+                delay = random.uniform(MIN_DELAY, MAX_DELAY)
+                if empty_streak >= 3:
+                    delay += min(empty_streak * 2.0, 15.0)
         if slowdown_ev.is_set():
             delay += random.uniform(2.0, 5.0)
         await asyncio.sleep(delay)
 
 
 async def run_chunk(chunk_id, dorks, engines, pages, max_res, use_tor, min_score,
-                    workers_n, progress_q, global_stop_ev, proxy=None):
+                    workers_n, progress_q, global_stop_ev, proxy=None, speed_mode=False):
     session     = _make_isolated_session(use_tor=use_tor, proxy=proxy)
     queue       = asyncio.Queue(maxsize=len(dorks) * 2)
     results_q   = asyncio.Queue(maxsize=500)
@@ -1491,7 +1513,7 @@ async def run_chunk(chunk_id, dorks, engines, pages, max_res, use_tor, min_score
 
     worker_tasks = [
         asyncio.create_task(dork_worker(i, chunk_id, queue, results_q, engines, pages,
-                                        max_res, session, min_score, stop_ev, slowdown_ev))
+                                        max_res, session, min_score, stop_ev, slowdown_ev, speed_mode))
         for i in range(workers_n)
     ]
     global_watcher = asyncio.create_task(_watch_global())
@@ -1555,8 +1577,9 @@ async def run_dork_job(chat_id, dorks, context):
     use_tor   = sess.get("tor", False)
     min_score = sess.get("min_score", 30)
     n_chunks  = max(1, sess.get("chunks", N_CHUNKS))
+    speed_mode = sess.get("speed_mode", False)
 
-    # ── NEW: dedup + validate dorks before running ──────────────────────────
+    # dedup + validate dorks before running
     cleaned = dedupe_dorks(dorks)
     valid_dorks   = []
     invalid_dorks = []
@@ -1616,7 +1639,9 @@ async def run_dork_job(chat_id, dorks, context):
         f"🔍 Engines : {' + '.join(e.upper() for e in engines)}\n"
         f"🛡 Filter  : SQL ≥{min_score}\n"
         f"🌐 Network : {proxy_info}\n"
-        f"🔒 TLS     : Chrome110\n{'━'*30}\n⏳ Starting...",
+        f"🔒 TLS     : Rotating fingerprints ({len(TLS_IMPERSONATIONS)} profiles)\n"
+        f"{'⚡' if speed_mode else '🐢'} Speed Mode : {'ON (200+ URLs/s)' if speed_mode else 'OFF'}\n"
+        f"{'━'*30}\n⏳ Starting...",
     )
 
     global_stop_ev = asyncio.Event()
@@ -1674,7 +1699,8 @@ async def run_dork_job(chat_id, dorks, context):
                 await asyncio.sleep(random.uniform(*CHUNK_STAGGER_DELAY))
             task = asyncio.create_task(
                 run_chunk(i, chunk_dorks, engines, pages, max_res, use_tor, min_score,
-                          workers_n, progress_q, global_stop_ev, proxy=chunk_proxies[i])
+                          workers_n, progress_q, global_stop_ev, proxy=chunk_proxies[i],
+                          speed_mode=speed_mode)
             )
             chunk_tasks.append(task)
         chunk_results = await asyncio.gather(*chunk_tasks, return_exceptions=True)
@@ -1749,6 +1775,109 @@ async def run_dork_job(chat_id, dorks, context):
     except OSError: pass
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ─── XTREAM MODE (1000+ URLs/s via Yahoo) ────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def run_xtream_job(chat_id: int, dorks: list[str], context) -> None:
+    sess = get_session(chat_id)
+    # 1. Generate many mutations from the seed dorks
+    all_dorks = []
+    for d in dorks:
+        variants = mutate_dork(d, n=20)
+        all_dorks.extend(variants)
+    all_dorks = dedupe_dorks(all_dorks)
+    log.info(f"[XTREAM] {len(all_dorks)} unique dorks generated")
+
+    # 2. Prepare rapid-fire fetchers
+    semaphore = asyncio.Semaphore(200)  # 200 concurrent requests max
+    stop_ev = asyncio.Event()
+    active_stop_evs[chat_id] = stop_ev
+
+    results_queue = asyncio.Queue(maxsize=10000)
+    min_score = sess["min_score"]
+
+    async def fetch_one(dork):
+        if stop_ev.is_set():
+            return
+        proxy_url = get_random_proxy_url(alive_only=True)
+        session = _make_isolated_session(proxy=proxy_url)
+        try:
+            # Only page 1 for speed
+            urls, degraded = await asyncio.wait_for(
+                fetch_page_yahoo(session, dork, 1, 10, chunk_id=0),
+                timeout=15
+            )
+            scored = filter_scored(urls, min_score)
+            for sc, url in scored:
+                await results_queue.put((sc, url))
+        except Exception:
+            pass
+        finally:
+            await session.close()
+
+    # 3. Launch all tasks
+    tasks = []
+    for d in all_dorks:
+        async def worker(dork=d):
+            async with semaphore:
+                await fetch_one(dork)
+        tasks.append(asyncio.create_task(worker()))
+
+    # 4. Stream results to file while tasks run
+    tmp_path = tempfile.mktemp(suffix=".txt")
+    total_urls = 0
+    start_time = time.time()
+    status_msg = await context.bot.send_message(chat_id, "🔥 Xtream storm started...")
+
+    async def collector():
+        nonlocal total_urls
+        seen = set()
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            while not stop_ev.is_set():
+                try:
+                    sc, url = await asyncio.wait_for(results_queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    if all(t.done() for t in tasks):
+                        break
+                    continue
+                if url not in seen:
+                    seen.add(url)
+                    f.write(f"{url}\n")
+                    total_urls += 1
+                    if total_urls % 1000 == 0:
+                        elapsed = time.time() - start_time
+                        rate = total_urls / elapsed if elapsed > 0 else 0
+                        try:
+                            await context.bot.edit_message_text(
+                                f"🔥 Xtream: {total_urls} URLs ({rate:.0f}/s)",
+                                chat_id=chat_id, message_id=status_msg.message_id
+                            )
+                        except Exception:
+                            pass
+
+    collector_task = asyncio.create_task(collector())
+    await asyncio.gather(*tasks, return_exceptions=True)
+    stop_ev.set()
+    await collector_task
+
+    elapsed = time.time() - start_time
+    rate = total_urls / elapsed if elapsed else 0
+
+    if total_urls > 0:
+        with open(tmp_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id, f,
+                filename=f"xtream_{total_urls}urls.txt",
+                caption=f"🔥 Xtream done: {total_urls} URLs in {elapsed:.1f}s ({rate:.0f}/s)"
+            )
+    else:
+        await context.bot.send_message(chat_id, "🔥 No URLs caught.")
+    os.unlink(tmp_path)
+    active_stop_evs.pop(chat_id, None)
+    active_jobs.pop(chat_id, None)
+
+
 # ─── UI HELPERS ──────────────────────────────────────────────────────────────
 def get_session(chat_id: int) -> dict:
     if chat_id not in user_sessions:
@@ -1786,6 +1915,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("🛡 SQL Filter", callback_data="m_filter")],
         [InlineKeyboardButton("🧹 URL Cleaner", callback_data="m_clean"),
          InlineKeyboardButton("📖 Help", callback_data="m_help")],
+        [InlineKeyboardButton("⚡ Speed Mode", callback_data="m_speed"),
+         InlineKeyboardButton("🔥 Xtream", callback_data="m_xtream")],
     ]
 
     alive = sum(1 for p in _proxy_pool if p["alive"])
@@ -1807,6 +1938,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✅ Auto health-check + background re-validation\n"
         "📥 Accepts ip:port, ip:port:user:pass, URL form\n"
         "⚡ Parallel chunks + Chrome110 TLS\n"
+        f"🔒 TLS Fingerprints: {len(TLS_IMPERSONATIONS)} rotating\n"
         f"{proxy_status}\n\n"
         "📌 Core Commands:\n"
         "  /dork <q>     — single dork search\n"
@@ -1819,7 +1951,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /engine X     — bing|yahoo|duckduckgo|all\n"
         "  /tor          — toggle Tor\n"
         "  /filter N     — SQL score 0-100\n"
-        "  /stop         — stop & get partial\n\n"
+        "  /stop         — stop & get partial\n"
+        "  /speed on|off — high-speed 200 URLs/s\n"
+        "  /xtream on|off— Yahoo storm 1000+ URLs/s\n\n"
         "🔄 Proxy Commands:\n"
         "  /addproxy <line>   — auto-detect & add ONE\n"
         "  /addproxies        — bulk paste (next msg)\n"
@@ -1846,16 +1980,20 @@ async def cmd_dork(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ok:
         await update.message.reply_text(f"❌ Invalid dork: {msg}")
         return
-    s = get_session(chat_id)
-    await update.message.reply_text(
-        f"🔍 {dork[:60]}\n📄 Pages: {', '.join(str(p) for p in s.get('pages', [1]))}"
-        f"{'  🧅TOR' if s.get('tor') else ''}\n💡 {msg}"
-    )
-    active_jobs[chat_id] = asyncio.create_task(run_dork_job(chat_id, [dork], context))
+    sess = get_session(chat_id)
+    if sess.get("xtream"):
+        sess["engines"] = ["yahoo"]
+        await update.message.reply_text("🔥 Xtream storm incoming…")
+        active_jobs[chat_id] = asyncio.create_task(run_xtream_job(chat_id, [dork], context))
+    else:
+        await update.message.reply_text(
+            f"🔍 {dork[:60]}\n📄 Pages: {', '.join(str(p) for p in sess.get('pages', [1]))}"
+            f"{'  🧅TOR' if sess.get('tor') else ''}\n💡 {msg}"
+        )
+        active_jobs[chat_id] = asyncio.create_task(run_dork_job(chat_id, [dork], context))
 
 
 async def cmd_dorkcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """NEW: validate / normalize / preview translation of a dork."""
     if not context.args:
         await update.message.reply_text(
             "🧠 DORK CHECKER\n━━━━━━━━━━━━━━\n"
@@ -1897,12 +2035,10 @@ async def cmd_dorkcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_mutate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """NEW: generate variations of a dork."""
     if not context.args:
         await update.message.reply_text("Usage: /mutate <dork> [n=10]")
         return
 
-    # Parse optional count at end
     args = list(context.args)
     n = 10
     if args[-1].isdigit():
@@ -1977,6 +2113,8 @@ async def cmd_settings(update, context):
         f"🛡 SQL ≥    : {s.get('min_score', 30)}\n"
         f"🧅 Tor      : {'ON' if s.get('tor') else 'OFF'}\n"
         f"{proxy_line}━━━━━━━━━━━━━━━━━━━━━━"
+        f"⚡ Speed    : {'ON' if s.get('speed_mode') else 'OFF'}\n"
+        f"🔥 Xtream   : {'ON (Yahoo only)' if s.get('xtream') else 'OFF'}"
     )
 
 
@@ -2048,23 +2186,55 @@ async def cmd_status(update, context):
     await update.message.reply_text("⚡ Running" if job and not job.done() else "💤 Idle")
 
 
+# ─── NEW SPEED / XTREAM COMMANDS ─────────────────────────────────────────────
+
+async def cmd_speed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    sess = get_session(chat_id)
+    if not context.args or context.args[0].lower() not in ("on", "off"):
+        await update.message.reply_text(
+            "Usage: /speed on|off\n"
+            "Enables high-speed mode (~200 URLs/s) with aggressive parallelism."
+        )
+        return
+    state = context.args[0].lower() == "on"
+    sess["speed_mode"] = state
+    if state:
+        # Boost workers/chunks for speed
+        sess["workers"] = min(sess.get("workers", WORKERS_PER_CHUNK), MAX_WORKERS_PER_CHUNK)
+        sess["chunks"] = min(sess.get("chunks", N_CHUNKS), 8)
+        sess["max_results"] = min(sess.get("max_results", MAX_RESULTS), 20)
+    await update.message.reply_text(f"⚡ Speed mode {'ENABLED' if state else 'DISABLED'}")
+
+
+async def cmd_xtream(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    sess = get_session(chat_id)
+    if not context.args or context.args[0].lower() not in ("on", "off"):
+        await update.message.reply_text(
+            "🔥 /xtream on|off\n"
+            "Xtream mode: 1000+ URLs/s via Yahoo with auto-mutations & proxy storm."
+        )
+        return
+    state = context.args[0].lower() == "on"
+    sess["xtream"] = state
+    if state:
+        # Force best settings for Yahoo
+        sess["engines"] = ["yahoo"]
+        sess["speed_mode"] = True  # also enable low delays
+    await update.message.reply_text(
+        f"🔥 Xtream mode {'ENABLED 🚀' if state else 'DISABLED'} on Yahoo"
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ─── PROXY COMMAND HANDLERS v19.0 ────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Track chat_ids waiting for bulk proxy input
 _awaiting_bulk_proxy: set[int] = set()
 
 
 async def cmd_addproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /addproxy <line>
-    Auto-detect protocol & add a single proxy to the pool.
-    Accepted formats:
-      ip:port
-      ip:port:user:pass
-      scheme://[user:pass@]host:port
-    """
     if not context.args:
         await update.message.reply_text(
             "➕ ADD PROXY\n━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -2082,13 +2252,9 @@ async def cmd_addproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     line = " ".join(context.args).strip()
     p    = parse_proxy_line(line)
     if not p:
-        await update.message.reply_text(
-            "❌ Invalid proxy format.\n"
-            "Use: ip:port  /  ip:port:user:pass  /  scheme://host:port"
-        )
+        await update.message.reply_text("❌ Invalid proxy format.")
         return
 
-    # Duplicate check
     key = proxy_key(p)
     async with _proxy_pool_lock:
         if any(proxy_key(x) == key for x in _proxy_pool):
@@ -2101,14 +2267,13 @@ async def cmd_addproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     ok = await detect_proxy_protocol(p)
-
     if not ok:
         await context.bot.edit_message_text(
             chat_id=update.effective_chat.id, message_id=wait_msg.message_id,
-            text=(f"❌ PROXY FAILED\n━━━━━━━━━━━━━━━━━━━━━━\n"
-                  f"🌐 {p['host']}:{p['port']}\n"
-                  f"💬 No protocol responded successfully\n"
-                  f"❌ Not added to pool")
+            text=f"❌ PROXY FAILED\n━━━━━━━━━━━━━━━━━━━━━━\n"
+                 f"🌐 {p['host']}:{p['port']}\n"
+                 f"💬 No protocol responded successfully\n"
+                 f"❌ Not added to pool"
         )
         return
 
@@ -2129,10 +2294,6 @@ async def cmd_addproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_addproxies(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /addproxies — start bulk-import mode.  Next message from this chat
-    will be parsed as a list of proxies (one per line), checked, and added.
-    """
     chat_id = update.effective_chat.id
     _awaiting_bulk_proxy.add(chat_id)
     await update.message.reply_text(
@@ -2153,14 +2314,12 @@ async def cmd_addproxies(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _bulk_add_proxies(chat_id: int, lines: list[str], context) -> None:
-    """Process a bulk list of proxy lines: parse, check, dedupe, add."""
     parsed: list[dict] = []
     invalid = 0
 
     for line in lines:
         if not line.strip() or line.startswith("#"):
             continue
-        # Strip inline comments
         line = line.split("#", 1)[0].strip()
         if not line:
             continue
@@ -2170,7 +2329,6 @@ async def _bulk_add_proxies(chat_id: int, lines: list[str], context) -> None:
         else:
             invalid += 1
 
-    # Dedupe against existing pool + among themselves
     seen_keys = {proxy_key(p) for p in _proxy_pool}
     unique:    list[dict] = []
     dup_count = 0
@@ -2182,11 +2340,7 @@ async def _bulk_add_proxies(chat_id: int, lines: list[str], context) -> None:
         unique.append(p)
 
     if not unique:
-        await context.bot.send_message(
-            chat_id,
-            f"⚠️ Nothing to add.\n"
-            f"❌ Invalid lines: {invalid}\n🔁 Duplicates: {dup_count}"
-        )
+        await context.bot.send_message(chat_id, f"⚠️ Nothing to add.\n❌ Invalid lines: {invalid}\n🔁 Duplicates: {dup_count}")
         return
 
     status_msg = await context.bot.send_message(
@@ -2201,7 +2355,6 @@ async def _bulk_add_proxies(chat_id: int, lines: list[str], context) -> None:
     )
 
     last_edit = [0.0]
-
     async def _progress(done, total, alive):
         if time.monotonic() - last_edit[0] < 2.5:
             return
@@ -2222,7 +2375,6 @@ async def _bulk_add_proxies(chat_id: int, lines: list[str], context) -> None:
 
     alive, dead = await check_proxies_bulk(unique, progress_cb=_progress)
 
-    # Add only alive ones
     added_alive: list[dict] = []
     async with _proxy_pool_lock:
         for p in unique:
@@ -2231,11 +2383,9 @@ async def _bulk_add_proxies(chat_id: int, lines: list[str], context) -> None:
                 added_alive.append(p)
         _persist_proxies()
 
-    # Build protocol breakdown
     breakdown: dict[str, int] = {}
     for p in added_alive:
         breakdown[p["protocol"]] = breakdown.get(p["protocol"], 0) + 1
-
     bd_text = "\n".join(f"   • {k.upper()}: {v}" for k, v in breakdown.items()) or "   (none)"
 
     try:
@@ -2257,15 +2407,11 @@ async def _bulk_add_proxies(chat_id: int, lines: list[str], context) -> None:
 
 
 async def cmd_proxycheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Re-check the entire pool — refreshes alive status & latencies."""
     if not _proxy_pool:
         await update.message.reply_text("📭 Pool is empty.")
         return
 
-    status_msg = await update.message.reply_text(
-        f"🔍 Re-checking {len(_proxy_pool)} proxies..."
-    )
-
+    status_msg = await update.message.reply_text(f"🔍 Re-checking {len(_proxy_pool)} proxies...")
     last_edit = [0.0]
     async def _progress(done, total, alive):
         if time.monotonic() - last_edit[0] < 2.5:
@@ -2298,17 +2444,14 @@ async def cmd_proxycheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_proxyclean(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Remove all dead proxies from the pool."""
     async with _proxy_pool_lock:
         before = len(_proxy_pool)
         _proxy_pool[:] = [p for p in _proxy_pool if p["alive"]]
         removed = before - len(_proxy_pool)
         _persist_proxies()
-    await update.message.reply_text(
-        f"🧹 PROXY CLEAN\n━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🗑 Removed dead : {removed}\n"
-        f"💚 Remaining    : {len(_proxy_pool)}"
-    )
+    await update.message.reply_text(f"🧹 PROXY CLEAN\n━━━━━━━━━━━━━━━━━━━━━━\n"
+                                    f"🗑 Removed dead : {removed}\n"
+                                    f"💚 Remaining    : {len(_proxy_pool)}")
 
 
 async def cmd_removeproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2333,30 +2476,22 @@ async def cmd_removeproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             removed = _proxy_pool.pop(idx)
             _persist_proxies()
-            await update.message.reply_text(
-                f"🗑 Removed {proxy_display(removed)}\n📦 Remaining: {len(_proxy_pool)}"
-            )
+            await update.message.reply_text(f"🗑 Removed {proxy_display(removed)}\n📦 Remaining: {len(_proxy_pool)}")
             return
         except ValueError:
             pass
-
-        # Try matching by host:port
         for i, p in enumerate(_proxy_pool):
             if f"{p['host']}:{p['port']}" == arg or p.get("url") == arg:
                 _proxy_pool.pop(i)
                 _persist_proxies()
                 await update.message.reply_text(f"🗑 Removed {arg}")
                 return
-
     await update.message.reply_text("❌ Not found. Use /removeproxy with no args to see indices.")
 
 
 async def cmd_proxylist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _proxy_pool:
-        await update.message.reply_text(
-            "📭 Pool empty.\n"
-            "Add proxies with /addproxy or /addproxies."
-        )
+        await update.message.reply_text("📭 Pool empty.\nAdd proxies with /addproxy or /addproxies.")
         return
 
     alive = sum(1 for p in _proxy_pool if p["alive"])
@@ -2370,29 +2505,22 @@ async def cmd_proxylist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 Protocols: " + ", ".join(f"{k}:{v}" for k, v in breakdown.items()),
         "━━━━━━━━━━━━━━━━━━━━━━",
     ]
-
-    # Limit display to first 50 to avoid Telegram message size cap
     for i, p in enumerate(_proxy_pool[:50], start=1):
         mark = "💚" if p["alive"] else "💀"
         lat  = f"{int(p['latency'])}ms" if p.get("latency") else "—"
         lines.append(f"{i:>2}. {mark} {proxy_display(p)}  {lat}")
-
     if len(_proxy_pool) > 50:
         lines.append(f"… and {len(_proxy_pool) - 50} more")
-
     lines.append("━━━━━━━━━━━━━━━━━━━━━━")
     lines.append("/proxycheck — re-test all  |  /proxyclean — drop dead")
     await update.message.reply_text("\n".join(lines))
 
 
 async def cmd_testproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Test a proxy without adding it to the pool."""
     if not context.args:
-        await update.message.reply_text(
-            "🧪 TEST PROXY (no add)\nUsage: /testproxy <line>\n\n"
-            "Accepted formats: same as /addproxy\n"
-            "Auto-detects protocol."
-        )
+        await update.message.reply_text("🧪 TEST PROXY (no add)\nUsage: /testproxy <line>\n\n"
+                                        "Accepted formats: same as /addproxy\n"
+                                        "Auto-detects protocol.")
         return
 
     line = " ".join(context.args).strip()
@@ -2401,13 +2529,9 @@ async def cmd_testproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid format.")
         return
 
-    wait = await update.message.reply_text(
-        f"🧪 Testing {p['host']}:{p['port']}...\n"
-        f"Probing SOCKS5 → SOCKS4 → HTTP → HTTPS"
-    )
-
+    wait = await update.message.reply_text(f"🧪 Testing {p['host']}:{p['port']}...\n"
+                                           f"Probing SOCKS5 → SOCKS4 → HTTP → HTTPS")
     ok = await detect_proxy_protocol(p)
-
     if ok:
         msg = (f"✅ PROXY WORKS\n━━━━━━━━━━━━━━━━━━━━━━\n"
                f"🔌 Protocol : {p['protocol'].upper()} (auto-detected)\n"
@@ -2420,11 +2544,8 @@ async def cmd_testproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
                f"🌐 {p['host']}:{p['port']}\n"
                f"💬 No protocol responded\n"
                f"Don't add this proxy.")
-
     try:
-        await context.bot.edit_message_text(
-            chat_id=update.effective_chat.id, message_id=wait.message_id, text=msg
-        )
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=wait.message_id, text=msg)
     except Exception:
         await update.message.reply_text(msg)
 
@@ -2438,7 +2559,6 @@ def _looks_like_url_list(lines: list) -> bool:
 
 
 def _looks_like_proxy_list(lines: list) -> bool:
-    """Detect if a file is a proxy list (ip:port or ip:port:user:pass)."""
     non_empty = [l for l in lines if l.strip() and not l.startswith("#")]
     if not non_empty:
         return False
@@ -2464,12 +2584,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         content = await (await context.bot.get_file(doc.file_id)).download_as_bytearray()
         lines   = content.decode("utf-8", errors="replace").splitlines()
 
-        # NEW: detect proxy lists first
         if _looks_like_proxy_list(lines):
-            await update.message.reply_text(
-                f"🔄 PROXY LIST detected — {len(lines)} lines\n"
-                f"🚀 Auto-detecting protocols & checking..."
-            )
+            await update.message.reply_text(f"🔄 PROXY LIST detected — {len(lines)} lines\n"
+                                            f"🚀 Auto-detecting protocols & checking...")
             await _bulk_add_proxies(chat_id, lines, context)
             return
 
@@ -2486,10 +2603,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ No dorks found.")
                 return
             s = get_session(chat_id)
-            await update.message.reply_text(
-                f"✅ {len(dorks)} dorks | Pages: {', '.join(str(p) for p in s.get('pages', [1]))}\n🚀 Starting..."
-            )
-            active_jobs[chat_id] = asyncio.create_task(run_dork_job(chat_id, dorks, context))
+            if s.get("xtream"):
+                await update.message.reply_text("🔥 Xtream storm incoming…")
+                active_jobs[chat_id] = asyncio.create_task(run_xtream_job(chat_id, dorks, context))
+            else:
+                await update.message.reply_text(
+                    f"✅ {len(dorks)} dorks | Pages: {', '.join(str(p) for p in s.get('pages', [1]))}\n🚀 Starting..."
+                )
+                active_jobs[chat_id] = asyncio.create_task(run_dork_job(chat_id, dorks, context))
 
     except Exception as exc:
         await update.message.reply_text(f"❌ Error: {exc}")
@@ -2498,7 +2619,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
-    # NEW: bulk proxy import mode
     if chat_id in _awaiting_bulk_proxy:
         _awaiting_bulk_proxy.discard(chat_id)
         lines = update.message.text.splitlines()
@@ -2515,10 +2635,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ Job running! /stop first.")
             return
         s = get_session(chat_id)
-        await update.message.reply_text(
-            f"✅ {len(lines)} dorks | Pages: {', '.join(str(p) for p in s.get('pages', [1]))}\n🚀 Starting..."
-        )
-        active_jobs[chat_id] = asyncio.create_task(run_dork_job(chat_id, lines, context))
+        if s.get("xtream"):
+            await update.message.reply_text("🔥 Xtream storm incoming…")
+            active_jobs[chat_id] = asyncio.create_task(run_xtream_job(chat_id, lines, context))
+        else:
+            await update.message.reply_text(
+                f"✅ {len(lines)} dorks | Pages: {', '.join(str(p) for p in s.get('pages', [1]))}\n🚀 Starting..."
+            )
+            active_jobs[chat_id] = asyncio.create_task(run_dork_job(chat_id, lines, context))
     else:
         await update.message.reply_text(
             "Use /dork <q> or upload .txt\n"
@@ -2527,100 +2651,119 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ─── FIXED INLINE KEYBOARD HANDLER ───────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
+# ─── CALLBACK HANDLER (FIXED) ────────────────────────────────────────────────
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    # Always answer the callback immediately to stop the loading indicator
-    await query.answer()
+    # Always answer immediately to stop the spinning progress
+    try:
+        await query.answer()
+    except Exception as exc:
+        log.warning(f"Callback answer failed: {exc}")
+
     data = query.data
     chat_id = query.message.chat_id
     sess = get_session(chat_id)
 
-    # ── Page selection buttons (unchanged logic) ────────────────────
     if data.startswith("pg_"):
         cmd = data[3:]
         selected = list(sess.get("pages", [1]))
-        if cmd == "all":
-            selected = list(range(1, 71))
-        elif cmd == "clear":
-            selected = []
+        if cmd == "all":   selected = list(range(1, 71))
+        elif cmd == "clear": selected = []
         elif cmd == "confirm":
             sess["pages"] = selected or [1]
             try:
-                await query.edit_message_text(
-                    f"✅ Pages saved: {', '.join(str(p) for p in sorted(sess['pages']))}",
-                    reply_markup=None,
-                )
-            except Exception:
-                pass
+                await query.edit_message_text(f"✅ Pages: {', '.join(str(p) for p in sorted(sess['pages']))}")
+            except Exception: pass
             return
         else:
             try:
                 p = int(cmd)
-                if p in selected:
-                    selected.remove(p)
-                else:
-                    selected.append(p)
+                if p in selected: selected.remove(p)
+                else: selected.append(p)
                 selected = sorted(selected)
-            except ValueError:
-                pass
+            except ValueError: pass
         sess["pages"] = selected
         try:
             await query.edit_message_text(
-                f"📄 SELECT PAGES (1–70)\n━━━━━━━━━━━━━━━━━━━━━━\nSelected: {', '.join(str(p) for p in selected) or 'none'}",
+                f"📄 SELECT PAGES\nSelected: {', '.join(str(p) for p in selected) or 'none'}",
                 reply_markup=page_keyboard(selected),
             )
-        except Exception:
-            pass
+        except Exception: pass
         return
 
-    # ── Menu buttons – now actually perform the actions ─────────────
-    if data == "m_bulk":
-        await query.message.reply_text(
-            "📂 Upload a .txt file with dorks (one per line) or a proxy list.\n"
-            "Auto‑detection for URLs / proxies / dorks is active."
+    # Toggle buttons that actually change settings
+    if data == "m_tor":
+        global tor_enabled_users
+        old = sess.get("tor", False)
+        new = not old
+        sess["tor"] = new
+        if new and not old:
+            tor_enabled_users += 1
+            if tor_enabled_users == 1: start_tor_rotation()
+        elif not new and old:
+            tor_enabled_users = max(0, tor_enabled_users - 1)
+            if tor_enabled_users == 0: stop_tor_rotation()
+        try:
+            await query.edit_message_text(
+                f"🧅 Tor {'✅ ON' if new else '❌ OFF'}",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(f"Toggle {'OFF' if new else 'ON'}", callback_data="m_tor")
+                ]])
+            )
+        except Exception:
+            await context.bot.send_message(chat_id, f"🧅 Tor → {'ON' if new else 'OFF'}")
+        return
+
+    if data == "m_filter":
+        await query.edit_message_text(
+            f"🛡 SQL Filter ≥ {sess.get('min_score', 30)}\nUse /filter N to change.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("↩ Back", callback_data="m_settings")
+            ]])
         )
-    elif data == "m_single":
-        await query.message.reply_text(
-            "🔍 Send a single dork with /dork <query>\n"
-            "Example: /dork inurl:login.php?id="
+        return
+
+    if data == "m_speed":
+        old = sess.get("speed_mode", False)
+        new = not old
+        sess["speed_mode"] = new
+        if new:
+            sess["workers"] = min(sess.get("workers", WORKERS_PER_CHUNK), MAX_WORKERS_PER_CHUNK)
+            sess["chunks"] = min(sess.get("chunks", N_CHUNKS), 8)
+            sess["max_results"] = min(sess.get("max_results", MAX_RESULTS), 20)
+        await query.edit_message_text(
+            f"⚡ Speed mode {'ENABLED' if new else 'DISABLED'}"
         )
+        return
+
+    if data == "m_xtream":
+        old = sess.get("xtream", False)
+        new = not old
+        sess["xtream"] = new
+        if new:
+            sess["engines"] = ["yahoo"]
+            sess["speed_mode"] = True
+        await query.edit_message_text(
+            f"🔥 Xtream mode {'ENABLED 🚀' if new else 'DISABLED'} (Yahoo only)"
+        )
+        return
+
+    # Static replies
+    replies = {
+        "m_bulk":     "📂 Upload .txt — URLs / dorks / proxies auto-detected.",
+        "m_single":   "🔍 /dork inurl:login.php?id=",
+        "m_clean":    "🧹 Upload .txt with URLs to clean.",
+        "m_settings": "⚙️ Use /settings",
+        "m_help":     "Use /start for full command list.",
+    }
+    if data in replies:
+        await query.edit_message_text(replies[data])
     elif data == "m_pages":
-        await query.message.reply_text(
-            "📄 Select pages",
-            reply_markup=page_keyboard(sess.get("pages", [1])),
+        await query.edit_message_text(
+            f"📄 SELECT PAGES (1–70)",
+            reply_markup=page_keyboard(sess.get("pages", [1]))
         )
-    elif data == "m_settings":
-        # Reuse the /settings command logic
-        await cmd_settings(update, context)
-    elif data == "m_tor":
-        # Actually toggle Tor – simulate /tor command
-        context.args = []  # makes cmd_tor toggle the value
-        await cmd_tor(update, context)
-    elif data == "m_filter":
-        await query.message.reply_text(
-            f"🛡 Current SQL filter: ≥{sess.get('min_score', 30)}\n"
-            "Send /filter <0-100> to change."
-        )
-    elif data == "m_clean":
-        await query.message.reply_text(
-            "🧹 URL CLEANER MODE\nUpload a .txt file with URLs (one per line)."
-        )
-    elif data == "m_help":
-        await query.message.reply_text(
-            "📖 DORK PARSER v19.0 HELP\n\n"
-            "Use /dork <query> for single search\n"
-            "Upload .txt for bulk dorks/proxies/URLs\n"
-            "/dorkcheck – validate a dork\n"
-            "/mutate – generate variations\n"
-            "/addproxies – bulk proxy import\n\n"
-            "Full list: /start"
-        )
-    else:
-        # Unknown callback – silently ignore
-        pass
 
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
@@ -2640,6 +2783,7 @@ def main():
         ("workers", cmd_workers), ("chunks", cmd_chunks),
         ("maxres", cmd_maxres), ("engine", cmd_engine),
         ("stop", cmd_stop), ("status", cmd_status),
+        ("speed", cmd_speed), ("xtream", cmd_xtream),  # NEW
     ]:
         app.add_handler(CommandHandler(name, handler))
 
@@ -2660,7 +2804,6 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     async def _on_startup(_app):
-        # Start background proxy health monitor
         start_proxy_health_monitor()
         log.info("Background proxy health monitor scheduled")
     app.post_init = _on_startup
@@ -2677,7 +2820,8 @@ def main():
     log.info(f"  Probe order: {PROXY_PROBE_ORDER}")
     log.info(f"  Health check every {PROXY_HEALTH_INTERVAL}s")
     log.info(f"  Engines: {', '.join(ENGINES)}")
-    log.info("  New: /dorkcheck /mutate /addproxies /proxycheck /proxyclean")
+    log.info(f"  TLS fingerprints: {TLS_IMPERSONATIONS}")
+    log.info("  New: /dorkcheck /mutate /addproxies /speed /xtream")
     log.info("=" * 60)
     app.run_polling(drop_pending_updates=True)
 
