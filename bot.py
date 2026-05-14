@@ -2527,57 +2527,100 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ─── FIXED INLINE KEYBOARD HANDLER ───────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    # Always answer the callback immediately to stop the loading indicator
     await query.answer()
     data = query.data
     chat_id = query.message.chat_id
     sess = get_session(chat_id)
 
+    # ── Page selection buttons (unchanged logic) ────────────────────
     if data.startswith("pg_"):
         cmd = data[3:]
         selected = list(sess.get("pages", [1]))
-        if cmd == "all":   selected = list(range(1, 71))
-        elif cmd == "clear": selected = []
+        if cmd == "all":
+            selected = list(range(1, 71))
+        elif cmd == "clear":
+            selected = []
         elif cmd == "confirm":
             sess["pages"] = selected or [1]
             try:
                 await query.edit_message_text(
-                    f"✅ Pages: {', '.join(str(p) for p in sorted(sess['pages']))}"
+                    f"✅ Pages saved: {', '.join(str(p) for p in sorted(sess['pages']))}",
+                    reply_markup=None,
                 )
-            except Exception: pass
+            except Exception:
+                pass
             return
         else:
             try:
                 p = int(cmd)
-                selected.remove(p) if p in selected else selected.append(p)
+                if p in selected:
+                    selected.remove(p)
+                else:
+                    selected.append(p)
                 selected = sorted(selected)
-            except ValueError: pass
+            except ValueError:
+                pass
         sess["pages"] = selected
         try:
             await query.edit_message_text(
-                f"📄 SELECT PAGES\nSelected: {', '.join(str(p) for p in selected) or 'none'}",
+                f"📄 SELECT PAGES (1–70)\n━━━━━━━━━━━━━━━━━━━━━━\nSelected: {', '.join(str(p) for p in selected) or 'none'}",
                 reply_markup=page_keyboard(selected),
             )
-        except Exception: pass
+        except Exception:
+            pass
         return
 
-    replies = {
-        "m_bulk":     "📂 Upload .txt — URLs / dorks / proxies auto-detected.",
-        "m_single":   "🔍 /dork inurl:login.php?id=",
-        "m_tor":      f"🧅 Tor {'ON' if sess.get('tor') else 'OFF'}",
-        "m_filter":   f"🛡 SQL ≥{sess.get('min_score', 30)}",
-        "m_clean":    "🧹 Upload .txt with URLs to clean.",
-        "m_settings": "⚙️ Use /settings",
-        "m_help":     "Use /start for full command list.",
-    }
-    if data == "m_pages":
+    # ── Menu buttons – now actually perform the actions ─────────────
+    if data == "m_bulk":
         await query.message.reply_text(
-            f"📄 SELECT PAGES (1–70)",
+            "📂 Upload a .txt file with dorks (one per line) or a proxy list.\n"
+            "Auto‑detection for URLs / proxies / dorks is active."
+        )
+    elif data == "m_single":
+        await query.message.reply_text(
+            "🔍 Send a single dork with /dork <query>\n"
+            "Example: /dork inurl:login.php?id="
+        )
+    elif data == "m_pages":
+        await query.message.reply_text(
+            "📄 Select pages",
             reply_markup=page_keyboard(sess.get("pages", [1])),
         )
-    elif data in replies:
-        await query.message.reply_text(replies[data])
+    elif data == "m_settings":
+        # Reuse the /settings command logic
+        await cmd_settings(update, context)
+    elif data == "m_tor":
+        # Actually toggle Tor – simulate /tor command
+        context.args = []  # makes cmd_tor toggle the value
+        await cmd_tor(update, context)
+    elif data == "m_filter":
+        await query.message.reply_text(
+            f"🛡 Current SQL filter: ≥{sess.get('min_score', 30)}\n"
+            "Send /filter <0-100> to change."
+        )
+    elif data == "m_clean":
+        await query.message.reply_text(
+            "🧹 URL CLEANER MODE\nUpload a .txt file with URLs (one per line)."
+        )
+    elif data == "m_help":
+        await query.message.reply_text(
+            "📖 DORK PARSER v19.0 HELP\n\n"
+            "Use /dork <query> for single search\n"
+            "Upload .txt for bulk dorks/proxies/URLs\n"
+            "/dorkcheck – validate a dork\n"
+            "/mutate – generate variations\n"
+            "/addproxies – bulk proxy import\n\n"
+            "Full list: /start"
+        )
+    else:
+        # Unknown callback – silently ignore
+        pass
 
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
