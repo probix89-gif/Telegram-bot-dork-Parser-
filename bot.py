@@ -77,21 +77,27 @@ XTREAM_WORKERS_PER_CHUNK   = 50      # parallel workers per chunk
 XTREAM_CHUNKS              = 8       # parallel chunks
 XTREAM_MIN_DELAY           = 0.01    # almost no delay
 XTREAM_MAX_DELAY           = 0.05
-XTREAM_TIMEOUT             = 15      # short timeout
-XTREAM_MAX_RETRIES         = 1       # fail fast
+XTREAM_TIMEOUT             = 20      # increased for reliability
+XTREAM_MAX_RETRIES         = 2       # extra retry before giving up
 XTREAM_TARGET_RPS          = 1000    # target requests/sec
-XTREAM_PAGES_PER_DORK      = 5       # pages to crawl per dork in xtream
+XTREAM_PAGES_PER_DORK      = 8       # deeper per-dork crawl
 XTREAM_SESSION_POOL_SIZE   = 200     # pre-warmed session pool
+XTREAM_SESSION_MAX_USES    = 30      # rotate session after N uses
+XTREAM_SESSION_MAX_AGE     = 240     # rotate session after 4 minutes
+XTREAM_POOL_BATCH_SIZE     = 20      # parallel batch size during pool init
+XTREAM_CAPTCHA_RATE_LIMIT  = 0.25    # throttle concurrency if captcha rate > 25%
+XTREAM_PRESEED_COOKIES     = True    # visit homepage to warm cookies before searching
 
 DEFAULT_SESSION = {
-    "workers":     WORKERS_PER_CHUNK,
-    "chunks":      N_CHUNKS,
-    "engines":     list(ENGINES),
-    "max_results": MAX_RESULTS,
-    "pages":       [1],
-    "tor":         False,
-    "min_score":   30,
-    "xtream":      False,
+    "workers":       WORKERS_PER_CHUNK,
+    "chunks":        N_CHUNKS,
+    "engines":       list(ENGINES),
+    "max_results":   MAX_RESULTS,
+    "pages":         [1],
+    "tor":           False,
+    "min_score":     30,
+    "xtream":        False,
+    "xtream_engine": "yahoo",  # yahoo | bing | both
 }
 
 user_sessions:   dict = {}
@@ -100,164 +106,653 @@ active_stop_evs: dict = {}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ─── ADVANCED TLS FINGERPRINT ROTATION v20.0 ─────────────────────────────────
+# ─── ADVANCED TLS FINGERPRINT ROTATION v21.0 ─────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# curl_cffi supports impersonating real browsers at the TLS/JA3 layer.
-# We rotate through ALL supported profiles + matched HTTP headers/Sec-CH-UA
-# to create truly believable traffic patterns that resist fingerprinting.
+# Full browser impersonation at TLS/JA3/ALPN + HTTP header layer.
+# 22+ profiles spanning Chrome, Firefox, Edge, Safari across Windows/macOS/
+# Linux/Android/iOS. Each profile carries the exact Accept, Accept-Encoding,
+# Priority, and Sec-CH-UA values the real browser sends so every layer of
+# fingerprinting is consistent.
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Diverse Accept-Language pool — real users have different browser locales
+_LANG_POOL = [
+    "en-US,en;q=0.9",
+    "en-US,en;q=0.9,es;q=0.8",
+    "en-GB,en;q=0.9",
+    "en-CA,en;q=0.9,fr-CA;q=0.8",
+    "en-AU,en;q=0.9",
+    "en-US,en;q=0.8,de;q=0.7",
+    "en-US,en;q=0.9,fr;q=0.8",
+    "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
+    "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+    "es-ES,es;q=0.9,en;q=0.8",
+    "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+    "nl-NL,nl;q=0.9,en-US;q=0.8,en;q=0.7",
+    "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+    "en-IN,en-GB;q=0.9,en;q=0.8",
+    "en-SG,en;q=0.9",
+    "en-NZ,en;q=0.9",
+]
+
+# Per-browser Accept header strings (must match the impersonate target exactly)
+_ACCEPT_CHROME  = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+_ACCEPT_FIREFOX = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+_ACCEPT_SAFARI  = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+_ACCEPT_EDGE    = "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+
 TLS_PROFILES = [
-    # --- Chrome family (Windows) ---
+    # ── Chrome 110 · Windows ────────────────────────────────────────────────
     {
-        "impersonate": "chrome110",
+        "impersonate": "chrome110", "browser": "chrome", "version": 110,
         "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
         "sec_ch_ua": '"Chromium";v="110", "Not A(Brand";v="24", "Google Chrome";v="110"',
-        "platform": '"Windows"',
-        "accept_lang": "en-US,en;q=0.9",
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
     },
+    # ── Chrome 116 · Windows ────────────────────────────────────────────────
     {
-        "impersonate": "chrome116",
+        "impersonate": "chrome116", "browser": "chrome", "version": 116,
         "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
         "sec_ch_ua": '"Not)A;Brand";v="24", "Chromium";v="116", "Google Chrome";v="116"',
-        "platform": '"Windows"',
-        "accept_lang": "en-US,en;q=0.9",
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
     },
+    # ── Chrome 119 · Windows ────────────────────────────────────────────────
     {
-        "impersonate": "chrome119",
+        "impersonate": "chrome119", "browser": "chrome", "version": 119,
         "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
         "sec_ch_ua": '"Google Chrome";v="119", "Chromium";v="119", "Not?A_Brand";v="24"',
-        "platform": '"Windows"',
-        "accept_lang": "en-US,en;q=0.9",
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
     },
+    # ── Chrome 120 · Windows ────────────────────────────────────────────────
     {
-        "impersonate": "chrome120",
+        "impersonate": "chrome120", "browser": "chrome", "version": 120,
         "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "sec_ch_ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-        "platform": '"Windows"',
-        "accept_lang": "en-US,en;q=0.9",
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
     },
+    # ── Chrome 123 · Windows ────────────────────────────────────────────────
     {
-        "impersonate": "chrome123",
+        "impersonate": "chrome123", "browser": "chrome", "version": 123,
         "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
         "sec_ch_ua": '"Google Chrome";v="123", "Not:A-Brand";v="8", "Chromium";v="123"',
-        "platform": '"Windows"',
-        "accept_lang": "en-US,en;q=0.9",
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
     },
-    # --- Chrome (macOS) ---
+    # ── Chrome 124 · Windows ────────────────────────────────────────────────
     {
-        "impersonate": "chrome120",
-        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "sec_ch_ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-        "platform": '"macOS"',
-        "accept_lang": "en-US,en;q=0.9",
+        "impersonate": "chrome124", "browser": "chrome", "version": 124,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
     },
-    # --- Chrome (Android) ---
+    # ── Chrome 126 · Windows ────────────────────────────────────────────────
     {
-        "impersonate": "chrome120",
-        "ua": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+        "impersonate": "chrome126", "browser": "chrome", "version": 126,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="8"',
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Chrome 131 · Windows ────────────────────────────────────────────────
+    {
+        "impersonate": "chrome131", "browser": "chrome", "version": 131,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Chrome 131 · macOS ──────────────────────────────────────────────────
+    {
+        "impersonate": "chrome131", "browser": "chrome", "version": 131,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "platform": '"macOS"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Chrome 131 · Linux ──────────────────────────────────────────────────
+    {
+        "impersonate": "chrome131", "browser": "chrome", "version": 131,
+        "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "platform": '"Linux"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Chrome 120 · macOS ──────────────────────────────────────────────────
+    {
+        "impersonate": "chrome120", "browser": "chrome", "version": 120,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "sec_ch_ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-        "platform": '"Android"',
-        "accept_lang": "en-US,en;q=0.9",
+        "platform": '"macOS"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Chrome 131 · Android (Pixel 8) ──────────────────────────────────────
+    {
+        "impersonate": "chrome131", "browser": "chrome", "version": 131,
+        "ua": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+        "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "platform": '"Android"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "mobile": True, "priority": "u=0, i",
+    },
+    # ── Chrome 120 · Android (Samsung) ──────────────────────────────────────
+    {
+        "impersonate": "chrome120", "browser": "chrome", "version": 120,
+        "ua": "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.144 Mobile Safari/537.36",
+        "sec_ch_ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        "platform": '"Android"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
         "mobile": True,
     },
-    # --- Edge ---
+    # ── Edge 99 · Windows ───────────────────────────────────────────────────
     {
-        "impersonate": "edge99",
+        "impersonate": "edge99", "browser": "edge", "version": 99,
         "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.84 Safari/537.36 Edg/99.0.1150.55",
         "sec_ch_ua": '"Microsoft Edge";v="99", "Chromium";v="99", "Not;A=Brand";v="24"',
-        "platform": '"Windows"',
-        "accept_lang": "en-US,en;q=0.9",
+        "platform": '"Windows"', "accept": _ACCEPT_EDGE,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
     },
+    # ── Edge 101 · Windows ──────────────────────────────────────────────────
     {
-        "impersonate": "edge101",
+        "impersonate": "edge101", "browser": "edge", "version": 101,
         "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.54 Safari/537.36 Edg/101.0.1210.39",
         "sec_ch_ua": '"Microsoft Edge";v="101", "Chromium";v="101", "Not;A=Brand";v="24"',
-        "platform": '"Windows"',
-        "accept_lang": "en-US,en;q=0.9",
+        "platform": '"Windows"', "accept": _ACCEPT_EDGE,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+        "priority": "u=0, i",
     },
-    # --- Safari ---
+    # ── Safari 15.5 · macOS ─────────────────────────────────────────────────
     {
-        "impersonate": "safari15_5",
+        "impersonate": "safari15_5", "browser": "safari", "version": 155,
         "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.5 Safari/605.1.15",
         "sec_ch_ua": None,
-        "platform": '"macOS"',
-        "accept_lang": "en-US,en;q=0.9",
+        "platform": '"macOS"', "accept": _ACCEPT_SAFARI,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
     },
+    # ── Safari 17.0 · macOS ─────────────────────────────────────────────────
     {
-        "impersonate": "safari17_0",
+        "impersonate": "safari17_0", "browser": "safari", "version": 170,
         "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
         "sec_ch_ua": None,
-        "platform": '"macOS"',
-        "accept_lang": "en-US,en;q=0.9",
+        "platform": '"macOS"', "accept": _ACCEPT_SAFARI,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
     },
-    # --- Safari iOS ---
+    # ── Safari 18.0 · macOS ─────────────────────────────────────────────────
     {
-        "impersonate": "safari17_2_ios",
+        "impersonate": "safari18_0", "browser": "safari", "version": 180,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
+        "sec_ch_ua": None,
+        "platform": '"macOS"', "accept": _ACCEPT_SAFARI,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Safari 17.2 · iOS ───────────────────────────────────────────────────
+    {
+        "impersonate": "safari17_2_ios", "browser": "safari", "version": 172,
         "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
         "sec_ch_ua": None,
-        "platform": '"iOS"',
-        "accept_lang": "en-US,en;q=0.9",
+        "platform": '"iOS"', "accept": _ACCEPT_SAFARI,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
         "mobile": True,
+    },
+    # ── Safari 18.0 · iOS ───────────────────────────────────────────────────
+    {
+        "impersonate": "safari18_0", "browser": "safari", "version": 180,
+        "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+        "sec_ch_ua": None,
+        "platform": '"iOS"', "accept": _ACCEPT_SAFARI,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+        "mobile": True,
+    },
+    # ── Firefox 133 · Windows ───────────────────────────────────────────────
+    {
+        "impersonate": "firefox133", "browser": "firefox", "version": 133,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
+        "sec_ch_ua": None,
+        "platform": None, "accept": _ACCEPT_FIREFOX,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "firefox": True,
+    },
+    # ── Firefox 133 · Linux ─────────────────────────────────────────────────
+    {
+        "impersonate": "firefox133", "browser": "firefox", "version": 133,
+        "ua": "Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0",
+        "sec_ch_ua": None,
+        "platform": None, "accept": _ACCEPT_FIREFOX,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "firefox": True,
+    },
+    # ── Firefox 133 · macOS ─────────────────────────────────────────────────
+    {
+        "impersonate": "firefox133", "browser": "firefox", "version": 133,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.2; rv:133.0) Gecko/20100101 Firefox/133.0",
+        "sec_ch_ua": None,
+        "platform": None, "accept": _ACCEPT_FIREFOX,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "firefox": True,
     },
 ]
 
 # Cycling iterator (thread-safe ish — used as a hint only)
 _tls_cycle = itertools.cycle(TLS_PROFILES)
 _tls_lock  = asyncio.Lock()
+_tls_last  = []         # tracks last N profiles used to avoid consecutive repeats
+_TLS_ANTI_REPEAT = 3   # don't repeat same impersonate within this window
 
 
 def get_tls_profile(strategy: str = "random") -> dict:
     """
-    Get a TLS profile. Strategies:
-      - "random"     : pick uniformly at random (default — best for fingerprint diversity)
-      - "round"      : round-robin (predictable distribution)
-      - "weighted"   : favor desktop Chrome (most common, blends in)
+    Get a TLS profile.
+      - "random"   : uniform random with anti-repeat window (best for diversity)
+      - "round"    : strict round-robin (predictable distribution)
+      - "weighted" : market-share weighted (Chrome dominant, Firefox included)
     """
+    global _tls_last
     if strategy == "round":
         return next(_tls_cycle)
+
     if strategy == "weighted":
-        # 70% desktop Chrome, 15% Edge, 10% Safari, 5% mobile
+        # Realistic 2025 browser market share weights
         r = random.random()
-        if r < 0.70:
-            pool = [p for p in TLS_PROFILES if "chrome" in p["impersonate"] and not p.get("mobile")]
-        elif r < 0.85:
-            pool = [p for p in TLS_PROFILES if "edge" in p["impersonate"]]
-        elif r < 0.95:
-            pool = [p for p in TLS_PROFILES if "safari" in p["impersonate"] and not p.get("mobile")]
+        if r < 0.62:
+            pool = [p for p in TLS_PROFILES if p["browser"] == "chrome" and not p.get("mobile")]
+        elif r < 0.72:
+            pool = [p for p in TLS_PROFILES if p["browser"] == "firefox"]
+        elif r < 0.80:
+            pool = [p for p in TLS_PROFILES if p["browser"] == "edge"]
+        elif r < 0.90:
+            pool = [p for p in TLS_PROFILES if p["browser"] == "safari" and not p.get("mobile")]
         else:
             pool = [p for p in TLS_PROFILES if p.get("mobile")]
-        return random.choice(pool or TLS_PROFILES)
-    return random.choice(TLS_PROFILES)
+        candidates = pool or TLS_PROFILES
+    else:
+        candidates = TLS_PROFILES
+
+    # Anti-repeat: exclude profiles whose impersonate was recently used
+    recent = set(_tls_last[-_TLS_ANTI_REPEAT:])
+    filtered = [p for p in candidates if p["impersonate"] not in recent]
+    chosen = random.choice(filtered if filtered else candidates)
+
+    # Update anti-repeat window
+    _tls_last.append(chosen["impersonate"])
+    if len(_tls_last) > _TLS_ANTI_REPEAT * 2:
+        _tls_last = _tls_last[-_TLS_ANTI_REPEAT:]
+    return chosen
 
 
 def build_headers_from_profile(profile: dict, referer: str | None = None,
-                                origin: str | None = None) -> dict:
-    """Build a coherent HTTP header set matching the TLS profile."""
-    h = {
-        "User-Agent": profile["ua"],
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-        "Accept-Language": profile["accept_lang"],
-        "Accept-Encoding": "gzip, deflate, br",
-        "Upgrade-Insecure-Requests": "1",
-        "Cache-Control": "max-age=0",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "same-origin" if referer else "none",
-        "Sec-Fetch-User": "?1",
-    }
+                                origin: str | None = None,
+                                context: str = "navigate") -> dict:
+    """
+    Build a complete, browser-accurate HTTP header set matching the TLS profile.
+    Every field is chosen to be internally consistent with the browser/OS/version.
+    """
+    is_firefox = profile.get("firefox", False)
+    is_mobile  = profile.get("mobile", False)
+    version    = profile.get("version", 120)
+    browser    = profile.get("browser", "chrome")
+
+    # Vary Cache-Control realistically (real users have varied cache states)
+    cache_ctrl = random.choice(["max-age=0", "max-age=0", "no-cache", "max-age=0"])
+
+    if is_firefox:
+        h = {
+            "User-Agent":              profile["ua"],
+            "Accept":                  profile.get("accept", _ACCEPT_FIREFOX),
+            "Accept-Language":         profile["accept_lang"],
+            "Accept-Encoding":         profile.get("accept_enc", "gzip, deflate, br, zstd"),
+            "Connection":              "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest":          "document",
+            "Sec-Fetch-Mode":          "navigate",
+            "Sec-Fetch-Site":          "cross-site" if referer else "none",
+            "Sec-Fetch-User":          "?1",
+            "Te":                      "trailers",
+            "Cache-Control":           cache_ctrl,
+        }
+    else:
+        # Chrome/Edge/Safari
+        h = {
+            "User-Agent":              profile["ua"],
+            "Accept":                  profile.get("accept", _ACCEPT_CHROME),
+            "Accept-Language":         profile["accept_lang"],
+            "Accept-Encoding":         profile.get("accept_enc", "gzip, deflate, br"),
+            "Upgrade-Insecure-Requests": "1",
+            "Cache-Control":           cache_ctrl,
+            "Sec-Fetch-Dest":          "document",
+            "Sec-Fetch-Mode":          "navigate",
+            "Sec-Fetch-Site":          "same-origin" if referer else "none",
+            "Sec-Fetch-User":          "?1",
+        }
+        # Priority header for Chrome 101+ and Edge 101+
+        if version >= 101 and browser in ("chrome", "edge") and "priority" in profile:
+            h["Priority"] = profile["priority"]
+
+    # Sec-CH-UA headers for Chromium-based browsers
     if profile.get("sec_ch_ua"):
         h["Sec-Ch-Ua"]          = profile["sec_ch_ua"]
-        h["Sec-Ch-Ua-Mobile"]   = "?1" if profile.get("mobile") else "?0"
+        h["Sec-Ch-Ua-Mobile"]   = "?1" if is_mobile else "?0"
         h["Sec-Ch-Ua-Platform"] = profile["platform"]
+        # Newer Chrome also sends architecture hints ~40% of the time
+        if version >= 120 and random.random() < 0.40:
+            h["Sec-Ch-Ua-Arch"]           = '"x86"' if not is_mobile else '"arm"'
+            h["Sec-Ch-Ua-Bitness"]        = '"64"'
+            h["Sec-Ch-Ua-Full-Version-List"] = profile["sec_ch_ua"]
+
     if referer:
         h["Referer"] = referer
     if origin:
         h["Origin"] = origin
-    # Random DNT
-    if random.random() < 0.3:
+
+    # DNT: Chrome sends it rarely (<5%), Firefox users ~25%
+    dnt_prob = 0.25 if is_firefox else 0.05
+    if random.random() < dnt_prob:
         h["DNT"] = "1"
+
+    # Save-Data: ~2% of connections (low-bandwidth users)
+    if random.random() < 0.02:
+        h["Save-Data"] = "on"
+
+    return h
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ─── ANTI-BLOCK SYSTEM v21.0 ─────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Four independent layers work together to defeat bot detection:
+#
+#  1. DomainCircuitBreaker — per-domain state machine that auto-pauses a
+#     domain when its block rate exceeds a threshold and auto-resumes after
+#     a cooldown period.  Workers call `check()` before each request and
+#     `record()` after.
+#
+#  2. humanize_delay()     — Gaussian jitter instead of uniform random sleep.
+#     Real humans don't sleep uniformly; they cluster around a mean with a
+#     natural spread.  Occasional outliers ("distraction breaks") are added.
+#
+#  3. RefererChain         — maintains a per-session chain of plausible
+#     referer URLs so requests look like they come from real navigation.
+#     Includes the search-engine homepage → SERP → result page chain.
+#
+#  4. SearchParamVariator  — randomises minor query-string parameters
+#     (Yahoo fr/b, Bing first/form/count) so each request has a unique
+#     fingerprint even when the dork is the same.
+#
+# ══════════════════════════════════════════════════════════════════════════════
+
+import collections as _collections
+
+# ── 1. Per-domain Circuit Breaker ────────────────────────────────────────────
+
+class DomainCircuitBreaker:
+    """
+    Tracks block/success events per target domain and exposes a circuit-breaker
+    that pauses a domain when it is clearly rate-limiting us.
+
+    States:
+      CLOSED  → normal operation
+      OPEN    → domain is paused; workers must wait for cooldown
+      HALF    → cooldown expired; next request is a probe
+
+    Transitions:
+      CLOSED → OPEN  : block_rate >= THRESHOLD over last WINDOW requests
+      OPEN   → HALF  : cooldown_secs elapsed
+      HALF   → CLOSED: probe request succeeded
+      HALF   → OPEN  : probe request was also blocked (extend cooldown ×2)
+    """
+
+    WINDOW        = 20    # sliding window of last N requests
+    THRESHOLD     = 0.55  # 55% block rate triggers OPEN
+    COOLDOWN_BASE = 45.0  # initial cooldown seconds
+    COOLDOWN_MAX  = 480.0 # cap at 8 minutes
+
+    def __init__(self):
+        self._lock     = asyncio.Lock()
+        # domain → deque of 1/0 (blocked/ok) for sliding window
+        self._history: dict[str, _collections.deque] = {}
+        # domain → state: "closed" | "open" | "half"
+        self._state:   dict[str, str]   = {}
+        # domain → time when OPEN expires
+        self._until:   dict[str, float] = {}
+        # domain → current cooldown duration (doubles on repeated failures)
+        self._cooldown: dict[str, float] = {}
+
+    def _domain(self, url: str) -> str:
+        try:
+            return urlparse(url).netloc.lower()
+        except Exception:
+            return url
+
+    async def check(self, url: str) -> float:
+        """
+        Returns 0.0 if the domain is CLOSED (proceed immediately).
+        Returns seconds-to-wait if OPEN.
+        Workers should await asyncio.sleep(result) before the request.
+        """
+        domain = self._domain(url)
+        async with self._lock:
+            state = self._state.get(domain, "closed")
+            if state == "closed":
+                return 0.0
+            if state == "open":
+                remaining = self._until.get(domain, 0) - time.time()
+                if remaining > 0:
+                    return remaining
+                # Transition to HALF — allow one probe through
+                self._state[domain] = "half"
+                return 0.0
+            # HALF — probe is in flight, other workers wait briefly
+            return 2.0
+
+    async def record(self, url: str, blocked: bool) -> None:
+        """Record the outcome of a request for the given URL's domain."""
+        domain = self._domain(url)
+        async with self._lock:
+            if domain not in self._history:
+                self._history[domain] = _collections.deque(maxlen=self.WINDOW)
+                self._state[domain]   = "closed"
+                self._cooldown[domain] = self.COOLDOWN_BASE
+
+            hist  = self._history[domain]
+            state = self._state.get(domain, "closed")
+
+            hist.append(1 if blocked else 0)
+
+            if state == "half":
+                if blocked:
+                    # Probe also blocked → extend cooldown and reopen
+                    cd = min(self._cooldown[domain] * 2, self.COOLDOWN_MAX)
+                    self._cooldown[domain] = cd
+                    self._state[domain]    = "open"
+                    self._until[domain]    = time.time() + cd
+                    log.debug(f"[CB] {domain}: probe blocked → OPEN for {cd:.0f}s")
+                else:
+                    # Probe succeeded → reset and close
+                    self._state[domain]    = "closed"
+                    self._cooldown[domain] = self.COOLDOWN_BASE
+                    hist.clear()
+                    log.debug(f"[CB] {domain}: probe OK → CLOSED")
+                return
+
+            if len(hist) >= self.WINDOW // 2:
+                rate = sum(hist) / len(hist)
+                if rate >= self.THRESHOLD and state == "closed":
+                    cd = self._cooldown[domain]
+                    self._state[domain] = "open"
+                    self._until[domain] = time.time() + cd
+                    log.warning(f"[CB] {domain}: block rate {rate:.0%} → OPEN for {cd:.0f}s")
+
+
+# Global singleton — shared across all XTREAM workers
+circuit_breaker = DomainCircuitBreaker()
+
+
+# ── 2. Gaussian Jitter Timing ─────────────────────────────────────────────────
+
+def humanize_delay(base: float, sigma_ratio: float = 0.30,
+                   distraction_prob: float = 0.04,
+                   distraction_extra: float = 3.0) -> float:
+    """
+    Return a human-like delay around `base` seconds.
+
+    - Core delay:  Gaussian(mean=base, sigma=base*sigma_ratio), clipped to
+                   [base*0.2, base*4.0]
+    - Distraction: With probability `distraction_prob`, add an extra pause of
+                   Uniform(distraction_extra, distraction_extra*3) — simulates
+                   a user glancing away, switching tabs, etc.
+
+    Example: humanize_delay(1.5) → typically 0.9–2.2 s, rarely up to 10 s
+    """
+    delay = random.gauss(base, base * sigma_ratio)
+    delay = max(base * 0.2, min(base * 4.0, delay))
+    if random.random() < distraction_prob:
+        delay += random.uniform(distraction_extra, distraction_extra * 3)
+    return delay
+
+
+async def async_humanize_sleep(base: float, **kw) -> None:
+    """async wrapper for humanize_delay — use in coroutines."""
+    await asyncio.sleep(humanize_delay(base, **kw))
+
+
+# ── 3. Per-session Referer Chain ──────────────────────────────────────────────
+
+_YAHOO_HOMES  = ["https://search.yahoo.com/", "https://yahoo.com/",
+                 "https://www.yahoo.com/"]
+_BING_HOMES   = ["https://www.bing.com/", "https://bing.com/"]
+_GOOGLE_HOMES = ["https://www.google.com/", "https://google.com/"]
+
+class RefererChain:
+    """
+    Maintains a plausible navigation history for a session so every outgoing
+    request carries a believable Referer that matches the chain:
+
+        Search engine homepage → SERP page → result page → (next SERP)
+
+    Usage:
+        chain = RefererChain("yahoo")
+        referer = chain.next_referer(serp_url)   # before each SERP request
+    """
+
+    def __init__(self, engine: str = "yahoo"):
+        self.engine  = engine
+        self._chain: list[str] = []
+        if engine == "bing":
+            self._chain.append(random.choice(_BING_HOMES))
+        elif engine == "google":
+            self._chain.append(random.choice(_GOOGLE_HOMES))
+        else:
+            self._chain.append(random.choice(_YAHOO_HOMES))
+
+    def push(self, url: str) -> None:
+        """Record a visited URL into the chain (keep last 5)."""
+        self._chain.append(url)
+        if len(self._chain) > 5:
+            self._chain.pop(0)
+
+    def current(self) -> str | None:
+        """Return the most recent URL as a Referer value."""
+        return self._chain[-1] if self._chain else None
+
+    def next_serp_referer(self, serp_url: str) -> str:
+        """
+        Return the referer to use for `serp_url`, then push serp_url
+        into the chain so the next call sees it as referer.
+        """
+        ref = self.current()
+        self.push(serp_url)
+        return ref or ""
+
+
+# ── 4. Search Parameter Variator ─────────────────────────────────────────────
+
+_YAHOO_FR_POOL = [
+    "fp-tts", "yfp-t-902", "yfp-t-501", "free", "p2", "sfp",
+    "uh3_finance_vert_gs", "uh3_finance_vert", "yfp-t-152",
+]
+_YAHOO_VD_POOL = ["b", ""]   # vertical
+_YAHOO_EI_POOL = ["UTF-8", "utf-8"]
+
+_BING_FORM_POOL = ["QBLH", "QBRE", "SBSC", "QBHL", "PERE", "ANAB01"]
+_BING_MSBQF_POOL = ["0", "1", ""]   # internal Bing flag
+_BING_COUNT_POOL  = [10, 10, 10, 15, 20]   # most use 10
+
+def vary_yahoo_params(base_params: dict) -> dict:
+    """
+    Add realistic variance to Yahoo search parameters so requests don't look
+    templated.  Modifies a copy; does not mutate the original.
+    """
+    p = dict(base_params)
+    p["fr"]  = random.choice(_YAHOO_FR_POOL)
+    p["ei"]  = random.choice(_YAHOO_EI_POOL)
+    if random.random() < 0.15:
+        p["vd"] = random.choice(_YAHOO_VD_POOL)
+    if random.random() < 0.10:
+        p["age"] = random.choice(["1d", "1w", "1m", ""])
+    if random.random() < 0.08:
+        p["toggle"] = "1"
+    return p
+
+
+def vary_bing_params(base_params: dict) -> dict:
+    """
+    Add realistic variance to Bing search parameters.
+    """
+    p = dict(base_params)
+    p["form"]  = random.choice(_BING_FORM_POOL)
+    p["count"] = random.choice(_BING_COUNT_POOL)
+    if random.random() < 0.12:
+        p["msbqf"] = random.choice(_BING_MSBQF_POOL)
+    if random.random() < 0.08:
+        p["qpvt"] = p.get("q", "")[:20]
+    if random.random() < 0.10:
+        p["sc"] = f"8-{random.randint(10, 40)}"
+    return p
+
+
+# ── 5. X-Forwarded-For Spoofer (optional header noise) ───────────────────────
+
+_COMMON_ISP_RANGES = [
+    # US ISPs / cloud egress ranges (publicly routable, not sensitive)
+    ("24.0.0.0",    "24.255.255.255"),   # Comcast
+    ("71.0.0.0",    "71.127.255.255"),   # AT&T
+    ("98.0.0.0",    "98.255.255.255"),   # Charter/Spectrum
+    ("173.0.0.0",   "173.79.255.255"),   # Comcast Business
+    ("67.40.0.0",   "67.63.255.255"),    # CenturyLink
+    ("50.0.0.0",    "50.127.255.255"),   # Various US cable
+    ("86.0.0.0",    "86.255.255.255"),   # BT / UK
+    ("82.0.0.0",    "82.127.255.255"),   # Deutsche Telekom
+    ("90.0.0.0",    "90.127.255.255"),   # France Telecom
+]
+
+def _random_public_ip() -> str:
+    r1, r2 = random.choice(_COMMON_ISP_RANGES)
+    parts1 = [int(x) for x in r1.split(".")]
+    parts2 = [int(x) for x in r2.split(".")]
+    ip = ".".join(str(random.randint(a, b)) for a, b in zip(parts1, parts2))
+    return ip
+
+def spoof_xff_headers(h: dict, probability: float = 0.35) -> dict:
+    """
+    With `probability`, inject X-Forwarded-For / X-Real-Ip headers with a
+    plausible residential IP to make the request look like it came from a NAT
+    gateway.  Returns the header dict (modified in-place).
+    """
+    if random.random() < probability:
+        ip = _random_public_ip()
+        h["X-Forwarded-For"] = ip
+        if random.random() < 0.5:
+            h["X-Real-Ip"] = ip
     return h
 
 
@@ -743,6 +1238,30 @@ def filter_urls(urls):
             "duplicates": total-rm_invalid-rm_blocked-rm_no_query-rm_too_long-len(kept)}
 
 
+_TRACKING_PARAM_RE = re.compile(
+    r"^(utm_\w+|fbclid|gclid|msclkid|yclid|mc_\w+|_ga|ref|source|medium|campaign|"
+    r"affiliate|clickid|cid|sid_?|zanpid|dclid|twclid|igshid|s_kwcid)$",
+    re.IGNORECASE,
+)
+
+
+def _normalize_url_for_dedup(url: str) -> str:
+    """Strip common tracking/noise params so near-duplicate URLs collapse."""
+    try:
+        p = urlparse(url)
+        if not p.query:
+            return url
+        from urllib.parse import urlencode
+        params = parse_qs(p.query, keep_blank_values=True)
+        cleaned = {k: v for k, v in params.items() if not _TRACKING_PARAM_RE.match(k)}
+        if cleaned == params:
+            return url
+        new_q = urlencode(cleaned, doseq=True)
+        return p._replace(query=new_q).geturl()
+    except Exception:
+        return url
+
+
 async def process_chunk_urls(chunk, semaphore, stop_ev):
     async with semaphore:
         if stop_ev.is_set(): return []
@@ -844,30 +1363,61 @@ def _make_fallback_session(exclude_proxy=None):
 # ─── XTREAM SESSION POOL ─────────────────────────────────────────────────────
 # Pre-warmed pool of sessions for 1000 RPS Yahoo bruteforce
 
+async def _preseed_session_cookies(sess, engine: str = "yahoo") -> None:
+    """
+    Visit a search engine homepage before querying.
+    This warms the cookie jar and makes the session look like a real browser
+    that browsed naturally rather than hitting the API cold.
+    """
+    try:
+        if engine == "bing":
+            url = random.choice(BING_HOMEPAGES)
+        else:
+            url = random.choice(YAHOO_HOMEPAGES)
+        profile = getattr(sess, "_tls_profile", None) or get_tls_profile("weighted")
+        headers = build_headers_from_profile(profile)
+        await sess.get(url, headers=headers, timeout=10)
+        await asyncio.sleep(random.uniform(0.15, 0.4))
+    except Exception:
+        pass
+
+
 class XtreamSessionPool:
     """
     Maintains a rotating pool of pre-built sessions for maximum throughput.
     Each session keeps cookies & a stable TLS profile to look human.
     Sessions are rotated based on usage count + age.
+    Pool is initialized in parallel batches for fast startup.
     """
-    def __init__(self, size=XTREAM_SESSION_POOL_SIZE):
-        self.size = size
+    def __init__(self, size=XTREAM_SESSION_POOL_SIZE, engine: str = "yahoo"):
+        self.size   = size
+        self.engine = engine  # which engine to pre-seed cookies for
         self.sessions: deque = deque()
         self._usage: dict = {}    # session_id -> count
         self._age:   dict = {}    # session_id -> ts
-        self._lock  = asyncio.Lock()
+        self._lock   = asyncio.Lock()
         self._closed = False
 
-    async def initialize(self, use_tor=False):
-        log.info(f"[XTREAM] Building session pool of {self.size}...")
-        for _ in range(self.size):
-            # For xtream we use weighted Chrome-heavy profiles
-            profile = get_tls_profile("weighted")
-            sess = _make_isolated_session(use_tor=use_tor, profile=profile)
+    async def _make_one(self, use_tor: bool) -> None:
+        profile = get_tls_profile("weighted")
+        sess = _make_isolated_session(use_tor=use_tor, profile=profile)
+        if XTREAM_PRESEED_COOKIES:
+            seed_engine = "bing" if self.engine == "bing" else "yahoo"
+            await _preseed_session_cookies(sess, engine=seed_engine)
+        async with self._lock:
             sid = id(sess)
             self.sessions.append(sess)
             self._usage[sid] = 0
             self._age[sid]   = time.time()
+
+    async def initialize(self, use_tor=False):
+        log.info(f"[XTREAM] Building session pool of {self.size} (batch={XTREAM_POOL_BATCH_SIZE})...")
+        tasks_left = self.size
+        while tasks_left > 0:
+            batch = min(XTREAM_POOL_BATCH_SIZE, tasks_left)
+            await asyncio.gather(*[self._make_one(use_tor) for _ in range(batch)],
+                                  return_exceptions=True)
+            tasks_left -= batch
         log.info(f"[XTREAM] Pool ready: {len(self.sessions)} sessions")
 
     async def acquire(self):
@@ -884,21 +1434,21 @@ class XtreamSessionPool:
 
     async def release(self, sess, burned=False):
         """Return session to pool. If burned (got blocked), replace it."""
-        if self._closed: 
+        if self._closed:
             try: await sess.close()
             except Exception: pass
             return
         async with self._lock:
             sid = id(sess)
             self._usage[sid] = self._usage.get(sid, 0) + 1
-            # Rotate session if used too many times or too old or burned
-            if burned or self._usage[sid] > 50 or (time.time() - self._age.get(sid, 0)) > 300:
+            too_old   = (time.time() - self._age.get(sid, 0)) > XTREAM_SESSION_MAX_AGE
+            too_used  = self._usage[sid] > XTREAM_SESSION_MAX_USES
+            if burned or too_old or too_used:
                 try: await sess.close()
                 except Exception: pass
                 self._usage.pop(sid, None); self._age.pop(sid, None)
-                # Spawn replacement
-                profile = get_tls_profile("weighted")
-                new_sess = _make_isolated_session(profile=profile)
+                profile   = get_tls_profile("weighted")
+                new_sess  = _make_isolated_session(profile=profile)
                 self._usage[id(new_sess)] = 0
                 self._age[id(new_sess)]   = time.time()
                 self.sessions.append(new_sess)
@@ -951,7 +1501,16 @@ def stop_tor_rotation():
 # ─── CAPTCHA / DEGRADED DETECTION ────────────────────────────────────────────
 _CAPTCHA_RE = re.compile(
     r"captcha|are you a robot|unusual traffic|access denied|verify you are human|"
-    r"please verify|too many requests|blocked|forbidden|rate limit|temporarily unavailable",
+    r"please verify|too many requests|blocked|forbidden|rate limit|temporarily unavailable|"
+    r"cf-error|error 429|request denied|robot check|human verification|"
+    r"your ip|ip address|automated|bot detection|security check|"
+    r"503 service|502 bad gateway|pardon our interruption",
+    re.IGNORECASE,
+)
+
+_YAHOO_RESULT_SIGNALS = re.compile(
+    r'id="results"|searchCenterMiddle|class="algo|class="Sr|data-b="algo|'
+    r'"algo-sr"|"dd algo"|uh3_id|"compTitle"',
     re.IGNORECASE,
 )
 
@@ -960,7 +1519,7 @@ def _is_degraded(html, engine):
     if len(html) < 400: return True
     if _CAPTCHA_RE.search(html[:4096]): return True
     if engine == "bing" and 'id="b_results"' not in html and "b_algo" not in html: return True
-    if engine == "yahoo" and 'id="results"' not in html and "searchCenterMiddle" not in html: return True
+    if engine == "yahoo" and not _YAHOO_RESULT_SIGNALS.search(html): return True
     if engine == "duckduckgo" and "result__a" not in html and "results--main" not in html: return True
     return False
 
@@ -1051,10 +1610,17 @@ async def _generic_engine_fetch(session, method, url, *, params=None, data=None,
     fallback_session = None
     try:
         for attempt in range(max_retries):
+            # ── Circuit breaker: pause if the domain is currently OPEN ──────
+            wait_secs = await circuit_breaker.check(url)
+            if wait_secs > 0:
+                await asyncio.sleep(min(wait_secs, 30.0))
+
             # Build headers from the session's TLS profile for consistency
             profile = getattr(active_session, "_tls_profile", None) or get_tls_profile()
             origin = referer.rstrip("/") if data is not None else None
             headers = build_headers_from_profile(profile, referer=referer, origin=origin)
+            # Optional XFF header noise (~35% of requests)
+            spoof_xff_headers(headers, probability=0.35)
             if data is not None:
                 headers["Content-Type"] = "application/x-www-form-urlencoded"
             try:
@@ -1065,25 +1631,36 @@ async def _generic_engine_fetch(session, method, url, *, params=None, data=None,
                     resp = await active_session.post(url, data=data, headers=headers, timeout=20)
                 status = resp.status_code; html = resp.text
                 if status == 429:
-                    await asyncio.sleep((2 ** attempt) * random.uniform(2.0, 4.0))
+                    await circuit_breaker.record(url, blocked=True)
+                    backoff = humanize_delay((2 ** attempt) * 3.0)
+                    await asyncio.sleep(backoff)
+                    continue
+                if status in (403, 503):
+                    await circuit_breaker.record(url, blocked=True)
+                    await asyncio.sleep(humanize_delay((2 ** attempt) * 1.5))
                     continue
                 if status != 200:
+                    await circuit_breaker.record(url, blocked=False)
                     return [], False
                 if _is_captcha(html):
+                    await circuit_breaker.record(url, blocked=True)
                     await _on_captcha_detected(engine, chunk_id, getattr(active_session, "_cur_proxy", None))
                     continue
                 if _is_degraded(html, engine):
+                    await circuit_breaker.record(url, blocked=True)
                     if attempt < max_retries - 1:
-                        await asyncio.sleep((2 ** attempt) * random.uniform(1.0, 2.5))
+                        await asyncio.sleep(humanize_delay((2 ** attempt) * 1.5))
                         continue
                     return [], True
                 raw = link_extractor(html)
                 urls = [u for u in raw if u.startswith("http")
                         and not noise_filter(u) and not _STATIC_EXT.search(u)]
                 urls = list(dict.fromkeys(urls))[:max_res]
+                await circuit_breaker.record(url, blocked=False)
                 return urls, False
             except asyncio.TimeoutError:
-                await asyncio.sleep((2 ** attempt) * random.uniform(1.0, 2.0))
+                await circuit_breaker.record(url, blocked=True)
+                await asyncio.sleep(humanize_delay((2 ** attempt) * 1.2))
             except CurlError as exc:
                 if (_is_proxy_error(exc) and PROXY_ENABLED and len(_proxy_pool) > 1
                         and attempt < max_retries - 1):
@@ -1091,9 +1668,9 @@ async def _generic_engine_fetch(session, method, url, *, params=None, data=None,
                     if fallback_session is not None: await fallback_session.close()
                     fallback_session = _make_fallback_session(exclude_proxy=cur_proxy)
                     active_session = fallback_session
-                    await asyncio.sleep(random.uniform(0.5, 1.2))
+                    await asyncio.sleep(humanize_delay(0.8))
                     continue
-                await asyncio.sleep((2 ** attempt) * random.uniform(1.0, 2.0))
+                await asyncio.sleep(humanize_delay((2 ** attempt) * 1.2))
             except Exception as exc:
                 log.error(f"[C{chunk_id}][{engine.upper()}] err: {exc}")
                 return [], False
@@ -1104,10 +1681,11 @@ async def _generic_engine_fetch(session, method, url, *, params=None, data=None,
 
 
 async def fetch_page_bing(session, dork, page, max_res, chunk_id=0):
+    base_params = {"q": translate_dork(dork, "bing"), "count": min(max_res, 10),
+                   "first": (page-1)*10+1, "setlang": "en"}
     return await _generic_engine_fetch(
         session, "GET", "https://www.bing.com/search",
-        params={"q": translate_dork(dork, "bing"), "count": min(max_res, 10),
-                "first": (page-1)*10+1, "setlang": "en"},
+        params=vary_bing_params(base_params),
         engine="bing", page=page, max_res=max_res, chunk_id=chunk_id,
         referer="https://www.bing.com/",
         link_extractor=_extract_links,
@@ -1116,10 +1694,11 @@ async def fetch_page_bing(session, dork, page, max_res, chunk_id=0):
 
 
 async def fetch_page_yahoo(session, dork, page, max_res, chunk_id=0):
+    base_params = {"p": translate_dork(dork, "yahoo"), "b": (page-1)*10+1,
+                   "pz": min(max_res, 10), "vl": "lang_en"}
     return await _generic_engine_fetch(
         session, "GET", "https://search.yahoo.com/search",
-        params={"p": translate_dork(dork, "yahoo"), "b": (page-1)*10+1,
-                "pz": min(max_res, 10), "vl": "lang_en"},
+        params=vary_yahoo_params(base_params),
         engine="yahoo", page=page, max_res=max_res, chunk_id=chunk_id,
         referer="https://search.yahoo.com/",
         link_extractor=_yahoo_link_extractor,
@@ -1146,7 +1725,8 @@ async def fetch_all_pages(session, dork, engine, pages, max_res, chunk_id=0):
 
     async def _fetch_with_stagger(page, idx):
         if idx > 0:
-            await asyncio.sleep(random.uniform(0.02, 0.1) * idx)
+            # Gaussian jitter instead of uniform — more human-like inter-page timing
+            await asyncio.sleep(humanize_delay(0.05 * idx, sigma_ratio=0.4))
         return await fetch_fn(session, dork, page, max_res, chunk_id)
 
     tasks = [_fetch_with_stagger(p, i) for i, p in enumerate(sorted_pages)]
@@ -1186,6 +1766,11 @@ YAHOO_ENDPOINTS = [
     "https://fr.search.yahoo.com/search",
     "https://es.search.yahoo.com/search",
     "https://br.search.yahoo.com/search",
+    "https://it.search.yahoo.com/search",
+    "https://nl.search.yahoo.com/search",
+    "https://mx.search.yahoo.com/search",
+    "https://nz.search.yahoo.com/search",
+    "https://za.search.yahoo.com/search",
 ]
 
 YAHOO_REFERERS = [
@@ -1194,7 +1779,39 @@ YAHOO_REFERERS = [
     "https://uk.search.yahoo.com/",
     "https://ca.search.yahoo.com/",
     "https://au.search.yahoo.com/",
+    "https://in.search.yahoo.com/",
+    "https://sg.search.yahoo.com/",
+    "https://de.search.yahoo.com/",
+    "https://fr.search.yahoo.com/",
 ]
+
+YAHOO_HOMEPAGES = [
+    "https://www.yahoo.com/",
+    "https://search.yahoo.com/",
+    "https://uk.yahoo.com/",
+    "https://au.yahoo.com/",
+    "https://ca.yahoo.com/",
+]
+
+# Bing regional endpoints for XTREAM multi-engine mode
+BING_XTREAM_ENDPOINTS = [
+    "https://www.bing.com/search",
+    "https://cn.bing.com/search",
+    "https://global.bing.com/search",
+]
+
+BING_XTREAM_REFERERS = [
+    "https://www.bing.com/",
+    "https://www.bing.com/search",
+    "https://cn.bing.com/",
+]
+
+BING_HOMEPAGES = [
+    "https://www.bing.com/",
+    "https://cn.bing.com/",
+]
+
+BING_XTREAM_MARKETS = ["en-US", "en-GB", "en-CA", "en-AU", "en-IN", "en-SG", "en-NZ"]
 
 
 async def xtream_fetch_yahoo(pool: XtreamSessionPool, dork: str, page: int,
@@ -1248,35 +1865,107 @@ async def xtream_fetch_yahoo(pool: XtreamSessionPool, dork: str, page: int,
         await pool.release(sess, burned=burned)
 
 
+async def xtream_fetch_bing(pool: XtreamSessionPool, dork: str, page: int,
+                             max_res: int, worker_id: int) -> tuple[list, bool, bool]:
+    """
+    Single Bing fetch in xtream mode.
+    Returns (urls, was_burned, was_captcha).
+    """
+    sess = await pool.acquire()
+    burned = False; captcha = False
+    try:
+        endpoint = random.choice(BING_XTREAM_ENDPOINTS)
+        referer  = random.choice(BING_XTREAM_REFERERS)
+        profile  = getattr(sess, "_tls_profile", None) or get_tls_profile("weighted")
+        headers  = build_headers_from_profile(profile, referer=referer)
+        params   = {
+            "q":       translate_dork(dork, "bing"),
+            "count":   min(max_res, 10),
+            "first":   (page - 1) * 10 + 1,
+            "setlang": "en",
+            "mkt":     random.choice(BING_XTREAM_MARKETS),
+            "form":    random.choice(["QBLH", "QBRE", "SBSD", "NMSP"]),
+        }
+        for attempt in range(XTREAM_MAX_RETRIES + 1):
+            try:
+                resp = await sess.get(endpoint, params=params, headers=headers,
+                                      timeout=XTREAM_TIMEOUT)
+                html = resp.text
+                if resp.status_code == 429:
+                    burned = True
+                    return [], True, False
+                if resp.status_code not in (200,):
+                    if attempt < XTREAM_MAX_RETRIES: continue
+                    return [], False, False
+                if _is_captcha(html):
+                    captcha = True; burned = True
+                    return [], True, True
+                if _is_degraded(html, "bing"):
+                    if attempt < XTREAM_MAX_RETRIES: continue
+                    return [], False, False
+                urls = _extract_links(html)
+                urls = [u for u in urls if u.startswith("http")
+                        and not _BING_NOISE.search(u) and not _STATIC_EXT.search(u)]
+                return list(dict.fromkeys(urls))[:max_res], False, False
+            except (asyncio.TimeoutError, CurlError):
+                if attempt < XTREAM_MAX_RETRIES: continue
+                return [], False, False
+            except Exception as exc:
+                log.debug(f"[XTREAM:BING:W{worker_id}] {exc}")
+                return [], False, False
+        return [], False, False
+    finally:
+        await pool.release(sess, burned=burned)
+
+
 async def xtream_worker(wid: int, queue: asyncio.Queue, results_q: asyncio.Queue,
                           pool: XtreamSessionPool, max_res: int, pages_per_dork: int,
                           min_score: int, stop_ev: asyncio.Event,
                           rate_limiter: asyncio.Semaphore,
-                          burn_event: asyncio.Event):
-    """High-speed Yahoo worker. Throttled by global rate_limiter."""
+                          xtream_engine: str,
+                          captcha_counter: list):
+    """
+    High-speed XTREAM worker supporting Yahoo, Bing, or both engines.
+    Uses per-worker adaptive cooldown instead of a shared burn event (no race conditions).
+    """
     consecutive_fails = 0
+    cooldown_until    = 0.0
+    engine_toggle     = wid % 2  # for "both" mode: even workers → yahoo, odd → bing
+
     while not stop_ev.is_set():
         try:
             dork = await asyncio.wait_for(queue.get(), timeout=1.0)
         except asyncio.TimeoutError:
             continue
 
+        # Per-worker cooldown after burns
+        now = time.time()
+        if cooldown_until > now:
+            await asyncio.sleep(cooldown_until - now)
+
+        # Pick engine for this dork
+        if xtream_engine == "both":
+            use_engine = "yahoo" if engine_toggle % 2 == 0 else "bing"
+            engine_toggle += 1
+        else:
+            use_engine = xtream_engine
+
+        fetch_fn = xtream_fetch_yahoo if use_engine == "yahoo" else xtream_fetch_bing
+        tag      = f"{use_engine}-xtream"
+
         # Crawl multiple pages per dork in parallel (limited by rate_limiter)
         page_tasks = []
         for page in range(1, pages_per_dork + 1):
-            async def _do(p=page):
+            async def _do(p=page, fn=fetch_fn):
                 async with rate_limiter:
-                    if burn_event.is_set():
-                        await asyncio.sleep(random.uniform(0.5, 1.5))
-                        burn_event.clear()
-                    return await xtream_fetch_yahoo(pool, dork, p, max_res, wid)
+                    return await fn(pool, dork, p, max_res, wid)
             page_tasks.append(asyncio.create_task(_do()))
 
         all_urls = []; any_burned = False; any_captcha = False
         try:
             page_results = await asyncio.wait_for(
                 asyncio.gather(*page_tasks, return_exceptions=True),
-                timeout=XTREAM_TIMEOUT * 2,
+                timeout=XTREAM_TIMEOUT * 3,
             )
             for r in page_results:
                 if isinstance(r, tuple):
@@ -1289,50 +1978,55 @@ async def xtream_worker(wid: int, queue: asyncio.Queue, results_q: asyncio.Queue
 
         scored = filter_scored(all_urls, min_score)
         try:
-            results_q.put_nowait((dork, "yahoo-xtream", scored, len(all_urls), any_captcha))
+            results_q.put_nowait((dork, tag, scored, len(all_urls), any_captcha))
         except asyncio.QueueFull:
-            await results_q.put((dork, "yahoo-xtream", scored, len(all_urls), any_captcha))
+            await results_q.put((dork, tag, scored, len(all_urls), any_captcha))
 
         queue.task_done()
 
+        if any_captcha:
+            captcha_counter[0] += 1
+
         if any_burned:
-            burn_event.set()
             consecutive_fails += 1
-            # Exponential backoff for this worker only
-            await asyncio.sleep(min(consecutive_fails * 1.5, 10.0))
+            # Exponential backoff per worker — no shared event, no race
+            backoff = min(consecutive_fails * 1.5, 15.0)
+            cooldown_until = time.time() + backoff
+            await asyncio.sleep(random.uniform(backoff * 0.5, backoff))
         elif all_urls:
             consecutive_fails = 0
             await asyncio.sleep(random.uniform(XTREAM_MIN_DELAY, XTREAM_MAX_DELAY))
         else:
             consecutive_fails += 1
-            await asyncio.sleep(random.uniform(0.1, 0.3))
+            await asyncio.sleep(random.uniform(0.05, 0.2))
 
 
 async def run_xtream_job(chat_id: int, dorks: list, context):
     """
-    XTREAM MODE: Yahoo-only, 1000 RPS bruteforce URL collection.
+    XTREAM MODE v21: Multi-engine (Yahoo/Bing/Both), adaptive throttle, domain stats.
     """
-    sess = get_session(chat_id)
-    use_tor   = sess.get("tor", False)
-    min_score = sess.get("min_score", 30)
-    max_res   = sess.get("max_results", 10)
+    from collections import Counter
+    sess_cfg      = get_session(chat_id)
+    use_tor       = sess_cfg.get("tor", False)
+    min_score     = sess_cfg.get("min_score", 30)
+    max_res       = sess_cfg.get("max_results", 10)
+    xtream_engine = sess_cfg.get("xtream_engine", "yahoo")
 
-    cleaned = dedupe_dorks(dorks)
+    cleaned     = dedupe_dorks(dorks)
     valid_dorks = [d for d in cleaned if validate_dork(d)[0]]
     total_dorks = len(valid_dorks)
     if total_dorks == 0:
         await context.bot.send_message(chat_id, "⚠️ No valid dorks.")
         active_jobs.pop(chat_id, None); return
 
-    start_time = time.time()
-    n_chunks   = XTREAM_CHUNKS
-    workers_n  = XTREAM_WORKERS_PER_CHUNK
-    total_workers = n_chunks * workers_n     # 8 × 50 = 400
+    start_time    = time.time()
+    n_chunks      = XTREAM_CHUNKS
+    workers_n     = XTREAM_WORKERS_PER_CHUNK
+    total_workers = n_chunks * workers_n
 
-    # Global rate limiter — enforces ≤ XTREAM_TARGET_RPS
-    # Tokens released at controlled rate
-    rate_limiter = asyncio.Semaphore(total_workers)  # base concurrency cap
-    burn_event   = asyncio.Event()
+    # Adaptive concurrency semaphore — starts full, shrinks on high captcha rate
+    rate_limiter    = asyncio.Semaphore(total_workers)
+    captcha_counter = [0]   # shared mutable counter (list avoids closure rebind)
 
     alive_proxies = sum(1 for p in _proxy_pool if p["alive"])
     proxy_info = (
@@ -1340,12 +2034,14 @@ async def run_xtream_job(chat_id: int, dorks: list, context):
         f"🔄 {alive_proxies}/{len(_proxy_pool)} alive proxies" if PROXY_ENABLED and alive_proxies else
         "🔓 Direct"
     )
+    engine_display = {"yahoo": "YAHOO (15 mirrors)", "bing": "BING (3 mirrors)",
+                      "both": "YAHOO + BING"}.get(xtream_engine, xtream_engine.upper())
 
     status_msg = await context.bot.send_message(
         chat_id,
         f"⚡⚡⚡ XTREAM MODE ENGAGED ⚡⚡⚡\n{'━'*30}\n"
         f"📋 Dorks      : {total_dorks}\n"
-        f"🎯 Engine     : YAHOO (10 mirrors)\n"
+        f"🎯 Engine     : {engine_display}\n"
         f"🚀 Target RPS : {XTREAM_TARGET_RPS}/sec\n"
         f"📄 Pages/dork : {XTREAM_PAGES_PER_DORK}\n"
         f"⚙️ Workers    : {total_workers} ({n_chunks}×{workers_n})\n"
@@ -1354,8 +2050,7 @@ async def run_xtream_job(chat_id: int, dorks: list, context):
         f"🌐 Network    : {proxy_info}\n{'━'*30}\n⏳ Warming sessions...",
     )
 
-    # Build session pool
-    pool = XtreamSessionPool(size=XTREAM_SESSION_POOL_SIZE)
+    pool = XtreamSessionPool(size=XTREAM_SESSION_POOL_SIZE, engine=xtream_engine)
     await pool.initialize(use_tor=use_tor)
 
     queue     = asyncio.Queue(maxsize=total_dorks + 10)
@@ -1366,26 +2061,30 @@ async def run_xtream_job(chat_id: int, dorks: list, context):
     for d in valid_dorks:
         await queue.put(d)
 
-    # Spawn workers
     worker_tasks = [
         asyncio.create_task(xtream_worker(
             i, queue, results_q, pool, max_res, XTREAM_PAGES_PER_DORK,
-            min_score, stop_ev, rate_limiter, burn_event,
+            min_score, stop_ev, rate_limiter, xtream_engine, captcha_counter,
         ))
         for i in range(total_workers)
     ]
 
     processed = 0; total_raw = 0; total_captcha = 0
-    seen_urls = set(); all_scored = []
-    last_edit = 0.0
+    seen_norm: set  = set()   # normalized URL set for smarter dedup
+    seen_urls: set  = set()   # original URL set
+    all_scored: list = []
+    last_edit  = 0.0
+    peak_rps   = 0.0
     last_rps_t = time.time(); rps_count = 0; current_rps = 0.0
 
+    # Temp file opened for incremental writes
     tmp_file = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False,
                                             prefix=f"xtream_{chat_id}_", suffix=".txt")
     tmp_path = tmp_file.name
-    tmp_file.write(f"# XTREAM Mode — Yahoo Bruteforce\n# {datetime.now()}\n")
+    tmp_file.write(f"# XTREAM Mode v21 — {engine_display}\n# {datetime.now()}\n")
     tmp_file.write(f"# Dorks: {total_dorks} | Pages: {XTREAM_PAGES_PER_DORK} | Workers: {total_workers}\n\n")
     tmp_file.close()
+    incremental_f = open(tmp_path, "a", encoding="utf-8")
 
     async def _job_timeout():
         await asyncio.sleep(JOB_TIMEOUT)
@@ -1401,24 +2100,36 @@ async def run_xtream_job(chat_id: int, dorks: list, context):
                 if all(t.done() for t in worker_tasks): break
                 continue
 
-            processed += 1; total_raw += raw_cnt; rps_count += raw_cnt
+            processed  += 1; total_raw += raw_cnt; rps_count += raw_cnt
             if was_captcha: total_captcha += 1
 
             for sc, url in scored:
-                if url not in seen_urls:
-                    seen_urls.add(url); all_scored.append((sc, url))
+                norm = _normalize_url_for_dedup(url)
+                if norm not in seen_norm:
+                    seen_norm.add(norm); seen_urls.add(url)
+                    all_scored.append((sc, url))
+                    try: incremental_f.write(f"{url}\n")
+                    except Exception: pass
 
-            # Calculate live RPS
+            # Adaptive throttle: if captcha rate spikes, tighten the semaphore
+            if processed > 0 and processed % 20 == 0:
+                captcha_rate = captcha_counter[0] / max(processed, 1)
+                if captcha_rate > XTREAM_CAPTCHA_RATE_LIMIT:
+                    log.warning(f"[XTREAM] High captcha rate {captcha_rate:.0%} — easing pressure")
+                    await asyncio.sleep(random.uniform(1.0, 2.5))
+
             now = time.time()
             if now - last_rps_t >= 2.0:
                 current_rps = rps_count / (now - last_rps_t)
+                if current_rps > peak_rps: peak_rps = current_rps
                 rps_count = 0; last_rps_t = now
 
             if time.time() - last_edit > 3.5:
-                pct = int(processed / total_dorks * 100)
-                bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+                pct     = int(processed / total_dorks * 100)
+                bar     = "█" * (pct // 10) + "░" * (10 - pct // 10)
                 elapsed = int(time.time() - start_time)
-                eta = int((elapsed / processed) * (total_dorks - processed)) if processed else 0
+                eta     = int((elapsed / processed) * (total_dorks - processed)) if processed else 0
+                captcha_rate = captcha_counter[0] / max(processed, 1)
                 try:
                     await context.bot.edit_message_text(
                         chat_id=chat_id, message_id=status_msg.message_id,
@@ -1426,9 +2137,9 @@ async def run_xtream_job(chat_id: int, dorks: list, context):
                               f"[{bar}] {pct}%\n"
                               f"✅ Dorks    : {processed}/{total_dorks}\n"
                               f"🔍 Raw URLs : {total_raw}\n"
-                              f"🎯 SQL      : {len(all_scored)}\n"
-                              f"📊 LIVE RPS : {current_rps:.0f}/sec\n"
-                              f"🛡 Captchas : {total_captcha}\n"
+                              f"🎯 Targets  : {len(all_scored)}\n"
+                              f"📊 RPS      : {current_rps:.0f} (peak {peak_rps:.0f})\n"
+                              f"🛡 Captchas : {total_captcha} ({captcha_rate:.0%})\n"
                               f"⏱ {elapsed}s | ETA {eta}s\n{'━'*30}"),
                     )
                     last_edit = time.time()
@@ -1444,6 +2155,8 @@ async def run_xtream_job(chat_id: int, dorks: list, context):
         await asyncio.gather(*worker_tasks, return_exceptions=True)
         raise
     finally:
+        try: incremental_f.close()
+        except Exception: pass
         timeout_task.cancel()
         try: await timeout_task
         except Exception: pass
@@ -1455,43 +2168,60 @@ async def run_xtream_job(chat_id: int, dorks: list, context):
     elapsed = int(time.time() - start_time)
     avg_rps = total_raw / max(elapsed, 1)
 
-    with open(tmp_path, "a", encoding="utf-8") as f:
-        high = [(s,u) for s,u in all_scored if s >= 70]
-        med  = [(s,u) for s,u in all_scored if 40 <= s < 70]
-        low  = [(s,u) for s,u in all_scored if s < 40]
+    # Build categorised + domain-stats output file
+    high = [(s, u) for s, u in all_scored if s >= 70]
+    med  = [(s, u) for s, u in all_scored if 40 <= s < 70]
+    low  = [(s, u) for s, u in all_scored if s < 40]
+    domain_counts = Counter(extract_domain(u) for _, u in all_scored)
+    top_domains   = domain_counts.most_common(10)
+
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(f"# XTREAM Mode v21 — {engine_display}\n# {datetime.now()}\n")
+        f.write(f"# Dorks: {total_dorks} | Raw: {total_raw} | Targets: {len(all_scored)}\n")
+        f.write(f"# Avg RPS: {avg_rps:.0f} | Peak RPS: {peak_rps:.0f} | Time: {elapsed}s\n")
+        f.write(f"# Captchas: {total_captcha} | Min-score: {min_score}\n\n")
+        if top_domains:
+            f.write("# ── TOP DOMAINS ────────────────────────\n")
+            for dom, cnt in top_domains:
+                f.write(f"# {cnt:>4}  {dom}\n")
+            f.write("\n")
         if high:
-            f.write(f"# HIGH VALUE — {len(high)}\n")
+            f.write(f"# ── HIGH VALUE (≥70) — {len(high)} ──────────────\n")
             for _, u in high: f.write(f"{u}\n")
         if med:
-            f.write(f"\n# MEDIUM — {len(med)}\n")
+            f.write(f"\n# ── MEDIUM (40-69) — {len(med)} ──────────────\n")
             for _, u in med: f.write(f"{u}\n")
         if low and min_score < 40:
-            f.write(f"\n# LOW — {len(low)}\n")
+            f.write(f"\n# ── LOW (<40) — {len(low)} ──────────────\n")
             for _, u in low: f.write(f"{u}\n")
 
+    dom_summary = "\n".join(f"  {cnt}× {d}" for d, cnt in top_domains[:5]) if top_domains else "  (none)"
     try:
         await context.bot.edit_message_text(
             chat_id=chat_id, message_id=status_msg.message_id,
             text=(f"🏁 XTREAM COMPLETE!\n{'━'*30}\n"
                   f"📋 Dorks       : {total_dorks}\n"
                   f"🔍 Raw URLs    : {total_raw}\n"
-                  f"🎯 SQL targets : {len(all_scored)}\n"
-                  f"📊 Avg RPS     : {avg_rps:.0f}/sec\n"
+                  f"🎯 Targets     : {len(all_scored)}\n"
+                  f"📊 Avg RPS     : {avg_rps:.0f} | Peak: {peak_rps:.0f}\n"
                   f"🛡 Captchas    : {total_captcha}\n"
-                  f"⏱ Total time  : {elapsed}s\n{'━'*30}"),
+                  f"⏱ Total time  : {elapsed}s\n"
+                  f"{'━'*30}\n"
+                  f"🏆 Top domains:\n{dom_summary}"),
         )
     except Exception: pass
 
     if all_scored:
         with open(tmp_path, "rb") as f:
             await context.bot.send_document(
-                chat_id, f, filename=f"xtream_{total_dorks}d_{len(all_scored)}u.txt",
-                caption=f"⚡ XTREAM RESULTS\n"
-                        f"🎯 {len(all_scored)} URLs | 📊 {avg_rps:.0f} RPS avg\n"
-                        f"⏱ {elapsed}s for {total_dorks} dorks",
+                chat_id, f,
+                filename=f"xtream_{total_dorks}d_{len(all_scored)}u.txt",
+                caption=(f"⚡ XTREAM v21 RESULTS\n"
+                         f"🎯 {len(all_scored)} URLs | 📊 {avg_rps:.0f} avg / {peak_rps:.0f} peak RPS\n"
+                         f"⏱ {elapsed}s | 🛡 {total_captcha} captchas"),
             )
     else:
-        await context.bot.send_message(chat_id, "⚠️ No URLs matched filter.")
+        await context.bot.send_message(chat_id, "⚠️ No URLs matched filter. Try lowering /filter or adding proxies.")
 
     try: os.unlink(tmp_path)
     except OSError: pass
@@ -1908,32 +2638,53 @@ async def cmd_dork(update, context):
 
 
 async def cmd_xtream(update, context):
-    """Toggle XTREAM mode (1000 RPS Yahoo bruteforce)."""
+    """Toggle XTREAM mode or set engine: /xtream [on|off|engine yahoo|bing|both]"""
     chat_id = update.effective_chat.id
     sess = get_session(chat_id)
+
     if context.args:
-        arg = context.args[0].lower()
-        if arg in ("on", "true", "1", "enable"):
+        arg0 = context.args[0].lower()
+        # Engine selection: /xtream engine yahoo|bing|both
+        if arg0 == "engine" and len(context.args) >= 2:
+            engine = context.args[1].lower()
+            if engine not in ("yahoo", "bing", "both"):
+                await update.message.reply_text(
+                    "⚠️ Invalid engine. Use: /xtream engine yahoo|bing|both"
+                ); return
+            sess["xtream_engine"] = engine
+            labels = {"yahoo": "YAHOO (15 mirrors)", "bing": "BING (3 mirrors)",
+                      "both": "YAHOO + BING (dual engine)"}
+            await update.message.reply_text(
+                f"🎯 XTREAM engine set to: {labels[engine]}\n"
+                f"💡 Enable with /xtream on"
+            ); return
+        elif arg0 in ("on", "true", "1", "enable"):
             sess["xtream"] = True
-        elif arg in ("off", "false", "0", "disable"):
+        elif arg0 in ("off", "false", "0", "disable"):
             sess["xtream"] = False
         else:
             sess["xtream"] = not sess.get("xtream", False)
     else:
         sess["xtream"] = not sess.get("xtream", False)
 
+    engine     = sess.get("xtream_engine", "yahoo")
+    eng_labels = {"yahoo": "YAHOO (15 mirrors)", "bing": "BING (3 mirrors)",
+                  "both": "YAHOO + BING"}
+
     if sess["xtream"]:
         await update.message.reply_text(
             f"⚡⚡⚡ XTREAM MODE ENABLED ⚡⚡⚡\n{'━'*30}\n"
-            f"🎯 Engine     : YAHOO ONLY (10 mirrors)\n"
-            f"🚀 Target RPS : 1000/sec\n"
+            f"🎯 Engine     : {eng_labels.get(engine, engine.upper())}\n"
+            f"🚀 Target RPS : {XTREAM_TARGET_RPS}/sec\n"
             f"⚙️ Workers    : {XTREAM_WORKERS_PER_CHUNK*XTREAM_CHUNKS} total\n"
             f"📄 Pages/dork : {XTREAM_PAGES_PER_DORK}\n"
             f"🔄 Sessions   : {XTREAM_SESSION_POOL_SIZE} pre-warmed pool\n"
             f"🛡 TLS profiles: {len(TLS_PROFILES)} rotating per-request\n"
-            f"💀 Anti-block : auto session burn + cooldown\n"
+            f"💀 Anti-block : per-worker adaptive cooldown (no race)\n"
+            f"🍪 Cookie seed: {'enabled' if XTREAM_PRESEED_COOKIES else 'disabled'}\n"
             f"{'━'*30}\n"
-            f"⚠️ Recommended: load proxies first (/proxylist)\n"
+            f"🔧 Change engine: /xtream engine yahoo|bing|both\n"
+            f"⚠️ Tip: load proxies first for best results (/proxylist)\n"
             f"💡 Use /dork <q> or upload a .txt to run in XTREAM mode\n"
             f"💡 /xtream off to disable"
         )
@@ -2714,10 +3465,13 @@ def main():
     app.post_init = _on_startup
 
     log.info("=" * 60)
-    log.info("  DORK PARSER v20.0 — XTREAM EDITION")
-    log.info(f"  TLS profiles : {len(TLS_PROFILES)} rotating")
+    log.info("  DORK PARSER v21.0 — XTREAM EDITION")
+    log.info(f"  TLS profiles : {len(TLS_PROFILES)} rotating (Chrome/Firefox/Edge/Safari)")
+    log.info(f"  Anti-block   : circuit-breaker | gaussian jitter | XFF spoof | param vary")
     log.info(f"  Standard     : ~200 URLs/sec ({N_CHUNKS}×{WORKERS_PER_CHUNK})")
-    log.info(f"  Xtream       : 1000 URLs/sec ({XTREAM_CHUNKS}×{XTREAM_WORKERS_PER_CHUNK})")
+    log.info(f"  Xtream       : {XTREAM_TARGET_RPS} RPS target ({XTREAM_CHUNKS}×{XTREAM_WORKERS_PER_CHUNK})")
+    log.info(f"  Xtream pages : {XTREAM_PAGES_PER_DORK}/dork | pool: {XTREAM_SESSION_POOL_SIZE}")
+    log.info(f"  Cookie seed  : {'on' if XTREAM_PRESEED_COOKIES else 'off'} | retries: {XTREAM_MAX_RETRIES}")
     log.info(f"  Proxies      : {len(_proxy_pool)} loaded")
     log.info(f"  Engines      : {', '.join(ENGINES)}")
     log.info("=" * 60)
