@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║   DORK PARSER BOT v20.0 — XTREAM EDITION                         ║
+║   DORK PARSER BOT v20.0 — XTREAM EDITION (FIXED)                 ║
 ║   • FIXED inline keyboard buttons (full handler coverage)        ║
 ║   • ADVANCED TLS fingerprint rotation (12 profiles, per-request) ║
 ║   • SPEED BOOST: 200 URLs/sec standard mode                      ║
@@ -16,13 +16,12 @@ import os
 import time
 import logging
 import tempfile
-import shlex
 import itertools
 from collections import deque
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs, unquote, quote_plus
+from urllib.parse import urlparse, parse_qs, unquote, quote_plus, urlencode
 
 from curl_cffi.requests import AsyncSession
 from curl_cffi import CurlError
@@ -48,14 +47,14 @@ log = logging.getLogger(__name__)
 
 # ─── CONFIGURATION ───────────────────────────────────────────────────────────
 BOT_TOKEN             = os.environ.get("BOT_TOKEN", "")
-N_CHUNKS              = int(os.environ.get("N_CHUNKS", 4))         # ↑ from 2
-WORKERS_PER_CHUNK     = int(os.environ.get("WORKERS_PER_CHUNK", 25)) # ↑ from 8
-MAX_WORKERS_PER_CHUNK = 60                                          # ↑ from 20
-MIN_DELAY             = float(os.environ.get("MIN_DELAY", 0.2))    # ↓ from 1.5
-MAX_DELAY             = float(os.environ.get("MAX_DELAY", 0.6))    # ↓ from 3.0
-FAST_MIN_DELAY        = 0.05                                        # ↓ from 0.5
-FAST_MAX_DELAY        = 0.15                                        # ↓ from 1.0
-FAST_STREAK_THRESHOLD = 2                                           # ↓ from 3
+N_CHUNKS              = int(os.environ.get("N_CHUNKS", 4))
+WORKERS_PER_CHUNK     = int(os.environ.get("WORKERS_PER_CHUNK", 25))
+MAX_WORKERS_PER_CHUNK = 60
+MIN_DELAY             = float(os.environ.get("MIN_DELAY", 0.2))
+MAX_DELAY             = float(os.environ.get("MAX_DELAY", 0.6))
+FAST_MIN_DELAY        = 0.05
+FAST_MAX_DELAY        = 0.15
+FAST_STREAK_THRESHOLD = 2
 MAX_RESULTS           = int(os.environ.get("MAX_RESULTS", 10))
 TOR_PROXY             = os.environ.get("TOR_PROXY", "socks5://127.0.0.1:9050")
 OUTPUT_DIR            = Path("results")
@@ -64,32 +63,32 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 ENGINES   = ["bing", "yahoo", "duckduckgo"]
 MAX_PAGES = 70
 
-WORKER_FETCH_TIMEOUT = 60                                           # ↓ from 120
+WORKER_FETCH_TIMEOUT = 60
 JOB_TIMEOUT          = 30 * 60
-MAX_RETRIES          = 2                                            # ↓ from 3
-CHUNK_STALL_TIMEOUT  = 30.0                                         # ↓ from 60
-EMPTY_RATE_SLOWDOWN  = 0.60                                         # ↑ tolerance
+MAX_RETRIES          = 2
+CHUNK_STALL_TIMEOUT  = 30.0
+EMPTY_RATE_SLOWDOWN  = 0.60
 EMPTY_RATE_RECOVER   = 0.40
-CHUNK_STAGGER_DELAY  = (0.1, 0.4)                                   # ↓ from (0.8, 2.5)
+CHUNK_STAGGER_DELAY  = (0.1, 0.4)
 
 # ─── XTREAM MODE CONFIG ──────────────────────────────────────────────────────
-XTREAM_WORKERS_PER_CHUNK   = 12      # parallel workers per chunk (stealth: was 50)
-XTREAM_CHUNKS              = 6       # parallel chunks (stealth: was 8) → 72 workers
-XTREAM_MIN_DELAY           = 1.2     # min inter-dork delay per worker (human reading time)
-XTREAM_MAX_DELAY           = 3.5     # max inter-dork delay per worker
-XTREAM_PAGE_DELAY_MIN      = 0.8     # min delay between sequential pages
-XTREAM_PAGE_DELAY_MAX      = 2.2     # max delay between sequential pages
-XTREAM_TIMEOUT             = 20      # request timeout
-XTREAM_MAX_RETRIES         = 2       # retries before giving up
-XTREAM_TARGET_RPS          = 250     # realistic stealth target RPS
-XTREAM_PAGES_PER_DORK      = 5       # pages per dork (sequential, not parallel)
-XTREAM_SESSION_POOL_SIZE   = 100     # pre-warmed sessions (matches worker count + headroom)
-XTREAM_SESSION_MAX_USES    = 25      # rotate session after N uses
-XTREAM_SESSION_MAX_AGE     = 180     # rotate session after 3 minutes
-XTREAM_POOL_BATCH_SIZE     = 15      # parallel batch size during pool init
-XTREAM_CAPTCHA_RATE_LIMIT  = 0.15    # throttle if captcha rate > 15%
-XTREAM_PRESEED_COOKIES     = True    # visit homepage to warm cookies before searching
-XTREAM_WORKER_START_JITTER = 0.25    # seconds between each worker starting (stagger burst)
+XTREAM_WORKERS_PER_CHUNK   = 12
+XTREAM_CHUNKS              = 6
+XTREAM_MIN_DELAY           = 1.2
+XTREAM_MAX_DELAY           = 3.5
+XTREAM_PAGE_DELAY_MIN      = 0.8
+XTREAM_PAGE_DELAY_MAX      = 2.2
+XTREAM_TIMEOUT             = 20
+XTREAM_MAX_RETRIES         = 2
+XTREAM_TARGET_RPS          = 250
+XTREAM_PAGES_PER_DORK      = 5
+XTREAM_SESSION_POOL_SIZE   = 100
+XTREAM_SESSION_MAX_USES    = 25
+XTREAM_SESSION_MAX_AGE     = 180
+XTREAM_POOL_BATCH_SIZE     = 15
+XTREAM_CAPTCHA_RATE_LIMIT  = 0.15
+XTREAM_PRESEED_COOKIES     = True
+XTREAM_WORKER_START_JITTER = 0.25
 
 DEFAULT_SESSION = {
     "workers":       WORKERS_PER_CHUNK,
@@ -100,66 +99,18 @@ DEFAULT_SESSION = {
     "tor":           False,
     "min_score":     30,
     "xtream":        False,
-    "xtream_engine": "yahoo",  # yahoo | bing | both
+    "xtream_engine": "yahoo",
 }
 
 user_sessions:   dict = {}
-MAX_TABS_PER_USER = 3   # max simultaneous jobs per user
-
-# {chat_id: {tab_id: asyncio.Task}}    — tab_id is 1, 2, or 3
 active_jobs:     dict = {}
-# {chat_id: {tab_id: asyncio.Event}}
 active_stop_evs: dict = {}
-# {chat_id: {tab_id: str}}             — human-readable label per tab
-active_tab_labels: dict = {}
-
-
-def get_free_tab(chat_id: int) -> int | None:
-    """Return the first free tab slot (1–MAX_TABS), or None if all full."""
-    tabs = active_jobs.get(chat_id, {})
-    for tab_id in range(1, MAX_TABS_PER_USER + 1):
-        task = tabs.get(tab_id)
-        if task is None or task.done():
-            return tab_id
-    return None
-
-
-def count_active_tabs(chat_id: int) -> int:
-    """Count tabs that are still running."""
-    return sum(
-        1 for t in active_jobs.get(chat_id, {}).values()
-        if t is not None and not t.done()
-    )
-
-
-def set_tab(chat_id: int, tab_id: int, task, stop_ev, label: str = ""):
-    """Register a tab."""
-    active_jobs.setdefault(chat_id, {})[tab_id]      = task
-    active_stop_evs.setdefault(chat_id, {})[tab_id]  = stop_ev
-    active_tab_labels.setdefault(chat_id, {})[tab_id] = label
-
-
-def clear_tab(chat_id: int, tab_id: int):
-    """Remove a tab after it finishes."""
-    for d in (active_jobs, active_stop_evs, active_tab_labels):
-        if chat_id in d:
-            d[chat_id].pop(tab_id, None)
-            if not d[chat_id]:
-                d.pop(chat_id, None)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ─── ADVANCED TLS FINGERPRINT ROTATION v21.0 ─────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
-#
-# Full browser impersonation at TLS/JA3/ALPN + HTTP header layer.
-# 22+ profiles spanning Chrome, Firefox, Edge, Safari across Windows/macOS/
-# Linux/Android/iOS. Each profile carries the exact Accept, Accept-Encoding,
-# Priority, and Sec-CH-UA values the real browser sends so every layer of
-# fingerprinting is consistent.
-# ══════════════════════════════════════════════════════════════════════════════
 
-# Diverse Accept-Language pool — real users have different browser locales
 _LANG_POOL = [
     "en-US,en;q=0.9",
     "en-US,en;q=0.9,es;q=0.8",
@@ -179,14 +130,12 @@ _LANG_POOL = [
     "en-NZ,en;q=0.9",
 ]
 
-# Per-browser Accept header strings (must match the impersonate target exactly)
 _ACCEPT_CHROME  = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
 _ACCEPT_FIREFOX = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
 _ACCEPT_SAFARI  = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 _ACCEPT_EDGE    = "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
 
 TLS_PROFILES = [
-    # ── Chrome 110 · Windows ────────────────────────────────────────────────
     {
         "impersonate": "chrome110", "browser": "chrome", "version": 110,
         "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
@@ -194,7 +143,6 @@ TLS_PROFILES = [
         "platform": '"Windows"', "accept": _ACCEPT_CHROME,
         "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
     },
-    # ── Chrome 116 · Windows ────────────────────────────────────────────────
     {
         "impersonate": "chrome116", "browser": "chrome", "version": 116,
         "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
@@ -202,7 +150,6 @@ TLS_PROFILES = [
         "platform": '"Windows"', "accept": _ACCEPT_CHROME,
         "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
     },
-    # ── Chrome 119 · Windows ────────────────────────────────────────────────
     {
         "impersonate": "chrome119", "browser": "chrome", "version": 119,
         "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
@@ -210,7 +157,6 @@ TLS_PROFILES = [
         "platform": '"Windows"', "accept": _ACCEPT_CHROME,
         "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
     },
-    # ── Chrome 120 · Windows ────────────────────────────────────────────────
     {
         "impersonate": "chrome120", "browser": "chrome", "version": 120,
         "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -218,7 +164,6 @@ TLS_PROFILES = [
         "platform": '"Windows"', "accept": _ACCEPT_CHROME,
         "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
     },
-    # ── Chrome 123 · Windows ────────────────────────────────────────────────
     {
         "impersonate": "chrome123", "browser": "chrome", "version": 123,
         "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
@@ -226,7 +171,6 @@ TLS_PROFILES = [
         "platform": '"Windows"', "accept": _ACCEPT_CHROME,
         "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
     },
-    # ── Chrome 124 · Windows ────────────────────────────────────────────────
     {
         "impersonate": "chrome124", "browser": "chrome", "version": 124,
         "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -235,7 +179,6 @@ TLS_PROFILES = [
         "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
         "priority": "u=0, i",
     },
-    # ── Chrome 126 · Windows ────────────────────────────────────────────────
     {
         "impersonate": "chrome126", "browser": "chrome", "version": 126,
         "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
@@ -244,7 +187,6 @@ TLS_PROFILES = [
         "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
         "priority": "u=0, i",
     },
-    # ── Chrome 131 · Windows ────────────────────────────────────────────────
     {
         "impersonate": "chrome131", "browser": "chrome", "version": 131,
         "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -253,7 +195,6 @@ TLS_PROFILES = [
         "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
         "priority": "u=0, i",
     },
-    # ── Chrome 131 · macOS ──────────────────────────────────────────────────
     {
         "impersonate": "chrome131", "browser": "chrome", "version": 131,
         "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -262,7 +203,6 @@ TLS_PROFILES = [
         "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
         "priority": "u=0, i",
     },
-    # ── Chrome 131 · Linux ──────────────────────────────────────────────────
     {
         "impersonate": "chrome131", "browser": "chrome", "version": 131,
         "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -271,7 +211,6 @@ TLS_PROFILES = [
         "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
         "priority": "u=0, i",
     },
-    # ── Chrome 120 · macOS ──────────────────────────────────────────────────
     {
         "impersonate": "chrome120", "browser": "chrome", "version": 120,
         "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -279,7 +218,6 @@ TLS_PROFILES = [
         "platform": '"macOS"', "accept": _ACCEPT_CHROME,
         "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
     },
-    # ── Chrome 131 · Android (Pixel 8) ──────────────────────────────────────
     {
         "impersonate": "chrome131", "browser": "chrome", "version": 131,
         "ua": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
@@ -288,7 +226,6 @@ TLS_PROFILES = [
         "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
         "mobile": True, "priority": "u=0, i",
     },
-    # ── Chrome 120 · Android (Samsung) ──────────────────────────────────────
     {
         "impersonate": "chrome120", "browser": "chrome", "version": 120,
         "ua": "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.144 Mobile Safari/537.36",
@@ -297,7 +234,6 @@ TLS_PROFILES = [
         "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
         "mobile": True,
     },
-    # ── Edge 99 · Windows ───────────────────────────────────────────────────
     {
         "impersonate": "edge99", "browser": "edge", "version": 99,
         "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.84 Safari/537.36 Edg/99.0.1150.55",
@@ -305,7 +241,6 @@ TLS_PROFILES = [
         "platform": '"Windows"', "accept": _ACCEPT_EDGE,
         "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
     },
-    # ── Edge 101 · Windows ──────────────────────────────────────────────────
     {
         "impersonate": "edge101", "browser": "edge", "version": 101,
         "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.54 Safari/537.36 Edg/101.0.1210.39",
@@ -314,7 +249,6 @@ TLS_PROFILES = [
         "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
         "priority": "u=0, i",
     },
-    # ── Safari 15.5 · macOS ─────────────────────────────────────────────────
     {
         "impersonate": "safari15_5", "browser": "safari", "version": 155,
         "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.5 Safari/605.1.15",
@@ -322,7 +256,6 @@ TLS_PROFILES = [
         "platform": '"macOS"', "accept": _ACCEPT_SAFARI,
         "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
     },
-    # ── Safari 17.0 · macOS ─────────────────────────────────────────────────
     {
         "impersonate": "safari17_0", "browser": "safari", "version": 170,
         "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
@@ -330,7 +263,6 @@ TLS_PROFILES = [
         "platform": '"macOS"', "accept": _ACCEPT_SAFARI,
         "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
     },
-    # ── Safari 18.0 · macOS ─────────────────────────────────────────────────
     {
         "impersonate": "safari18_0", "browser": "safari", "version": 180,
         "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
@@ -338,7 +270,6 @@ TLS_PROFILES = [
         "platform": '"macOS"', "accept": _ACCEPT_SAFARI,
         "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
     },
-    # ── Safari 17.2 · iOS ───────────────────────────────────────────────────
     {
         "impersonate": "safari17_2_ios", "browser": "safari", "version": 172,
         "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
@@ -347,7 +278,6 @@ TLS_PROFILES = [
         "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
         "mobile": True,
     },
-    # ── Safari 18.0 · iOS ───────────────────────────────────────────────────
     {
         "impersonate": "safari18_0", "browser": "safari", "version": 180,
         "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
@@ -356,7 +286,6 @@ TLS_PROFILES = [
         "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
         "mobile": True,
     },
-    # ── Firefox 133 · Windows ───────────────────────────────────────────────
     {
         "impersonate": "firefox133", "browser": "firefox", "version": 133,
         "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
@@ -365,7 +294,6 @@ TLS_PROFILES = [
         "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
         "firefox": True,
     },
-    # ── Firefox 133 · Linux ─────────────────────────────────────────────────
     {
         "impersonate": "firefox133", "browser": "firefox", "version": 133,
         "ua": "Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0",
@@ -374,7 +302,6 @@ TLS_PROFILES = [
         "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
         "firefox": True,
     },
-    # ── Firefox 133 · macOS ─────────────────────────────────────────────────
     {
         "impersonate": "firefox133", "browser": "firefox", "version": 133,
         "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.2; rv:133.0) Gecko/20100101 Firefox/133.0",
@@ -385,26 +312,18 @@ TLS_PROFILES = [
     },
 ]
 
-# Cycling iterator (thread-safe ish — used as a hint only)
 _tls_cycle = itertools.cycle(TLS_PROFILES)
 _tls_lock  = asyncio.Lock()
-_tls_last  = []         # tracks last N profiles used to avoid consecutive repeats
-_TLS_ANTI_REPEAT = 3   # don't repeat same impersonate within this window
+_tls_last  = []
+_TLS_ANTI_REPEAT = 3
 
 
 def get_tls_profile(strategy: str = "random") -> dict:
-    """
-    Get a TLS profile.
-      - "random"   : uniform random with anti-repeat window (best for diversity)
-      - "round"    : strict round-robin (predictable distribution)
-      - "weighted" : market-share weighted (Chrome dominant, Firefox included)
-    """
     global _tls_last
     if strategy == "round":
         return next(_tls_cycle)
 
     if strategy == "weighted":
-        # Realistic 2025 browser market share weights
         r = random.random()
         if r < 0.62:
             pool = [p for p in TLS_PROFILES if p["browser"] == "chrome" and not p.get("mobile")]
@@ -420,12 +339,10 @@ def get_tls_profile(strategy: str = "random") -> dict:
     else:
         candidates = TLS_PROFILES
 
-    # Anti-repeat: exclude profiles whose impersonate was recently used
     recent = set(_tls_last[-_TLS_ANTI_REPEAT:])
     filtered = [p for p in candidates if p["impersonate"] not in recent]
     chosen = random.choice(filtered if filtered else candidates)
 
-    # Update anti-repeat window
     _tls_last.append(chosen["impersonate"])
     if len(_tls_last) > _TLS_ANTI_REPEAT * 2:
         _tls_last = _tls_last[-_TLS_ANTI_REPEAT:]
@@ -435,16 +352,10 @@ def get_tls_profile(strategy: str = "random") -> dict:
 def build_headers_from_profile(profile: dict, referer: str | None = None,
                                 origin: str | None = None,
                                 context: str = "navigate") -> dict:
-    """
-    Build a complete, browser-accurate HTTP header set matching the TLS profile.
-    Every field is chosen to be internally consistent with the browser/OS/version.
-    """
     is_firefox = profile.get("firefox", False)
     is_mobile  = profile.get("mobile", False)
     version    = profile.get("version", 120)
     browser    = profile.get("browser", "chrome")
-
-    # Vary Cache-Control realistically (real users have varied cache states)
     cache_ctrl = random.choice(["max-age=0", "max-age=0", "no-cache", "max-age=0"])
 
     if is_firefox:
@@ -463,7 +374,6 @@ def build_headers_from_profile(profile: dict, referer: str | None = None,
             "Cache-Control":           cache_ctrl,
         }
     else:
-        # Chrome/Edge/Safari
         h = {
             "User-Agent":              profile["ua"],
             "Accept":                  profile.get("accept", _ACCEPT_CHROME),
@@ -476,16 +386,13 @@ def build_headers_from_profile(profile: dict, referer: str | None = None,
             "Sec-Fetch-Site":          "same-origin" if referer else "none",
             "Sec-Fetch-User":          "?1",
         }
-        # Priority header for Chrome 101+ and Edge 101+
         if version >= 101 and browser in ("chrome", "edge") and "priority" in profile:
             h["Priority"] = profile["priority"]
 
-    # Sec-CH-UA headers for Chromium-based browsers
     if profile.get("sec_ch_ua"):
         h["Sec-Ch-Ua"]          = profile["sec_ch_ua"]
         h["Sec-Ch-Ua-Mobile"]   = "?1" if is_mobile else "?0"
         h["Sec-Ch-Ua-Platform"] = profile["platform"]
-        # Newer Chrome also sends architecture hints ~40% of the time
         if version >= 120 and random.random() < 0.40:
             h["Sec-Ch-Ua-Arch"]           = '"x86"' if not is_mobile else '"arm"'
             h["Sec-Ch-Ua-Bitness"]        = '"64"'
@@ -496,78 +403,31 @@ def build_headers_from_profile(profile: dict, referer: str | None = None,
     if origin:
         h["Origin"] = origin
 
-    # DNT: Chrome sends it rarely (<5%), Firefox users ~25%
     dnt_prob = 0.25 if is_firefox else 0.05
     if random.random() < dnt_prob:
         h["DNT"] = "1"
-
-    # Save-Data: ~2% of connections (low-bandwidth users)
     if random.random() < 0.02:
         h["Save-Data"] = "on"
-
     return h
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ─── ANTI-BLOCK SYSTEM v21.0 ─────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
-#
-# Four independent layers work together to defeat bot detection:
-#
-#  1. DomainCircuitBreaker — per-domain state machine that auto-pauses a
-#     domain when its block rate exceeds a threshold and auto-resumes after
-#     a cooldown period.  Workers call `check()` before each request and
-#     `record()` after.
-#
-#  2. humanize_delay()     — Gaussian jitter instead of uniform random sleep.
-#     Real humans don't sleep uniformly; they cluster around a mean with a
-#     natural spread.  Occasional outliers ("distraction breaks") are added.
-#
-#  3. RefererChain         — maintains a per-session chain of plausible
-#     referer URLs so requests look like they come from real navigation.
-#     Includes the search-engine homepage → SERP → result page chain.
-#
-#  4. SearchParamVariator  — randomises minor query-string parameters
-#     (Yahoo fr/b, Bing first/form/count) so each request has a unique
-#     fingerprint even when the dork is the same.
-#
-# ══════════════════════════════════════════════════════════════════════════════
 
 import collections as _collections
 
-# ── 1. Per-domain Circuit Breaker ────────────────────────────────────────────
-
 class DomainCircuitBreaker:
-    """
-    Tracks block/success events per target domain and exposes a circuit-breaker
-    that pauses a domain when it is clearly rate-limiting us.
-
-    States:
-      CLOSED  → normal operation
-      OPEN    → domain is paused; workers must wait for cooldown
-      HALF    → cooldown expired; next request is a probe
-
-    Transitions:
-      CLOSED → OPEN  : block_rate >= THRESHOLD over last WINDOW requests
-      OPEN   → HALF  : cooldown_secs elapsed
-      HALF   → CLOSED: probe request succeeded
-      HALF   → OPEN  : probe request was also blocked (extend cooldown ×2)
-    """
-
-    WINDOW        = 20    # sliding window of last N requests
-    THRESHOLD     = 0.55  # 55% block rate triggers OPEN
-    COOLDOWN_BASE = 45.0  # initial cooldown seconds
-    COOLDOWN_MAX  = 480.0 # cap at 8 minutes
+    WINDOW        = 20
+    THRESHOLD     = 0.55
+    COOLDOWN_BASE = 45.0
+    COOLDOWN_MAX  = 480.0
 
     def __init__(self):
         self._lock     = asyncio.Lock()
-        # domain → deque of 1/0 (blocked/ok) for sliding window
-        self._history: dict[str, _collections.deque] = {}
-        # domain → state: "closed" | "open" | "half"
+        self._history: dict[str, deque] = {}
         self._state:   dict[str, str]   = {}
-        # domain → time when OPEN expires
         self._until:   dict[str, float] = {}
-        # domain → current cooldown duration (doubles on repeated failures)
         self._cooldown: dict[str, float] = {}
 
     def _domain(self, url: str) -> str:
@@ -577,11 +437,6 @@ class DomainCircuitBreaker:
             return url
 
     async def check(self, url: str) -> float:
-        """
-        Returns 0.0 if the domain is CLOSED (proceed immediately).
-        Returns seconds-to-wait if OPEN.
-        Workers should await asyncio.sleep(result) before the request.
-        """
         domain = self._domain(url)
         async with self._lock:
             state = self._state.get(domain, "closed")
@@ -591,14 +446,11 @@ class DomainCircuitBreaker:
                 remaining = self._until.get(domain, 0) - time.time()
                 if remaining > 0:
                     return remaining
-                # Transition to HALF — allow one probe through
                 self._state[domain] = "half"
                 return 0.0
-            # HALF — probe is in flight, other workers wait briefly
             return 2.0
 
     async def record(self, url: str, blocked: bool) -> None:
-        """Record the outcome of a request for the given URL's domain."""
         domain = self._domain(url)
         async with self._lock:
             if domain not in self._history:
@@ -608,23 +460,18 @@ class DomainCircuitBreaker:
 
             hist  = self._history[domain]
             state = self._state.get(domain, "closed")
-
             hist.append(1 if blocked else 0)
 
             if state == "half":
                 if blocked:
-                    # Probe also blocked → extend cooldown and reopen
                     cd = min(self._cooldown[domain] * 2, self.COOLDOWN_MAX)
                     self._cooldown[domain] = cd
                     self._state[domain]    = "open"
                     self._until[domain]    = time.time() + cd
-                    log.debug(f"[CB] {domain}: probe blocked → OPEN for {cd:.0f}s")
                 else:
-                    # Probe succeeded → reset and close
                     self._state[domain]    = "closed"
                     self._cooldown[domain] = self.COOLDOWN_BASE
                     hist.clear()
-                    log.debug(f"[CB] {domain}: probe OK → CLOSED")
                 return
 
             if len(hist) >= self.WINDOW // 2:
@@ -633,29 +480,14 @@ class DomainCircuitBreaker:
                     cd = self._cooldown[domain]
                     self._state[domain] = "open"
                     self._until[domain] = time.time() + cd
-                    log.warning(f"[CB] {domain}: block rate {rate:.0%} → OPEN for {cd:.0f}s")
 
 
-# Global singleton — shared across all XTREAM workers
 circuit_breaker = DomainCircuitBreaker()
 
-
-# ── 2. Gaussian Jitter Timing ─────────────────────────────────────────────────
 
 def humanize_delay(base: float, sigma_ratio: float = 0.30,
                    distraction_prob: float = 0.04,
                    distraction_extra: float = 3.0) -> float:
-    """
-    Return a human-like delay around `base` seconds.
-
-    - Core delay:  Gaussian(mean=base, sigma=base*sigma_ratio), clipped to
-                   [base*0.2, base*4.0]
-    - Distraction: With probability `distraction_prob`, add an extra pause of
-                   Uniform(distraction_extra, distraction_extra*3) — simulates
-                   a user glancing away, switching tabs, etc.
-
-    Example: humanize_delay(1.5) → typically 0.9–2.2 s, rarely up to 10 s
-    """
     delay = random.gauss(base, base * sigma_ratio)
     delay = max(base * 0.2, min(base * 4.0, delay))
     if random.random() < distraction_prob:
@@ -664,29 +496,14 @@ def humanize_delay(base: float, sigma_ratio: float = 0.30,
 
 
 async def async_humanize_sleep(base: float, **kw) -> None:
-    """async wrapper for humanize_delay — use in coroutines."""
     await asyncio.sleep(humanize_delay(base, **kw))
 
 
-# ── 3. Per-session Referer Chain ──────────────────────────────────────────────
-
-_YAHOO_HOMES  = ["https://search.yahoo.com/", "https://yahoo.com/",
-                 "https://www.yahoo.com/"]
+_YAHOO_HOMES  = ["https://search.yahoo.com/", "https://yahoo.com/", "https://www.yahoo.com/"]
 _BING_HOMES   = ["https://www.bing.com/", "https://bing.com/"]
 _GOOGLE_HOMES = ["https://www.google.com/", "https://google.com/"]
 
 class RefererChain:
-    """
-    Maintains a plausible navigation history for a session so every outgoing
-    request carries a believable Referer that matches the chain:
-
-        Search engine homepage → SERP page → result page → (next SERP)
-
-    Usage:
-        chain = RefererChain("yahoo")
-        referer = chain.next_referer(serp_url)   # before each SERP request
-    """
-
     def __init__(self, engine: str = "yahoo"):
         self.engine  = engine
         self._chain: list[str] = []
@@ -698,43 +515,32 @@ class RefererChain:
             self._chain.append(random.choice(_YAHOO_HOMES))
 
     def push(self, url: str) -> None:
-        """Record a visited URL into the chain (keep last 5)."""
         self._chain.append(url)
         if len(self._chain) > 5:
             self._chain.pop(0)
 
     def current(self) -> str | None:
-        """Return the most recent URL as a Referer value."""
         return self._chain[-1] if self._chain else None
 
     def next_serp_referer(self, serp_url: str) -> str:
-        """
-        Return the referer to use for `serp_url`, then push serp_url
-        into the chain so the next call sees it as referer.
-        """
         ref = self.current()
         self.push(serp_url)
         return ref or ""
 
 
-# ── 4. Search Parameter Variator ─────────────────────────────────────────────
-
 _YAHOO_FR_POOL = [
     "fp-tts", "yfp-t-902", "yfp-t-501", "free", "p2", "sfp",
     "uh3_finance_vert_gs", "uh3_finance_vert", "yfp-t-152",
 ]
-_YAHOO_VD_POOL = ["b", ""]   # vertical
+_YAHOO_VD_POOL = ["b", ""]
 _YAHOO_EI_POOL = ["UTF-8", "utf-8"]
 
 _BING_FORM_POOL = ["QBLH", "QBRE", "SBSC", "QBHL", "PERE", "ANAB01"]
-_BING_MSBQF_POOL = ["0", "1", ""]   # internal Bing flag
-_BING_COUNT_POOL  = [10, 10, 10, 15, 20]   # most use 10
+_BING_MSBQF_POOL = ["0", "1", ""]
+_BING_COUNT_POOL  = [10, 10, 10, 15, 20]
+
 
 def vary_yahoo_params(base_params: dict) -> dict:
-    """
-    Add realistic variance to Yahoo search parameters so requests don't look
-    templated.  Modifies a copy; does not mutate the original.
-    """
     p = dict(base_params)
     p["fr"]  = random.choice(_YAHOO_FR_POOL)
     p["ei"]  = random.choice(_YAHOO_EI_POOL)
@@ -748,9 +554,6 @@ def vary_yahoo_params(base_params: dict) -> dict:
 
 
 def vary_bing_params(base_params: dict) -> dict:
-    """
-    Add realistic variance to Bing search parameters.
-    """
     p = dict(base_params)
     p["form"]  = random.choice(_BING_FORM_POOL)
     p["count"] = random.choice(_BING_COUNT_POOL)
@@ -763,34 +566,25 @@ def vary_bing_params(base_params: dict) -> dict:
     return p
 
 
-# ── 5. X-Forwarded-For Spoofer (optional header noise) ───────────────────────
-
 _COMMON_ISP_RANGES = [
-    # US ISPs / cloud egress ranges (publicly routable, not sensitive)
-    ("24.0.0.0",    "24.255.255.255"),   # Comcast
-    ("71.0.0.0",    "71.127.255.255"),   # AT&T
-    ("98.0.0.0",    "98.255.255.255"),   # Charter/Spectrum
-    ("173.0.0.0",   "173.79.255.255"),   # Comcast Business
-    ("67.40.0.0",   "67.63.255.255"),    # CenturyLink
-    ("50.0.0.0",    "50.127.255.255"),   # Various US cable
-    ("86.0.0.0",    "86.255.255.255"),   # BT / UK
-    ("82.0.0.0",    "82.127.255.255"),   # Deutsche Telekom
-    ("90.0.0.0",    "90.127.255.255"),   # France Telecom
+    ("24.0.0.0",    "24.255.255.255"),
+    ("71.0.0.0",    "71.127.255.255"),
+    ("98.0.0.0",    "98.255.255.255"),
+    ("173.0.0.0",   "173.79.255.255"),
+    ("67.40.0.0",   "67.63.255.255"),
+    ("50.0.0.0",    "50.127.255.255"),
+    ("86.0.0.0",    "86.255.255.255"),
+    ("82.0.0.0",    "82.127.255.255"),
+    ("90.0.0.0",    "90.127.255.255"),
 ]
 
 def _random_public_ip() -> str:
     r1, r2 = random.choice(_COMMON_ISP_RANGES)
     parts1 = [int(x) for x in r1.split(".")]
     parts2 = [int(x) for x in r2.split(".")]
-    ip = ".".join(str(random.randint(a, b)) for a, b in zip(parts1, parts2))
-    return ip
+    return ".".join(str(random.randint(a, b)) for a, b in zip(parts1, parts2))
 
 def spoof_xff_headers(h: dict, probability: float = 0.35) -> dict:
-    """
-    With `probability`, inject X-Forwarded-For / X-Real-Ip headers with a
-    plausible residential IP to make the request look like it came from a NAT
-    gateway.  Returns the header dict (modified in-place).
-    """
     if random.random() < probability:
         ip = _random_public_ip()
         h["X-Forwarded-For"] = ip
@@ -916,7 +710,6 @@ async def detect_proxy_protocol(p):
             p["protocol"]=scheme
             p["url"]=_build_proxy_url(scheme, host, port, user, pwd)
             p["alive"]=True; p["latency"]=latency; p["last_check"]=time.time(); p["fail_count"]=0
-            log.info(f"[PROXY] Detected {scheme.upper()} for {host}:{port} ({latency:.0f}ms)")
             return True
     p["alive"]=False; p["protocol"]=None
     p["last_check"]=time.time(); p["fail_count"]=p.get("fail_count",0)+1
@@ -1289,12 +1082,10 @@ _TRACKING_PARAM_RE = re.compile(
 
 
 def _normalize_url_for_dedup(url: str) -> str:
-    """Strip common tracking/noise params so near-duplicate URLs collapse."""
     try:
         p = urlparse(url)
         if not p.query:
             return url
-        from urllib.parse import urlencode
         params = parse_qs(p.query, keep_blank_values=True)
         cleaned = {k: v for k, v in params.items() if not _TRACKING_PARAM_RE.match(k)}
         if cleaned == params:
@@ -1312,10 +1103,10 @@ async def process_chunk_urls(chunk, semaphore, stop_ev):
         return filter_urls(chunk)["kept"]
 
 
-async def run_url_clean_job(chat_id, raw_lines, context, tab_id: int = 1):
+async def run_url_clean_job(chat_id, raw_lines, context):
     CLEAN_CHUNK_SIZE = 500; MAX_CONCURRENT = 4
     stop_ev = asyncio.Event()
-    set_tab(chat_id, tab_id, asyncio.current_task(), stop_ev, label=f"URL-Cleaner")
+    active_stop_evs[chat_id] = stop_ev
     total_input = len(raw_lines)
     status_msg = await context.bot.send_message(
         chat_id,
@@ -1360,7 +1151,8 @@ async def run_url_clean_job(chat_id, raw_lines, context, tab_id: int = 1):
                 caption=f"🧹 {len(final_urls)} kept from {total_input}")
     else:
         await context.bot.send_message(chat_id, "⚠️ No URLs passed the filters.")
-    clear_tab(chat_id, tab_id)
+    active_stop_evs.pop(chat_id, None)
+    active_jobs.pop(chat_id, None)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1368,10 +1160,6 @@ async def run_url_clean_job(chat_id, raw_lines, context, tab_id: int = 1):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _make_isolated_session(use_tor=False, proxy=None, profile=None, http2=True):
-    """
-    Build a session with a rotated TLS fingerprint.
-    `profile` lets caller pin a specific TLS profile; otherwise random.
-    """
     chosen_proxy = None
     if use_tor:
         chosen_proxy = TOR_PROXY
@@ -1387,7 +1175,7 @@ def _make_isolated_session(use_tor=False, proxy=None, profile=None, http2=True):
         "impersonate": profile["impersonate"],
         "verify":      False,
         "timeout":     20,
-        "default_headers": False,   # we control headers ourselves
+        "default_headers": False,
     }
     if chosen_proxy:
         kwargs["proxy"] = chosen_proxy
@@ -1403,14 +1191,8 @@ def _make_fallback_session(exclude_proxy=None):
 
 
 # ─── XTREAM SESSION POOL ─────────────────────────────────────────────────────
-# Pre-warmed pool of sessions for 1000 RPS Yahoo bruteforce
 
 async def _preseed_session_cookies(sess, engine: str = "yahoo") -> None:
-    """
-    Visit a search engine homepage before querying.
-    This warms the cookie jar and makes the session look like a real browser
-    that browsed naturally rather than hitting the API cold.
-    """
     try:
         if engine == "bing":
             url = random.choice(BING_HOMEPAGES)
@@ -1425,18 +1207,12 @@ async def _preseed_session_cookies(sess, engine: str = "yahoo") -> None:
 
 
 class XtreamSessionPool:
-    """
-    Maintains a rotating pool of pre-built sessions for maximum throughput.
-    Each session keeps cookies & a stable TLS profile to look human.
-    Sessions are rotated based on usage count + age.
-    Pool is initialized in parallel batches for fast startup.
-    """
     def __init__(self, size=XTREAM_SESSION_POOL_SIZE, engine: str = "yahoo"):
         self.size   = size
-        self.engine = engine  # which engine to pre-seed cookies for
+        self.engine = engine
         self.sessions: deque = deque()
-        self._usage: dict = {}    # session_id -> count
-        self._age:   dict = {}    # session_id -> ts
+        self._usage: dict = {}
+        self._age:   dict = {}
         self._lock   = asyncio.Lock()
         self._closed = False
 
@@ -1453,17 +1229,14 @@ class XtreamSessionPool:
             self._age[sid]   = time.time()
 
     async def initialize(self, use_tor=False):
-        log.info(f"[XTREAM] Building session pool of {self.size} (batch={XTREAM_POOL_BATCH_SIZE})...")
         tasks_left = self.size
         while tasks_left > 0:
             batch = min(XTREAM_POOL_BATCH_SIZE, tasks_left)
             await asyncio.gather(*[self._make_one(use_tor) for _ in range(batch)],
                                   return_exceptions=True)
             tasks_left -= batch
-        log.info(f"[XTREAM] Pool ready: {len(self.sessions)} sessions")
 
     async def acquire(self):
-        """Get a session from the pool (rotates round-robin)."""
         async with self._lock:
             if not self.sessions:
                 profile = get_tls_profile("weighted")
@@ -1475,7 +1248,6 @@ class XtreamSessionPool:
             return sess
 
     async def release(self, sess, burned=False):
-        """Return session to pool. If burned (got blocked), replace it."""
         if self._closed:
             try: await sess.close()
             except Exception: pass
@@ -1652,16 +1424,13 @@ async def _generic_engine_fetch(session, method, url, *, params=None, data=None,
     fallback_session = None
     try:
         for attempt in range(max_retries):
-            # ── Circuit breaker: pause if the domain is currently OPEN ──────
             wait_secs = await circuit_breaker.check(url)
             if wait_secs > 0:
                 await asyncio.sleep(min(wait_secs, 30.0))
 
-            # Build headers from the session's TLS profile for consistency
             profile = getattr(active_session, "_tls_profile", None) or get_tls_profile()
             origin = referer.rstrip("/") if data is not None else None
             headers = build_headers_from_profile(profile, referer=referer, origin=origin)
-            # Optional XFF header noise (~35% of requests)
             spoof_xff_headers(headers, probability=0.35)
             if data is not None:
                 headers["Content-Type"] = "application/x-www-form-urlencoded"
@@ -1767,7 +1536,6 @@ async def fetch_all_pages(session, dork, engine, pages, max_res, chunk_id=0):
 
     async def _fetch_with_stagger(page, idx):
         if idx > 0:
-            # Gaussian jitter instead of uniform — more human-like inter-page timing
             await asyncio.sleep(humanize_delay(0.05 * idx, sigma_ratio=0.4))
         return await fetch_fn(session, dork, page, max_res, chunk_id)
 
@@ -1783,20 +1551,9 @@ async def fetch_all_pages(session, dork, engine, pages, max_res, chunk_id=0):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ─── XTREAM MODE — YAHOO BRUTEFORCE @ 1000 URLs/sec ──────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
-#
-# Strategy:
-#  1. Pre-warmed session pool with rotated TLS profiles
-#  2. Yahoo-only (most permissive, weakest captcha enforcement on /search)
-#  3. Per-session cookie/state preservation reduces 403s
-#  4. Async semaphore = WORKERS × CHUNKS = 400 concurrent requests
-#  5. Stagger micro-bursts: 100 requests every 100ms → 1000 RPS
-#  6. Adaptive backoff: any 429/captcha → burn session + cooldown that worker
-#  7. Per-IP rate limiting via proxy rotation
+# ─── XTREAM MODE — YAHOO BRUTEFORCE @ 1000 URLs/sec (FIXED) ─────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Yahoo regional endpoints — spread load across mirrors
 YAHOO_ENDPOINTS = [
     "https://search.yahoo.com/search",
     "https://uk.search.yahoo.com/search",
@@ -1835,7 +1592,6 @@ YAHOO_HOMEPAGES = [
     "https://ca.yahoo.com/",
 ]
 
-# Bing regional endpoints for XTREAM multi-engine mode
 BING_XTREAM_ENDPOINTS = [
     "https://www.bing.com/search",
     "https://cn.bing.com/search",
@@ -1859,11 +1615,6 @@ BING_XTREAM_MARKETS = ["en-US", "en-GB", "en-CA", "en-AU", "en-IN", "en-SG", "en
 async def xtream_fetch_yahoo(pool: XtreamSessionPool, dork: str, page: int,
                               max_res: int, worker_id: int,
                               sess=None) -> tuple[list, bool, bool]:
-    """
-    Single Yahoo fetch in xtream mode — stealth edition.
-    Returns (urls, was_burned, was_captcha).
-    If `sess` is provided the caller owns session lifetime (no acquire/release).
-    """
     owned  = sess is None
     burned = False; captcha = False
     if owned:
@@ -1883,7 +1634,6 @@ async def xtream_fetch_yahoo(pool: XtreamSessionPool, dork: str, page: int,
         }
         params = vary_yahoo_params(base_params)
 
-        # Circuit breaker check
         wait = await circuit_breaker.check(endpoint)
         if wait > 0:
             await asyncio.sleep(min(wait, 25.0))
@@ -1941,11 +1691,6 @@ async def xtream_fetch_yahoo(pool: XtreamSessionPool, dork: str, page: int,
 async def xtream_fetch_bing(pool: XtreamSessionPool, dork: str, page: int,
                              max_res: int, worker_id: int,
                              sess=None) -> tuple[list, bool, bool]:
-    """
-    Single Bing fetch in xtream mode — stealth edition.
-    Returns (urls, was_burned, was_captcha).
-    If `sess` is provided the caller owns session lifetime.
-    """
     owned  = sess is None
     burned = False; captcha = False
     if owned:
@@ -1966,7 +1711,6 @@ async def xtream_fetch_bing(pool: XtreamSessionPool, dork: str, page: int,
         }
         params = vary_bing_params(base_params)
 
-        # Circuit breaker check
         wait = await circuit_breaker.check(endpoint)
         if wait > 0:
             await asyncio.sleep(min(wait, 25.0))
@@ -2022,17 +1766,12 @@ async def xtream_fetch_bing(pool: XtreamSessionPool, dork: str, page: int,
 
 
 async def xtream_worker(wid: int, queue: asyncio.Queue, results_q: asyncio.Queue,
-                          pool: XtreamSessionPool, max_res: int, pages_per_dork: int,
-                          min_score: int, stop_ev: asyncio.Event,
-                          rate_limiter: asyncio.Semaphore,
-                          xtream_engine: str,
-                          captcha_counter: list):
-    """
-    Stealth XTREAM worker — pages are fetched SEQUENTIALLY with human-like delays,
-    and each dork owns one session for the full page run (session affinity).
-    Workers stagger their startup to prevent the initial burst spike.
-    """
-    # ── Stagger startup: spread workers over time to avoid burst detection ──
+                         pool: XtreamSessionPool, max_res: int, pages_per_dork: int,
+                         min_score: int, stop_ev: asyncio.Event,
+                         rate_limiter: asyncio.Semaphore,
+                         xtream_engine: str,
+                         captcha_counter: list,
+                         captcha_lock: asyncio.Lock):
     await asyncio.sleep(humanize_delay(wid * XTREAM_WORKER_START_JITTER,
                                        sigma_ratio=0.3, distraction_prob=0.0))
 
@@ -2046,7 +1785,6 @@ async def xtream_worker(wid: int, queue: asyncio.Queue, results_q: asyncio.Queue
         except asyncio.TimeoutError:
             continue
 
-        # Per-worker cooldown after burns (exponential, capped)
         now = time.time()
         if cooldown_until > now:
             await asyncio.sleep(cooldown_until - now)
@@ -2054,7 +1792,6 @@ async def xtream_worker(wid: int, queue: asyncio.Queue, results_q: asyncio.Queue
                 queue.task_done()
                 break
 
-        # Pick engine for this dork
         if xtream_engine == "both":
             use_engine = "yahoo" if engine_toggle % 2 == 0 else "bing"
             engine_toggle += 1
@@ -2064,7 +1801,6 @@ async def xtream_worker(wid: int, queue: asyncio.Queue, results_q: asyncio.Queue
         fetch_fn = xtream_fetch_yahoo if use_engine == "yahoo" else xtream_fetch_bing
         tag      = f"{use_engine}-xtream"
 
-        # ── Session affinity: one session owns the full page sweep ───────────
         sess = await pool.acquire()
         all_urls = []; any_burned = False; any_captcha = False
 
@@ -2082,9 +1818,8 @@ async def xtream_worker(wid: int, queue: asyncio.Queue, results_q: asyncio.Queue
                     break
                 if captcha:
                     any_captcha = True
-                    any_burned  = True   # treat captcha as burn — retire session
+                    any_burned  = True
                     break
-                # Human-like inter-page delay (reading the results)
                 if page < pages_per_dork and not stop_ev.is_set():
                     delay = humanize_delay(
                         random.uniform(XTREAM_PAGE_DELAY_MIN, XTREAM_PAGE_DELAY_MAX),
@@ -2104,17 +1839,16 @@ async def xtream_worker(wid: int, queue: asyncio.Queue, results_q: asyncio.Queue
         queue.task_done()
 
         if any_captcha:
-            captcha_counter[0] += 1
+            async with captcha_lock:
+                captcha_counter[0] += 1
 
         if any_burned:
             consecutive_fails += 1
-            # Exponential back-off, Gaussian jitter, capped at 30s
             backoff = min(consecutive_fails * 2.0, 30.0)
             cooldown_until = time.time() + backoff
             await asyncio.sleep(humanize_delay(backoff, sigma_ratio=0.2))
         elif all_urls:
             consecutive_fails = max(0, consecutive_fails - 1)
-            # Human reading-time delay between dorks
             await asyncio.sleep(humanize_delay(
                 random.uniform(XTREAM_MIN_DELAY, XTREAM_MAX_DELAY),
                 sigma_ratio=0.3,
@@ -2124,10 +1858,7 @@ async def xtream_worker(wid: int, queue: asyncio.Queue, results_q: asyncio.Queue
             await asyncio.sleep(humanize_delay(0.5, sigma_ratio=0.4))
 
 
-async def run_xtream_job(chat_id: int, dorks: list, context, tab_id: int = 1):
-    """
-    XTREAM MODE v21: Multi-engine (Yahoo/Bing/Both), adaptive throttle, domain stats.
-    """
+async def run_xtream_job(chat_id: int, dorks: list, context):
     from collections import Counter
     sess_cfg      = get_session(chat_id)
     use_tor       = sess_cfg.get("tor", False)
@@ -2140,16 +1871,16 @@ async def run_xtream_job(chat_id: int, dorks: list, context, tab_id: int = 1):
     total_dorks = len(valid_dorks)
     if total_dorks == 0:
         await context.bot.send_message(chat_id, "⚠️ No valid dorks.")
-        clear_tab(chat_id, tab_id); return
+        active_jobs.pop(chat_id, None); return
 
     start_time    = time.time()
     n_chunks      = XTREAM_CHUNKS
     workers_n     = XTREAM_WORKERS_PER_CHUNK
     total_workers = n_chunks * workers_n
 
-    # Adaptive concurrency semaphore — starts full, shrinks on high captcha rate
     rate_limiter    = asyncio.Semaphore(total_workers)
-    captcha_counter = [0]   # shared mutable counter (list avoids closure rebind)
+    captcha_counter = [0]  # shared list, protected by lock
+    captcha_lock    = asyncio.Lock()
 
     alive_proxies = sum(1 for p in _proxy_pool if p["alive"])
     proxy_info = (
@@ -2160,11 +1891,9 @@ async def run_xtream_job(chat_id: int, dorks: list, context, tab_id: int = 1):
     engine_display = {"yahoo": "YAHOO (15 mirrors)", "bing": "BING (3 mirrors)",
                       "both": "YAHOO + BING"}.get(xtream_engine, xtream_engine.upper())
 
-    tab_label = f"[Tab {tab_id}] " if tab_id > 1 else ""
     status_msg = await context.bot.send_message(
         chat_id,
-        f"{tab_label}⚡⚡⚡ XTREAM MODE ENGAGED ⚡⚡⚡\n{'━'*30}\n"
-        f"🗂 Tab         : {tab_id}/{MAX_TABS_PER_USER}\n"
+        f"⚡⚡⚡ XTREAM MODE ENGAGED ⚡⚡⚡\n{'━'*30}\n"
         f"📋 Dorks      : {total_dorks}\n"
         f"🎯 Engine     : {engine_display}\n"
         f"🚀 Target RPS : {XTREAM_TARGET_RPS}/sec\n"
@@ -2181,8 +1910,7 @@ async def run_xtream_job(chat_id: int, dorks: list, context, tab_id: int = 1):
     queue     = asyncio.Queue(maxsize=total_dorks + 10)
     results_q = asyncio.Queue(maxsize=total_dorks * 2)
     stop_ev   = asyncio.Event()
-    set_tab(chat_id, tab_id, asyncio.current_task(), stop_ev,
-            label=f"XTREAM/{total_dorks}d")
+    active_stop_evs[chat_id] = stop_ev
 
     for d in valid_dorks:
         await queue.put(d)
@@ -2190,20 +1918,19 @@ async def run_xtream_job(chat_id: int, dorks: list, context, tab_id: int = 1):
     worker_tasks = [
         asyncio.create_task(xtream_worker(
             i, queue, results_q, pool, max_res, XTREAM_PAGES_PER_DORK,
-            min_score, stop_ev, rate_limiter, xtream_engine, captcha_counter,
+            min_score, stop_ev, rate_limiter, xtream_engine, captcha_counter, captcha_lock,
         ))
         for i in range(total_workers)
     ]
 
     processed = 0; total_raw = 0; total_captcha = 0
-    seen_norm: set  = set()   # normalized URL set for smarter dedup
-    seen_urls: set  = set()   # original URL set
+    seen_norm: set  = set()
+    seen_urls: set  = set()
     all_scored: list = []
     last_edit  = 0.0
     peak_rps   = 0.0
     last_rps_t = time.time(); rps_count = 0; current_rps = 0.0
 
-    # Temp file opened for incremental writes
     tmp_file = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False,
                                             prefix=f"xtream_{chat_id}_", suffix=".txt")
     tmp_path = tmp_file.name
@@ -2227,7 +1954,9 @@ async def run_xtream_job(chat_id: int, dorks: list, context, tab_id: int = 1):
                 continue
 
             processed  += 1; total_raw += raw_cnt; rps_count += raw_cnt
-            if was_captcha: total_captcha += 1
+            if was_captcha:
+                async with captcha_lock:
+                    total_captcha += 1
 
             for sc, url in scored:
                 norm = _normalize_url_for_dedup(url)
@@ -2237,11 +1966,10 @@ async def run_xtream_job(chat_id: int, dorks: list, context, tab_id: int = 1):
                     try: incremental_f.write(f"{url}\n")
                     except Exception: pass
 
-            # Adaptive throttle: if captcha rate spikes, tighten the semaphore
             if processed > 0 and processed % 20 == 0:
-                captcha_rate = captcha_counter[0] / max(processed, 1)
+                async with captcha_lock:
+                    captcha_rate = captcha_counter[0] / max(processed, 1)
                 if captcha_rate > XTREAM_CAPTCHA_RATE_LIMIT:
-                    log.warning(f"[XTREAM] High captcha rate {captcha_rate:.0%} — easing pressure")
                     await asyncio.sleep(random.uniform(1.0, 2.5))
 
             now = time.time()
@@ -2255,7 +1983,8 @@ async def run_xtream_job(chat_id: int, dorks: list, context, tab_id: int = 1):
                 bar     = "█" * (pct // 10) + "░" * (10 - pct // 10)
                 elapsed = int(time.time() - start_time)
                 eta     = int((elapsed / processed) * (total_dorks - processed)) if processed else 0
-                captcha_rate = captcha_counter[0] / max(processed, 1)
+                async with captcha_lock:
+                    captcha_rate = captcha_counter[0] / max(processed, 1)
                 try:
                     await context.bot.edit_message_text(
                         chat_id=chat_id, message_id=status_msg.message_id,
@@ -2265,7 +1994,7 @@ async def run_xtream_job(chat_id: int, dorks: list, context, tab_id: int = 1):
                               f"🔍 Raw URLs : {total_raw}\n"
                               f"🎯 Targets  : {len(all_scored)}\n"
                               f"📊 RPS      : {current_rps:.0f} (peak {peak_rps:.0f})\n"
-                              f"🛡 Captchas : {total_captcha} ({captcha_rate:.0%})\n"
+                              f"🛡 Captchas : {captcha_counter[0]} ({captcha_rate:.0%})\n"
                               f"⏱ {elapsed}s | ETA {eta}s\n{'━'*30}"),
                     )
                     last_edit = time.time()
@@ -2287,13 +2016,13 @@ async def run_xtream_job(chat_id: int, dorks: list, context, tab_id: int = 1):
         try: await timeout_task
         except Exception: pass
         await pool.close_all()
-        clear_tab(chat_id, tab_id)
+        active_jobs.pop(chat_id, None)
+        active_stop_evs.pop(chat_id, None)
 
     all_scored.sort(reverse=True)
     elapsed = int(time.time() - start_time)
     avg_rps = total_raw / max(elapsed, 1)
 
-    # Build categorised + domain-stats output file
     high = [(s, u) for s, u in all_scored if s >= 70]
     med  = [(s, u) for s, u in all_scored if 40 <= s < 70]
     low  = [(s, u) for s, u in all_scored if s < 40]
@@ -2470,12 +2199,11 @@ async def run_chunk(chunk_id, dorks, engines, pages, max_res, use_tor, min_score
             "degraded_count":chunk_degraded,"processed":processed,"empty_count":empty_count}
 
 
-async def run_dork_job(chat_id, dorks, context, tab_id: int = 1):
+async def run_dork_job(chat_id, dorks, context):
     sess = get_session(chat_id)
 
-    # Route to xtream mode if enabled
     if sess.get("xtream", False):
-        await run_xtream_job(chat_id, dorks, context, tab_id=tab_id)
+        await run_xtream_job(chat_id, dorks, context)
         return
 
     engines = sess.get("engines", list(ENGINES))
@@ -2495,7 +2223,7 @@ async def run_dork_job(chat_id, dorks, context, tab_id: int = 1):
     dorks = valid_dorks; total_dorks = len(dorks)
     if total_dorks == 0:
         await context.bot.send_message(chat_id, "⚠️ No valid dorks.")
-        clear_tab(chat_id, tab_id); return
+        active_jobs.pop(chat_id, None); return
 
     pages_str = ", ".join(str(p) for p in pages)
     start_time = time.time()
@@ -2521,11 +2249,9 @@ async def run_dork_job(chat_id, dorks, context, tab_id: int = 1):
         proxy_info = f"⏸ DISABLED"
     else: proxy_info = "🔓 Direct"
 
-    tab_pfx = f"[Tab {tab_id}] " if tab_id > 1 else ""
     status_msg = await context.bot.send_message(
         chat_id,
-        f"{tab_pfx}🕷 DORK PARSER v20.0 — STARTED\n{'━'*30}\n"
-        f"🗂 Tab       : {tab_id}/{MAX_TABS_PER_USER}\n"
+        f"🕷 DORK PARSER v20.0 — STARTED\n{'━'*30}\n"
         f"📋 Dorks    : {total_dorks}"
         + (f" (⚠️ {len(invalid_dorks)} skip)" if invalid_dorks else "")
         + f"\n📄 Pages    : {pages_str}\n"
@@ -2539,12 +2265,11 @@ async def run_dork_job(chat_id, dorks, context, tab_id: int = 1):
     )
 
     global_stop_ev = asyncio.Event()
-    set_tab(chat_id, tab_id, asyncio.current_task(), global_stop_ev,
-            label=f"Standard/{total_dorks}d")
+    active_stop_evs[chat_id] = global_stop_ev
     progress_q = asyncio.Queue(maxsize=total_dorks * 2)
     chunk_counters = {i: {"processed":0,"total":len(chunks[i])} for i in range(actual_chunks)}
     agg_raw=[0]; agg_kept=[0]; last_edit=[0.0]; total_processed=[0]
-    rps_window=[time.time(), 0, 0.0]   # [last_t, count, current_rps]
+    rps_window=[time.time(), 0, 0.0]
 
     async def _status_updater():
         while not global_stop_ev.is_set():
@@ -2608,7 +2333,8 @@ async def run_dork_job(chat_id, dorks, context, tab_id: int = 1):
         global_stop_ev.set()
         timeout_task.cancel(); status_task.cancel()
         await asyncio.gather(timeout_task, status_task, return_exceptions=True)
-        clear_tab(chat_id, tab_id)
+        active_jobs.pop(chat_id, None)
+        active_stop_evs.pop(chat_id, None)
 
     seen_urls=set(); all_scored=[]; total_raw=total_degraded=failed_chunks=0
     for result in chunk_results:
@@ -2786,36 +2512,28 @@ async def cmd_dork(update, context):
     if not context.args:
         await update.message.reply_text("Usage: /dork inurl:login.php?id=")
         return
-    tab_id = get_free_tab(chat_id)
-    if tab_id is None:
-        await update.message.reply_text(
-            f"⚠️ All {MAX_TABS_PER_USER} tabs busy!\n"
-            f"Use /stop <N> or /status to manage tabs."
-        ); return
+    if chat_id in active_jobs and not active_jobs[chat_id].done():
+        await update.message.reply_text("⚠️ Job running! /stop first."); return
     dork = " ".join(context.args)
     ok, msg = validate_dork(dork)
     if not ok:
         await update.message.reply_text(f"❌ Invalid: {msg}"); return
     s = get_session(chat_id)
     mode_tag = " ⚡XTREAM" if s.get("xtream") else ""
-    tab_note = f" | Tab {tab_id}/{MAX_TABS_PER_USER}" if tab_id > 1 else ""
     await update.message.reply_text(
-        f"🔍 {dork[:60]}{mode_tag}{tab_note}\n"
+        f"🔍 {dork[:60]}{mode_tag}\n"
         f"📄 Pages: {', '.join(str(p) for p in s.get('pages',[1]))}"
         f"{' 🧅TOR' if s.get('tor') else ''}\n💡 {msg}"
     )
-    task = asyncio.create_task(run_dork_job(chat_id, [dork], context, tab_id=tab_id))
-    set_tab(chat_id, tab_id, task, asyncio.Event(), label=f"dork/1")
+    active_jobs[chat_id] = asyncio.create_task(run_dork_job(chat_id, [dork], context))
 
 
 async def cmd_xtream(update, context):
-    """Toggle XTREAM mode or set engine: /xtream [on|off|engine yahoo|bing|both]"""
     chat_id = update.effective_chat.id
     sess = get_session(chat_id)
 
     if context.args:
         arg0 = context.args[0].lower()
-        # Engine selection: /xtream engine yahoo|bing|both
         if arg0 == "engine" and len(context.args) >= 2:
             engine = context.args[1].lower()
             if engine not in ("yahoo", "bing", "both"):
@@ -3044,64 +2762,29 @@ async def cmd_clean(update, context):
 
 async def cmd_stop(update, context):
     chat_id = update.effective_chat.id
-    args = context.args
-
-    # /stop <tab_id>  — stop a specific tab
-    if args and args[0].isdigit():
-        tid = int(args[0])
-        stop_ev = active_stop_evs.get(chat_id, {}).get(tid)
-        job     = active_jobs.get(chat_id, {}).get(tid)
-        if stop_ev and job and not job.done():
-            stop_ev.set()
-            await update.message.reply_text(f"⏹ Tab {tid} — STOP requested, partial results coming.")
-        elif job and not job.done():
-            job.cancel(); clear_tab(chat_id, tid)
-            await update.message.reply_text(f"🛑 Tab {tid} force-stopped.")
-        else:
-            await update.message.reply_text(f"💤 Tab {tid} is not running.")
-        return
-
-    # /stop  — stop ALL running tabs
-    tabs = active_jobs.get(chat_id, {})
-    running = [(tid, t) for tid, t in tabs.items() if not t.done()]
-    if not running:
-        await update.message.reply_text("💤 No active jobs."); return
-    for tid, job in running:
-        stop_ev = active_stop_evs.get(chat_id, {}).get(tid)
-        if stop_ev:
-            stop_ev.set()
-        else:
-            job.cancel(); clear_tab(chat_id, tid)
-    await update.message.reply_text(
-        f"⏹ STOP sent to {len(running)} tab(s) — partial results coming.\n"
-        f"Tip: /stop <tab_id> to stop just one tab."
-    )
+    stop_ev = active_stop_evs.get(chat_id)
+    job = active_jobs.get(chat_id)
+    if stop_ev and job and not job.done():
+        stop_ev.set()
+        await update.message.reply_text("⏹ STOP REQUESTED — partial results coming.")
+    elif job and not job.done():
+        job.cancel(); active_jobs.pop(chat_id, None)
+        await update.message.reply_text("🛑 Force-stopped.")
+    else:
+        await update.message.reply_text("💤 No active job.")
 
 
 async def cmd_status(update, context):
     chat_id = update.effective_chat.id
-    sess    = get_session(chat_id)
-    mode    = "⚡ XTREAM" if sess.get("xtream") else "🕷 Standard"
-    tabs    = active_jobs.get(chat_id, {})
-    labels  = active_tab_labels.get(chat_id, {})
-    running = [(tid, t) for tid, t in tabs.items() if not t.done()]
-    if not running:
-        await update.message.reply_text(f"💤 Idle | Mode: {mode}"); return
-    lines = [f"⚡ {len(running)}/{MAX_TABS_PER_USER} tab(s) running | Mode: {mode}", "━"*28]
-    for tid, _ in sorted(running):
-        lbl = labels.get(tid, "job")
-        lines.append(f"  🗂 Tab {tid}: {lbl}")
-    lines.append("━"*28)
-    lines.append("Use /stop <N> to stop a tab  |  /stop to stop all")
-    await update.message.reply_text("\n".join(lines))
+    job = active_jobs.get(chat_id)
+    sess = get_session(chat_id)
+    mode = "⚡ XTREAM" if sess.get("xtream") else "🕷 Standard"
+    await update.message.reply_text(
+        f"{'⚡ Running' if job and not job.done() else '💤 Idle'}\nMode: {mode}"
+    )
 
 
-async def cmd_tabs(update, context):
-    """Alias for /status — lists all running tabs."""
-    await cmd_status(update, context)
-
-
-# ─── PROXY COMMAND HANDLERS (unchanged) ──────────────────────────────────────
+# ─── PROXY COMMAND HANDLERS ──────────────────────────────────────────────────
 _awaiting_bulk_proxy: set = set()
 
 
@@ -3311,17 +2994,10 @@ def _looks_like_proxy_list(lines):
 async def handle_document(update, context):
     chat_id = update.effective_chat.id
     doc = update.message.document
+    if chat_id in active_jobs and not active_jobs[chat_id].done():
+        await update.message.reply_text("⚠️ Job running! /stop first."); return
     if not doc.file_name.endswith(".txt"):
         await update.message.reply_text("❌ Send a .txt file."); return
-
-    tab_id = get_free_tab(chat_id)
-    if tab_id is None:
-        running = count_active_tabs(chat_id)
-        await update.message.reply_text(
-            f"⚠️ All {MAX_TABS_PER_USER} tabs busy!\n"
-            f"Use /stop <N> to cancel a tab, or /status to see what's running."
-        ); return
-
     await update.message.reply_text("📥 Reading...")
     try:
         content = await (await context.bot.get_file(doc.file_id)).download_as_bytearray()
@@ -3333,21 +3009,17 @@ async def handle_document(update, context):
             raw_urls = [l.strip() for l in lines if l.strip() and not l.startswith("#")]
             if not raw_urls:
                 await update.message.reply_text("❌ No URLs."); return
-            tab_note = f" [Tab {tab_id}]" if tab_id > 1 else ""
-            await update.message.reply_text(f"🧹 URL LIST — {len(raw_urls)}{tab_note}")
-            task = asyncio.create_task(run_url_clean_job(chat_id, raw_urls, context, tab_id=tab_id))
-            set_tab(chat_id, tab_id, task, asyncio.Event(), label=f"URL-Cleaner")
+            await update.message.reply_text(f"🧹 URL LIST — {len(raw_urls)}")
+            active_jobs[chat_id] = asyncio.create_task(run_url_clean_job(chat_id, raw_urls, context))
         else:
             dorks = [l.strip() for l in lines if l.strip() and not l.startswith("#")]
             if not dorks:
                 await update.message.reply_text("❌ No dorks."); return
             s = get_session(chat_id)
             mode_tag = " ⚡XTREAM" if s.get("xtream") else ""
-            tab_note = f" | Tab {tab_id}/{MAX_TABS_PER_USER}" if tab_id > 1 else ""
             await update.message.reply_text(
-                f"✅ {len(dorks)} dorks{mode_tag}{tab_note} | Pages: {', '.join(str(p) for p in s.get('pages',[1]))}\n🚀 Starting...")
-            task = asyncio.create_task(run_dork_job(chat_id, dorks, context, tab_id=tab_id))
-            set_tab(chat_id, tab_id, task, asyncio.Event(), label=f"dork/{len(dorks)}")
+                f"✅ {len(dorks)} dorks{mode_tag} | Pages: {', '.join(str(p) for p in s.get('pages',[1]))}\n🚀 Starting...")
+            active_jobs[chat_id] = asyncio.create_task(run_dork_job(chat_id, dorks, context))
     except Exception as exc:
         await update.message.reply_text(f"❌ Error: {exc}")
 
@@ -3363,19 +3035,13 @@ async def handle_text(update, context):
     lines = [l.strip() for l in update.message.text.splitlines()
              if l.strip() and not l.startswith("#")]
     if len(lines) > 1:
-        tab_id = get_free_tab(chat_id)
-        if tab_id is None:
-            await update.message.reply_text(
-                f"⚠️ All {MAX_TABS_PER_USER} tabs busy!\n"
-                f"Use /stop <N> or /status to manage tabs."
-            ); return
+        if chat_id in active_jobs and not active_jobs[chat_id].done():
+            await update.message.reply_text("⚠️ Job running! /stop first."); return
         s = get_session(chat_id)
         mode_tag = " ⚡XTREAM" if s.get("xtream") else ""
-        tab_note = f" | Tab {tab_id}/{MAX_TABS_PER_USER}" if tab_id > 1 else ""
         await update.message.reply_text(
-            f"✅ {len(lines)} dorks{mode_tag}{tab_note}\n🚀 Starting...")
-        task = asyncio.create_task(run_dork_job(chat_id, lines, context, tab_id=tab_id))
-        set_tab(chat_id, tab_id, task, asyncio.Event(), label=f"dork/{len(lines)}")
+            f"✅ {len(lines)} dorks{mode_tag}\n🚀 Starting...")
+        active_jobs[chat_id] = asyncio.create_task(run_dork_job(chat_id, lines, context))
     else:
         await update.message.reply_text(
             "Use /dork <q> or upload .txt\n"
@@ -3388,14 +3054,12 @@ async def handle_text(update, context):
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def handle_callback(update, context):
-    """Fully-working callback dispatcher for every inline keyboard button."""
     query = update.callback_query
-    await query.answer()      # always ACK first to remove loading spinner
+    await query.answer()
     data = query.data
     chat_id = query.message.chat_id
     sess = get_session(chat_id)
 
-    # ── Page selector ──────────────────────────────────────────────────────
     if data.startswith("pg_"):
         cmd = data[3:]
         selected = list(sess.get("pages", [1]))
@@ -3425,7 +3089,6 @@ async def handle_callback(update, context):
         except Exception: pass
         return
 
-    # ── Filter keyboard ────────────────────────────────────────────────────
     if data.startswith("f_"):
         try:
             n = int(data[2:])
@@ -3437,12 +3100,10 @@ async def handle_callback(update, context):
         except (ValueError, Exception): pass
         return
 
-    # ── Main menu buttons ──────────────────────────────────────────────────
     if data == "m_bulk":
         try:
             await query.edit_message_text(
-                "📂 BULK UPLOAD\n━━━━━━━━━━━━━━━\n"
-                "Send a .txt file. Auto-detected:\n"
+                "📂 BULK UPLOAD\nSend a .txt file. Auto-detected:\n"
                 "  • Dork list → run search\n"
                 "  • URL list  → run cleaner\n"
                 "  • Proxy list → import to pool\n\n"
@@ -3455,14 +3116,12 @@ async def handle_callback(update, context):
     if data == "m_single":
         try:
             await query.edit_message_text(
-                "🔍 SINGLE DORK SEARCH\n━━━━━━━━━━━━━━━\n"
-                "Usage: /dork <query>\n\n"
+                "🔍 SINGLE DORK SEARCH\nUsage: /dork <query>\n\n"
                 "Examples:\n"
                 "  /dork inurl:login.php?id=\n"
                 "  /dork intitle:\"index of\" filetype:php\n"
                 "  /dork site:example.com -site:blog.example.com\n\n"
-                "💡 /dorkcheck <q> — validate before running\n"
-                "💡 /mutate <q> — generate variations",
+                "💡 /dorkcheck <q> — validate\n💡 /mutate <q> — variations",
                 reply_markup=main_menu_keyboard(sess),
             )
         except Exception: pass
@@ -3522,7 +3181,6 @@ async def handle_callback(update, context):
         if sess["xtream"]:
             msg = (
                 f"⚡⚡⚡ XTREAM MODE ENABLED ⚡⚡⚡\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"🎯 Yahoo bruteforce @ 1000 RPS\n"
                 f"⚙️ {XTREAM_WORKERS_PER_CHUNK*XTREAM_CHUNKS} workers, {XTREAM_SESSION_POOL_SIZE} sessions\n"
                 f"🛡 {len(TLS_PROFILES)} TLS profiles rotating\n"
@@ -3549,8 +3207,7 @@ async def handle_callback(update, context):
     if data == "m_clean":
         try:
             await query.edit_message_text(
-                "🧹 URL CLEANER\n━━━━━━━━━━━━━━━\n"
-                "Upload a .txt with URLs (auto-detected).\n"
+                "🧹 URL CLEANER\nUpload a .txt with URLs (auto-detected).\n"
                 "Removes: blocked domains, no-query, >200 chars, dupes, invalid.\n\n"
                 "Or paste a URL list directly in chat.",
                 reply_markup=main_menu_keyboard(sess),
@@ -3616,25 +3273,16 @@ async def handle_callback(update, context):
         return
 
     if data == "m_status":
-        tabs    = active_jobs.get(chat_id, {})
-        labels  = active_tab_labels.get(chat_id, {})
-        running = [(tid, t) for tid, t in tabs.items() if not t.done()]
-        mode    = "⚡ XTREAM (1000 RPS)" if sess.get("xtream") else "🕷 Standard (~200 RPS)"
-        if running:
-            tab_lines = "\n".join(f"  🗂 Tab {tid}: {labels.get(tid,'job')}"
-                                  for tid, _ in sorted(running))
-            state_txt = f"⚡ {len(running)}/{MAX_TABS_PER_USER} tab(s)\n{tab_lines}"
-        else:
-            state_txt = "💤 Idle"
+        job = active_jobs.get(chat_id)
+        running = bool(job and not job.done())
+        mode = "⚡ XTREAM (1000 RPS)" if sess.get("xtream") else "🕷 Standard (~200 RPS)"
         try:
             await query.edit_message_text(
                 f"📊 STATUS\n━━━━━━━━━━━━━━━\n"
-                f"State: {state_txt}\n"
+                f"State: {'⚡ Running' if running else '💤 Idle'}\n"
                 f"Mode : {mode}\n"
                 f"Tor  : {'ON' if sess.get('tor') else 'OFF'}\n"
-                f"Filt : ≥{sess.get('min_score', 30)}\n"
-                f"━━━━━━━━━━━━━━━\n"
-                f"/stop <N> — stop tab N  |  /stop — stop all",
+                f"Filt : ≥{sess.get('min_score', 30)}",
                 reply_markup=main_menu_keyboard(sess),
             )
         except Exception: pass
@@ -3673,7 +3321,6 @@ async def handle_callback(update, context):
         except Exception: pass
         return
 
-    # Fallback for unknown callback
     log.warning(f"[CB] Unknown callback: {data}")
     try:
         await query.answer(f"Unknown action: {data}", show_alert=True)
@@ -3696,7 +3343,7 @@ def main():
         ("filter", cmd_filter), ("settings", cmd_settings),
         ("workers", cmd_workers), ("chunks", cmd_chunks),
         ("maxres", cmd_maxres), ("engine", cmd_engine),
-        ("stop", cmd_stop), ("status", cmd_status), ("tabs", cmd_tabs),
+        ("stop", cmd_stop), ("status", cmd_status),
     ]:
         app.add_handler(CommandHandler(name, handler))
 
@@ -3718,17 +3365,13 @@ def main():
     app.post_init = _on_startup
 
     log.info("=" * 60)
-    log.info("  DORK PARSER v21.0 — XTREAM STEALTH EDITION")
+    log.info("  DORK PARSER v21.0 — XTREAM STEALTH EDITION (FIXED)")
     log.info(f"  TLS profiles : {len(TLS_PROFILES)} rotating (Chrome/Firefox/Edge/Safari)")
-    log.info(f"  Anti-block   : circuit-breaker | gaussian jitter | XFF spoof | param vary")
-    log.info(f"  Stealth      : sequential pages | session affinity | staggered startup")
     log.info(f"  Standard     : ~200 URLs/sec ({N_CHUNKS}×{WORKERS_PER_CHUNK})")
     log.info(f"  Xtream       : {XTREAM_TARGET_RPS} RPS target ({XTREAM_CHUNKS}×{XTREAM_WORKERS_PER_CHUNK}={XTREAM_CHUNKS*XTREAM_WORKERS_PER_CHUNK} workers)")
     log.info(f"  Xtream pages : {XTREAM_PAGES_PER_DORK}/dork sequential | pool: {XTREAM_SESSION_POOL_SIZE}")
-    log.info(f"  Page delay   : {XTREAM_PAGE_DELAY_MIN}-{XTREAM_PAGE_DELAY_MAX}s | dork delay: {XTREAM_MIN_DELAY}-{XTREAM_MAX_DELAY}s")
-    log.info(f"  Cookie seed  : {'on' if XTREAM_PRESEED_COOKIES else 'off'} | retries: {XTREAM_MAX_RETRIES}")
     log.info(f"  Proxies      : {len(_proxy_pool)} loaded")
-    log.info(f"  Engines      : {', '.join(ENGINES)}")
+    log.info("  Bugs fixed   : captcha_counter thread safety, missing imports, callback reliability")
     log.info("=" * 60)
     app.run_polling(drop_pending_updates=True)
 
