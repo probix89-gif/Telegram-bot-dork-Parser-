@@ -73,20 +73,23 @@ EMPTY_RATE_RECOVER   = 0.40
 CHUNK_STAGGER_DELAY  = (0.1, 0.4)                                   # ↓ from (0.8, 2.5)
 
 # ─── XTREAM MODE CONFIG ──────────────────────────────────────────────────────
-XTREAM_WORKERS_PER_CHUNK   = 50      # parallel workers per chunk
-XTREAM_CHUNKS              = 8       # parallel chunks
-XTREAM_MIN_DELAY           = 0.01    # almost no delay
-XTREAM_MAX_DELAY           = 0.05
-XTREAM_TIMEOUT             = 20      # increased for reliability
-XTREAM_MAX_RETRIES         = 2       # extra retry before giving up
-XTREAM_TARGET_RPS          = 1000    # target requests/sec
-XTREAM_PAGES_PER_DORK      = 8       # deeper per-dork crawl
-XTREAM_SESSION_POOL_SIZE   = 200     # pre-warmed session pool
-XTREAM_SESSION_MAX_USES    = 30      # rotate session after N uses
-XTREAM_SESSION_MAX_AGE     = 240     # rotate session after 4 minutes
-XTREAM_POOL_BATCH_SIZE     = 20      # parallel batch size during pool init
-XTREAM_CAPTCHA_RATE_LIMIT  = 0.25    # throttle concurrency if captcha rate > 25%
+XTREAM_WORKERS_PER_CHUNK   = 12      # parallel workers per chunk (stealth: was 50)
+XTREAM_CHUNKS              = 6       # parallel chunks (stealth: was 8) → 72 workers
+XTREAM_MIN_DELAY           = 1.2     # min inter-dork delay per worker (human reading time)
+XTREAM_MAX_DELAY           = 3.5     # max inter-dork delay per worker
+XTREAM_PAGE_DELAY_MIN      = 0.8     # min delay between sequential pages
+XTREAM_PAGE_DELAY_MAX      = 2.2     # max delay between sequential pages
+XTREAM_TIMEOUT             = 20      # request timeout
+XTREAM_MAX_RETRIES         = 2       # retries before giving up
+XTREAM_TARGET_RPS          = 250     # realistic stealth target RPS
+XTREAM_PAGES_PER_DORK      = 5       # pages per dork (sequential, not parallel)
+XTREAM_SESSION_POOL_SIZE   = 100     # pre-warmed sessions (matches worker count + headroom)
+XTREAM_SESSION_MAX_USES    = 25      # rotate session after N uses
+XTREAM_SESSION_MAX_AGE     = 180     # rotate session after 3 minutes
+XTREAM_POOL_BATCH_SIZE     = 15      # parallel batch size during pool init
+XTREAM_CAPTCHA_RATE_LIMIT  = 0.15    # throttle if captcha rate > 15%
 XTREAM_PRESEED_COOKIES     = True    # visit homepage to warm cookies before searching
+XTREAM_WORKER_START_JITTER = 0.25    # seconds between each worker starting (stagger burst)
 
 DEFAULT_SESSION = {
     "workers":       WORKERS_PER_CHUNK,
@@ -1815,107 +1818,168 @@ BING_XTREAM_MARKETS = ["en-US", "en-GB", "en-CA", "en-AU", "en-IN", "en-SG", "en
 
 
 async def xtream_fetch_yahoo(pool: XtreamSessionPool, dork: str, page: int,
-                              max_res: int, worker_id: int) -> tuple[list, bool, bool]:
+                              max_res: int, worker_id: int,
+                              sess=None) -> tuple[list, bool, bool]:
     """
-    Single Yahoo fetch in xtream mode.
+    Single Yahoo fetch in xtream mode — stealth edition.
     Returns (urls, was_burned, was_captcha).
+    If `sess` is provided the caller owns session lifetime (no acquire/release).
     """
-    sess = await pool.acquire()
+    owned  = sess is None
     burned = False; captcha = False
+    if owned:
+        sess = await pool.acquire()
     try:
         endpoint = random.choice(YAHOO_ENDPOINTS)
         referer  = random.choice(YAHOO_REFERERS)
         profile  = getattr(sess, "_tls_profile", None) or get_tls_profile("weighted")
         headers  = build_headers_from_profile(profile, referer=referer)
-        params   = {
-            "p": translate_dork(dork, "yahoo"),
-            "b": (page - 1) * 10 + 1,
+        spoof_xff_headers(headers, probability=0.35)
+
+        base_params = {
+            "p":  translate_dork(dork, "yahoo"),
+            "b":  (page - 1) * 10 + 1,
             "pz": min(max_res, 10),
             "vl": "lang_en",
-            "fr": random.choice(["yfp-t", "uh3_search_web", "sfp", "yfp-t-s"]),
         }
+        params = vary_yahoo_params(base_params)
+
+        # Circuit breaker check
+        wait = await circuit_breaker.check(endpoint)
+        if wait > 0:
+            await asyncio.sleep(min(wait, 25.0))
+
         for attempt in range(XTREAM_MAX_RETRIES + 1):
             try:
                 resp = await sess.get(endpoint, params=params, headers=headers,
                                        timeout=XTREAM_TIMEOUT)
                 html = resp.text
-                if resp.status_code == 429:
+                sc   = resp.status_code
+                if sc == 429:
                     burned = True
+                    await circuit_breaker.record(endpoint, blocked=True)
                     return [], True, False
-                if resp.status_code != 200:
+                if sc in (403, 503):
+                    burned = True
+                    await circuit_breaker.record(endpoint, blocked=True)
+                    if attempt < XTREAM_MAX_RETRIES:
+                        await asyncio.sleep(humanize_delay(2.0))
+                        continue
+                    return [], True, False
+                if sc != 200:
+                    await circuit_breaker.record(endpoint, blocked=False)
                     return [], False, False
                 if _is_captcha(html):
                     captcha = True; burned = True
+                    await circuit_breaker.record(endpoint, blocked=True)
                     return [], True, True
                 if _is_degraded(html, "yahoo"):
-                    if attempt < XTREAM_MAX_RETRIES: continue
+                    await circuit_breaker.record(endpoint, blocked=True)
+                    if attempt < XTREAM_MAX_RETRIES:
+                        await asyncio.sleep(humanize_delay(1.5))
+                        continue
                     return [], False, False
+                await circuit_breaker.record(endpoint, blocked=False)
                 urls = _yahoo_link_extractor(html)
                 urls = [u for u in urls if u.startswith("http")
                         and not _YAHOO_NOISE.search(u) and not _STATIC_EXT.search(u)]
                 return list(dict.fromkeys(urls))[:max_res], False, False
             except (asyncio.TimeoutError, CurlError):
-                if attempt < XTREAM_MAX_RETRIES: continue
+                await circuit_breaker.record(endpoint, blocked=True)
+                if attempt < XTREAM_MAX_RETRIES:
+                    await asyncio.sleep(humanize_delay(1.0))
+                    continue
                 return [], False, False
             except Exception as exc:
-                log.debug(f"[XTREAM:W{worker_id}] {exc}")
+                log.debug(f"[XTREAM:Y:W{worker_id}] {exc}")
                 return [], False, False
         return [], False, False
     finally:
-        await pool.release(sess, burned=burned)
+        if owned:
+            await pool.release(sess, burned=burned)
 
 
 async def xtream_fetch_bing(pool: XtreamSessionPool, dork: str, page: int,
-                             max_res: int, worker_id: int) -> tuple[list, bool, bool]:
+                             max_res: int, worker_id: int,
+                             sess=None) -> tuple[list, bool, bool]:
     """
-    Single Bing fetch in xtream mode.
+    Single Bing fetch in xtream mode — stealth edition.
     Returns (urls, was_burned, was_captcha).
+    If `sess` is provided the caller owns session lifetime.
     """
-    sess = await pool.acquire()
+    owned  = sess is None
     burned = False; captcha = False
+    if owned:
+        sess = await pool.acquire()
     try:
         endpoint = random.choice(BING_XTREAM_ENDPOINTS)
         referer  = random.choice(BING_XTREAM_REFERERS)
         profile  = getattr(sess, "_tls_profile", None) or get_tls_profile("weighted")
         headers  = build_headers_from_profile(profile, referer=referer)
-        params   = {
+        spoof_xff_headers(headers, probability=0.35)
+
+        base_params = {
             "q":       translate_dork(dork, "bing"),
             "count":   min(max_res, 10),
             "first":   (page - 1) * 10 + 1,
             "setlang": "en",
             "mkt":     random.choice(BING_XTREAM_MARKETS),
-            "form":    random.choice(["QBLH", "QBRE", "SBSD", "NMSP"]),
         }
+        params = vary_bing_params(base_params)
+
+        # Circuit breaker check
+        wait = await circuit_breaker.check(endpoint)
+        if wait > 0:
+            await asyncio.sleep(min(wait, 25.0))
+
         for attempt in range(XTREAM_MAX_RETRIES + 1):
             try:
                 resp = await sess.get(endpoint, params=params, headers=headers,
                                       timeout=XTREAM_TIMEOUT)
                 html = resp.text
-                if resp.status_code == 429:
+                sc   = resp.status_code
+                if sc == 429:
                     burned = True
+                    await circuit_breaker.record(endpoint, blocked=True)
                     return [], True, False
-                if resp.status_code not in (200,):
-                    if attempt < XTREAM_MAX_RETRIES: continue
+                if sc in (403, 503):
+                    burned = True
+                    await circuit_breaker.record(endpoint, blocked=True)
+                    if attempt < XTREAM_MAX_RETRIES:
+                        await asyncio.sleep(humanize_delay(2.0))
+                        continue
+                    return [], True, False
+                if sc not in (200,):
+                    await circuit_breaker.record(endpoint, blocked=False)
                     return [], False, False
                 if _is_captcha(html):
                     captcha = True; burned = True
+                    await circuit_breaker.record(endpoint, blocked=True)
                     return [], True, True
                 if _is_degraded(html, "bing"):
-                    if attempt < XTREAM_MAX_RETRIES: continue
+                    await circuit_breaker.record(endpoint, blocked=True)
+                    if attempt < XTREAM_MAX_RETRIES:
+                        await asyncio.sleep(humanize_delay(1.5))
+                        continue
                     return [], False, False
+                await circuit_breaker.record(endpoint, blocked=False)
                 urls = _extract_links(html)
                 urls = [u for u in urls if u.startswith("http")
                         and not _BING_NOISE.search(u) and not _STATIC_EXT.search(u)]
                 return list(dict.fromkeys(urls))[:max_res], False, False
             except (asyncio.TimeoutError, CurlError):
-                if attempt < XTREAM_MAX_RETRIES: continue
+                await circuit_breaker.record(endpoint, blocked=True)
+                if attempt < XTREAM_MAX_RETRIES:
+                    await asyncio.sleep(humanize_delay(1.0))
+                    continue
                 return [], False, False
             except Exception as exc:
-                log.debug(f"[XTREAM:BING:W{worker_id}] {exc}")
+                log.debug(f"[XTREAM:B:W{worker_id}] {exc}")
                 return [], False, False
         return [], False, False
     finally:
-        await pool.release(sess, burned=burned)
+        if owned:
+            await pool.release(sess, burned=burned)
 
 
 async def xtream_worker(wid: int, queue: asyncio.Queue, results_q: asyncio.Queue,
@@ -1925,12 +1989,17 @@ async def xtream_worker(wid: int, queue: asyncio.Queue, results_q: asyncio.Queue
                           xtream_engine: str,
                           captcha_counter: list):
     """
-    High-speed XTREAM worker supporting Yahoo, Bing, or both engines.
-    Uses per-worker adaptive cooldown instead of a shared burn event (no race conditions).
+    Stealth XTREAM worker — pages are fetched SEQUENTIALLY with human-like delays,
+    and each dork owns one session for the full page run (session affinity).
+    Workers stagger their startup to prevent the initial burst spike.
     """
+    # ── Stagger startup: spread workers over time to avoid burst detection ──
+    await asyncio.sleep(humanize_delay(wid * XTREAM_WORKER_START_JITTER,
+                                       sigma_ratio=0.3, distraction_prob=0.0))
+
     consecutive_fails = 0
     cooldown_until    = 0.0
-    engine_toggle     = wid % 2  # for "both" mode: even workers → yahoo, odd → bing
+    engine_toggle     = wid % 2
 
     while not stop_ev.is_set():
         try:
@@ -1938,10 +2007,13 @@ async def xtream_worker(wid: int, queue: asyncio.Queue, results_q: asyncio.Queue
         except asyncio.TimeoutError:
             continue
 
-        # Per-worker cooldown after burns
+        # Per-worker cooldown after burns (exponential, capped)
         now = time.time()
         if cooldown_until > now:
             await asyncio.sleep(cooldown_until - now)
+            if stop_ev.is_set():
+                queue.task_done()
+                break
 
         # Pick engine for this dork
         if xtream_engine == "both":
@@ -1953,28 +2025,36 @@ async def xtream_worker(wid: int, queue: asyncio.Queue, results_q: asyncio.Queue
         fetch_fn = xtream_fetch_yahoo if use_engine == "yahoo" else xtream_fetch_bing
         tag      = f"{use_engine}-xtream"
 
-        # Crawl multiple pages per dork in parallel (limited by rate_limiter)
-        page_tasks = []
-        for page in range(1, pages_per_dork + 1):
-            async def _do(p=page, fn=fetch_fn):
-                async with rate_limiter:
-                    return await fn(pool, dork, p, max_res, wid)
-            page_tasks.append(asyncio.create_task(_do()))
-
+        # ── Session affinity: one session owns the full page sweep ───────────
+        sess = await pool.acquire()
         all_urls = []; any_burned = False; any_captcha = False
+
         try:
-            page_results = await asyncio.wait_for(
-                asyncio.gather(*page_tasks, return_exceptions=True),
-                timeout=XTREAM_TIMEOUT * 3,
-            )
-            for r in page_results:
-                if isinstance(r, tuple):
-                    urls, burned, captcha = r
-                    all_urls.extend(urls)
-                    if burned: any_burned = True
-                    if captcha: any_captcha = True
-        except asyncio.TimeoutError:
-            for t in page_tasks: t.cancel()
+            for page in range(1, pages_per_dork + 1):
+                if stop_ev.is_set() or any_burned:
+                    break
+                async with rate_limiter:
+                    urls, burned, captcha = await fetch_fn(
+                        pool, dork, page, max_res, wid, sess=sess
+                    )
+                all_urls.extend(urls)
+                if burned:
+                    any_burned = True
+                    break
+                if captcha:
+                    any_captcha = True
+                    any_burned  = True   # treat captcha as burn — retire session
+                    break
+                # Human-like inter-page delay (reading the results)
+                if page < pages_per_dork and not stop_ev.is_set():
+                    delay = humanize_delay(
+                        random.uniform(XTREAM_PAGE_DELAY_MIN, XTREAM_PAGE_DELAY_MAX),
+                        sigma_ratio=0.25,
+                        distraction_prob=0.03,
+                    )
+                    await asyncio.sleep(delay)
+        finally:
+            await pool.release(sess, burned=any_burned)
 
         scored = filter_scored(all_urls, min_score)
         try:
@@ -1989,16 +2069,20 @@ async def xtream_worker(wid: int, queue: asyncio.Queue, results_q: asyncio.Queue
 
         if any_burned:
             consecutive_fails += 1
-            # Exponential backoff per worker — no shared event, no race
-            backoff = min(consecutive_fails * 1.5, 15.0)
+            # Exponential back-off, Gaussian jitter, capped at 30s
+            backoff = min(consecutive_fails * 2.0, 30.0)
             cooldown_until = time.time() + backoff
-            await asyncio.sleep(random.uniform(backoff * 0.5, backoff))
+            await asyncio.sleep(humanize_delay(backoff, sigma_ratio=0.2))
         elif all_urls:
-            consecutive_fails = 0
-            await asyncio.sleep(random.uniform(XTREAM_MIN_DELAY, XTREAM_MAX_DELAY))
+            consecutive_fails = max(0, consecutive_fails - 1)
+            # Human reading-time delay between dorks
+            await asyncio.sleep(humanize_delay(
+                random.uniform(XTREAM_MIN_DELAY, XTREAM_MAX_DELAY),
+                sigma_ratio=0.3,
+            ))
         else:
             consecutive_fails += 1
-            await asyncio.sleep(random.uniform(0.05, 0.2))
+            await asyncio.sleep(humanize_delay(0.5, sigma_ratio=0.4))
 
 
 async def run_xtream_job(chat_id: int, dorks: list, context):
@@ -3524,12 +3608,14 @@ def main():
     app.post_init = _on_startup
 
     log.info("=" * 60)
-    log.info("  DORK PARSER v21.0 — XTREAM EDITION")
+    log.info("  DORK PARSER v21.0 — XTREAM STEALTH EDITION")
     log.info(f"  TLS profiles : {len(TLS_PROFILES)} rotating (Chrome/Firefox/Edge/Safari)")
     log.info(f"  Anti-block   : circuit-breaker | gaussian jitter | XFF spoof | param vary")
+    log.info(f"  Stealth      : sequential pages | session affinity | staggered startup")
     log.info(f"  Standard     : ~200 URLs/sec ({N_CHUNKS}×{WORKERS_PER_CHUNK})")
-    log.info(f"  Xtream       : {XTREAM_TARGET_RPS} RPS target ({XTREAM_CHUNKS}×{XTREAM_WORKERS_PER_CHUNK})")
-    log.info(f"  Xtream pages : {XTREAM_PAGES_PER_DORK}/dork | pool: {XTREAM_SESSION_POOL_SIZE}")
+    log.info(f"  Xtream       : {XTREAM_TARGET_RPS} RPS target ({XTREAM_CHUNKS}×{XTREAM_WORKERS_PER_CHUNK}={XTREAM_CHUNKS*XTREAM_WORKERS_PER_CHUNK} workers)")
+    log.info(f"  Xtream pages : {XTREAM_PAGES_PER_DORK}/dork sequential | pool: {XTREAM_SESSION_POOL_SIZE}")
+    log.info(f"  Page delay   : {XTREAM_PAGE_DELAY_MIN}-{XTREAM_PAGE_DELAY_MAX}s | dork delay: {XTREAM_MIN_DELAY}-{XTREAM_MAX_DELAY}s")
     log.info(f"  Cookie seed  : {'on' if XTREAM_PRESEED_COOKIES else 'off'} | retries: {XTREAM_MAX_RETRIES}")
     log.info(f"  Proxies      : {len(_proxy_pool)} loaded")
     log.info(f"  Engines      : {', '.join(ENGINES)}")
