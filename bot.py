@@ -104,8 +104,48 @@ DEFAULT_SESSION = {
 }
 
 user_sessions:   dict = {}
+MAX_TABS_PER_USER = 3   # max simultaneous jobs per user
+
+# {chat_id: {tab_id: asyncio.Task}}    — tab_id is 1, 2, or 3
 active_jobs:     dict = {}
+# {chat_id: {tab_id: asyncio.Event}}
 active_stop_evs: dict = {}
+# {chat_id: {tab_id: str}}             — human-readable label per tab
+active_tab_labels: dict = {}
+
+
+def get_free_tab(chat_id: int) -> int | None:
+    """Return the first free tab slot (1–MAX_TABS), or None if all full."""
+    tabs = active_jobs.get(chat_id, {})
+    for tab_id in range(1, MAX_TABS_PER_USER + 1):
+        task = tabs.get(tab_id)
+        if task is None or task.done():
+            return tab_id
+    return None
+
+
+def count_active_tabs(chat_id: int) -> int:
+    """Count tabs that are still running."""
+    return sum(
+        1 for t in active_jobs.get(chat_id, {}).values()
+        if t is not None and not t.done()
+    )
+
+
+def set_tab(chat_id: int, tab_id: int, task, stop_ev, label: str = ""):
+    """Register a tab."""
+    active_jobs.setdefault(chat_id, {})[tab_id]      = task
+    active_stop_evs.setdefault(chat_id, {})[tab_id]  = stop_ev
+    active_tab_labels.setdefault(chat_id, {})[tab_id] = label
+
+
+def clear_tab(chat_id: int, tab_id: int):
+    """Remove a tab after it finishes."""
+    for d in (active_jobs, active_stop_evs, active_tab_labels):
+        if chat_id in d:
+            d[chat_id].pop(tab_id, None)
+            if not d[chat_id]:
+                d.pop(chat_id, None)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1272,10 +1312,10 @@ async def process_chunk_urls(chunk, semaphore, stop_ev):
         return filter_urls(chunk)["kept"]
 
 
-async def run_url_clean_job(chat_id, raw_lines, context):
+async def run_url_clean_job(chat_id, raw_lines, context, tab_id: int = 1):
     CLEAN_CHUNK_SIZE = 500; MAX_CONCURRENT = 4
     stop_ev = asyncio.Event()
-    active_stop_evs[chat_id] = stop_ev
+    set_tab(chat_id, tab_id, asyncio.current_task(), stop_ev, label=f"URL-Cleaner")
     total_input = len(raw_lines)
     status_msg = await context.bot.send_message(
         chat_id,
@@ -1320,8 +1360,7 @@ async def run_url_clean_job(chat_id, raw_lines, context):
                 caption=f"🧹 {len(final_urls)} kept from {total_input}")
     else:
         await context.bot.send_message(chat_id, "⚠️ No URLs passed the filters.")
-    active_stop_evs.pop(chat_id, None)
-    active_jobs.pop(chat_id, None)
+    clear_tab(chat_id, tab_id)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2085,7 +2124,7 @@ async def xtream_worker(wid: int, queue: asyncio.Queue, results_q: asyncio.Queue
             await asyncio.sleep(humanize_delay(0.5, sigma_ratio=0.4))
 
 
-async def run_xtream_job(chat_id: int, dorks: list, context):
+async def run_xtream_job(chat_id: int, dorks: list, context, tab_id: int = 1):
     """
     XTREAM MODE v21: Multi-engine (Yahoo/Bing/Both), adaptive throttle, domain stats.
     """
@@ -2101,7 +2140,7 @@ async def run_xtream_job(chat_id: int, dorks: list, context):
     total_dorks = len(valid_dorks)
     if total_dorks == 0:
         await context.bot.send_message(chat_id, "⚠️ No valid dorks.")
-        active_jobs.pop(chat_id, None); return
+        clear_tab(chat_id, tab_id); return
 
     start_time    = time.time()
     n_chunks      = XTREAM_CHUNKS
@@ -2121,9 +2160,11 @@ async def run_xtream_job(chat_id: int, dorks: list, context):
     engine_display = {"yahoo": "YAHOO (15 mirrors)", "bing": "BING (3 mirrors)",
                       "both": "YAHOO + BING"}.get(xtream_engine, xtream_engine.upper())
 
+    tab_label = f"[Tab {tab_id}] " if tab_id > 1 else ""
     status_msg = await context.bot.send_message(
         chat_id,
-        f"⚡⚡⚡ XTREAM MODE ENGAGED ⚡⚡⚡\n{'━'*30}\n"
+        f"{tab_label}⚡⚡⚡ XTREAM MODE ENGAGED ⚡⚡⚡\n{'━'*30}\n"
+        f"🗂 Tab         : {tab_id}/{MAX_TABS_PER_USER}\n"
         f"📋 Dorks      : {total_dorks}\n"
         f"🎯 Engine     : {engine_display}\n"
         f"🚀 Target RPS : {XTREAM_TARGET_RPS}/sec\n"
@@ -2140,7 +2181,8 @@ async def run_xtream_job(chat_id: int, dorks: list, context):
     queue     = asyncio.Queue(maxsize=total_dorks + 10)
     results_q = asyncio.Queue(maxsize=total_dorks * 2)
     stop_ev   = asyncio.Event()
-    active_stop_evs[chat_id] = stop_ev
+    set_tab(chat_id, tab_id, asyncio.current_task(), stop_ev,
+            label=f"XTREAM/{total_dorks}d")
 
     for d in valid_dorks:
         await queue.put(d)
@@ -2245,8 +2287,7 @@ async def run_xtream_job(chat_id: int, dorks: list, context):
         try: await timeout_task
         except Exception: pass
         await pool.close_all()
-        active_jobs.pop(chat_id, None)
-        active_stop_evs.pop(chat_id, None)
+        clear_tab(chat_id, tab_id)
 
     all_scored.sort(reverse=True)
     elapsed = int(time.time() - start_time)
@@ -2429,12 +2470,12 @@ async def run_chunk(chunk_id, dorks, engines, pages, max_res, use_tor, min_score
             "degraded_count":chunk_degraded,"processed":processed,"empty_count":empty_count}
 
 
-async def run_dork_job(chat_id, dorks, context):
+async def run_dork_job(chat_id, dorks, context, tab_id: int = 1):
     sess = get_session(chat_id)
 
     # Route to xtream mode if enabled
     if sess.get("xtream", False):
-        await run_xtream_job(chat_id, dorks, context)
+        await run_xtream_job(chat_id, dorks, context, tab_id=tab_id)
         return
 
     engines = sess.get("engines", list(ENGINES))
@@ -2454,7 +2495,7 @@ async def run_dork_job(chat_id, dorks, context):
     dorks = valid_dorks; total_dorks = len(dorks)
     if total_dorks == 0:
         await context.bot.send_message(chat_id, "⚠️ No valid dorks.")
-        active_jobs.pop(chat_id, None); return
+        clear_tab(chat_id, tab_id); return
 
     pages_str = ", ".join(str(p) for p in pages)
     start_time = time.time()
@@ -2480,9 +2521,11 @@ async def run_dork_job(chat_id, dorks, context):
         proxy_info = f"⏸ DISABLED"
     else: proxy_info = "🔓 Direct"
 
+    tab_pfx = f"[Tab {tab_id}] " if tab_id > 1 else ""
     status_msg = await context.bot.send_message(
         chat_id,
-        f"🕷 DORK PARSER v20.0 — STARTED\n{'━'*30}\n"
+        f"{tab_pfx}🕷 DORK PARSER v20.0 — STARTED\n{'━'*30}\n"
+        f"🗂 Tab       : {tab_id}/{MAX_TABS_PER_USER}\n"
         f"📋 Dorks    : {total_dorks}"
         + (f" (⚠️ {len(invalid_dorks)} skip)" if invalid_dorks else "")
         + f"\n📄 Pages    : {pages_str}\n"
@@ -2496,7 +2539,8 @@ async def run_dork_job(chat_id, dorks, context):
     )
 
     global_stop_ev = asyncio.Event()
-    active_stop_evs[chat_id] = global_stop_ev
+    set_tab(chat_id, tab_id, asyncio.current_task(), global_stop_ev,
+            label=f"Standard/{total_dorks}d")
     progress_q = asyncio.Queue(maxsize=total_dorks * 2)
     chunk_counters = {i: {"processed":0,"total":len(chunks[i])} for i in range(actual_chunks)}
     agg_raw=[0]; agg_kept=[0]; last_edit=[0.0]; total_processed=[0]
@@ -2564,8 +2608,7 @@ async def run_dork_job(chat_id, dorks, context):
         global_stop_ev.set()
         timeout_task.cancel(); status_task.cancel()
         await asyncio.gather(timeout_task, status_task, return_exceptions=True)
-        active_jobs.pop(chat_id, None)
-        active_stop_evs.pop(chat_id, None)
+        clear_tab(chat_id, tab_id)
 
     seen_urls=set(); all_scored=[]; total_raw=total_degraded=failed_chunks=0
     for result in chunk_results:
@@ -2743,20 +2786,26 @@ async def cmd_dork(update, context):
     if not context.args:
         await update.message.reply_text("Usage: /dork inurl:login.php?id=")
         return
-    if chat_id in active_jobs and not active_jobs[chat_id].done():
-        await update.message.reply_text("⚠️ Job running! /stop first."); return
+    tab_id = get_free_tab(chat_id)
+    if tab_id is None:
+        await update.message.reply_text(
+            f"⚠️ All {MAX_TABS_PER_USER} tabs busy!\n"
+            f"Use /stop <N> or /status to manage tabs."
+        ); return
     dork = " ".join(context.args)
     ok, msg = validate_dork(dork)
     if not ok:
         await update.message.reply_text(f"❌ Invalid: {msg}"); return
     s = get_session(chat_id)
     mode_tag = " ⚡XTREAM" if s.get("xtream") else ""
+    tab_note = f" | Tab {tab_id}/{MAX_TABS_PER_USER}" if tab_id > 1 else ""
     await update.message.reply_text(
-        f"🔍 {dork[:60]}{mode_tag}\n"
+        f"🔍 {dork[:60]}{mode_tag}{tab_note}\n"
         f"📄 Pages: {', '.join(str(p) for p in s.get('pages',[1]))}"
         f"{' 🧅TOR' if s.get('tor') else ''}\n💡 {msg}"
     )
-    active_jobs[chat_id] = asyncio.create_task(run_dork_job(chat_id, [dork], context))
+    task = asyncio.create_task(run_dork_job(chat_id, [dork], context, tab_id=tab_id))
+    set_tab(chat_id, tab_id, task, asyncio.Event(), label=f"dork/1")
 
 
 async def cmd_xtream(update, context):
@@ -2995,26 +3044,61 @@ async def cmd_clean(update, context):
 
 async def cmd_stop(update, context):
     chat_id = update.effective_chat.id
-    stop_ev = active_stop_evs.get(chat_id)
-    job = active_jobs.get(chat_id)
-    if stop_ev and job and not job.done():
-        stop_ev.set()
-        await update.message.reply_text("⏹ STOP REQUESTED — partial results coming.")
-    elif job and not job.done():
-        job.cancel(); active_jobs.pop(chat_id, None)
-        await update.message.reply_text("🛑 Force-stopped.")
-    else:
-        await update.message.reply_text("💤 No active job.")
+    args = context.args
+
+    # /stop <tab_id>  — stop a specific tab
+    if args and args[0].isdigit():
+        tid = int(args[0])
+        stop_ev = active_stop_evs.get(chat_id, {}).get(tid)
+        job     = active_jobs.get(chat_id, {}).get(tid)
+        if stop_ev and job and not job.done():
+            stop_ev.set()
+            await update.message.reply_text(f"⏹ Tab {tid} — STOP requested, partial results coming.")
+        elif job and not job.done():
+            job.cancel(); clear_tab(chat_id, tid)
+            await update.message.reply_text(f"🛑 Tab {tid} force-stopped.")
+        else:
+            await update.message.reply_text(f"💤 Tab {tid} is not running.")
+        return
+
+    # /stop  — stop ALL running tabs
+    tabs = active_jobs.get(chat_id, {})
+    running = [(tid, t) for tid, t in tabs.items() if not t.done()]
+    if not running:
+        await update.message.reply_text("💤 No active jobs."); return
+    for tid, job in running:
+        stop_ev = active_stop_evs.get(chat_id, {}).get(tid)
+        if stop_ev:
+            stop_ev.set()
+        else:
+            job.cancel(); clear_tab(chat_id, tid)
+    await update.message.reply_text(
+        f"⏹ STOP sent to {len(running)} tab(s) — partial results coming.\n"
+        f"Tip: /stop <tab_id> to stop just one tab."
+    )
 
 
 async def cmd_status(update, context):
     chat_id = update.effective_chat.id
-    job = active_jobs.get(chat_id)
-    sess = get_session(chat_id)
-    mode = "⚡ XTREAM" if sess.get("xtream") else "🕷 Standard"
-    await update.message.reply_text(
-        f"{'⚡ Running' if job and not job.done() else '💤 Idle'}\nMode: {mode}"
-    )
+    sess    = get_session(chat_id)
+    mode    = "⚡ XTREAM" if sess.get("xtream") else "🕷 Standard"
+    tabs    = active_jobs.get(chat_id, {})
+    labels  = active_tab_labels.get(chat_id, {})
+    running = [(tid, t) for tid, t in tabs.items() if not t.done()]
+    if not running:
+        await update.message.reply_text(f"💤 Idle | Mode: {mode}"); return
+    lines = [f"⚡ {len(running)}/{MAX_TABS_PER_USER} tab(s) running | Mode: {mode}", "━"*28]
+    for tid, _ in sorted(running):
+        lbl = labels.get(tid, "job")
+        lines.append(f"  🗂 Tab {tid}: {lbl}")
+    lines.append("━"*28)
+    lines.append("Use /stop <N> to stop a tab  |  /stop to stop all")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_tabs(update, context):
+    """Alias for /status — lists all running tabs."""
+    await cmd_status(update, context)
 
 
 # ─── PROXY COMMAND HANDLERS (unchanged) ──────────────────────────────────────
@@ -3227,10 +3311,17 @@ def _looks_like_proxy_list(lines):
 async def handle_document(update, context):
     chat_id = update.effective_chat.id
     doc = update.message.document
-    if chat_id in active_jobs and not active_jobs[chat_id].done():
-        await update.message.reply_text("⚠️ Job running! /stop first."); return
     if not doc.file_name.endswith(".txt"):
         await update.message.reply_text("❌ Send a .txt file."); return
+
+    tab_id = get_free_tab(chat_id)
+    if tab_id is None:
+        running = count_active_tabs(chat_id)
+        await update.message.reply_text(
+            f"⚠️ All {MAX_TABS_PER_USER} tabs busy!\n"
+            f"Use /stop <N> to cancel a tab, or /status to see what's running."
+        ); return
+
     await update.message.reply_text("📥 Reading...")
     try:
         content = await (await context.bot.get_file(doc.file_id)).download_as_bytearray()
@@ -3242,17 +3333,21 @@ async def handle_document(update, context):
             raw_urls = [l.strip() for l in lines if l.strip() and not l.startswith("#")]
             if not raw_urls:
                 await update.message.reply_text("❌ No URLs."); return
-            await update.message.reply_text(f"🧹 URL LIST — {len(raw_urls)}")
-            active_jobs[chat_id] = asyncio.create_task(run_url_clean_job(chat_id, raw_urls, context))
+            tab_note = f" [Tab {tab_id}]" if tab_id > 1 else ""
+            await update.message.reply_text(f"🧹 URL LIST — {len(raw_urls)}{tab_note}")
+            task = asyncio.create_task(run_url_clean_job(chat_id, raw_urls, context, tab_id=tab_id))
+            set_tab(chat_id, tab_id, task, asyncio.Event(), label=f"URL-Cleaner")
         else:
             dorks = [l.strip() for l in lines if l.strip() and not l.startswith("#")]
             if not dorks:
                 await update.message.reply_text("❌ No dorks."); return
             s = get_session(chat_id)
             mode_tag = " ⚡XTREAM" if s.get("xtream") else ""
+            tab_note = f" | Tab {tab_id}/{MAX_TABS_PER_USER}" if tab_id > 1 else ""
             await update.message.reply_text(
-                f"✅ {len(dorks)} dorks{mode_tag} | Pages: {', '.join(str(p) for p in s.get('pages',[1]))}\n🚀 Starting...")
-            active_jobs[chat_id] = asyncio.create_task(run_dork_job(chat_id, dorks, context))
+                f"✅ {len(dorks)} dorks{mode_tag}{tab_note} | Pages: {', '.join(str(p) for p in s.get('pages',[1]))}\n🚀 Starting...")
+            task = asyncio.create_task(run_dork_job(chat_id, dorks, context, tab_id=tab_id))
+            set_tab(chat_id, tab_id, task, asyncio.Event(), label=f"dork/{len(dorks)}")
     except Exception as exc:
         await update.message.reply_text(f"❌ Error: {exc}")
 
@@ -3268,13 +3363,19 @@ async def handle_text(update, context):
     lines = [l.strip() for l in update.message.text.splitlines()
              if l.strip() and not l.startswith("#")]
     if len(lines) > 1:
-        if chat_id in active_jobs and not active_jobs[chat_id].done():
-            await update.message.reply_text("⚠️ Job running! /stop first."); return
+        tab_id = get_free_tab(chat_id)
+        if tab_id is None:
+            await update.message.reply_text(
+                f"⚠️ All {MAX_TABS_PER_USER} tabs busy!\n"
+                f"Use /stop <N> or /status to manage tabs."
+            ); return
         s = get_session(chat_id)
         mode_tag = " ⚡XTREAM" if s.get("xtream") else ""
+        tab_note = f" | Tab {tab_id}/{MAX_TABS_PER_USER}" if tab_id > 1 else ""
         await update.message.reply_text(
-            f"✅ {len(lines)} dorks{mode_tag}\n🚀 Starting...")
-        active_jobs[chat_id] = asyncio.create_task(run_dork_job(chat_id, lines, context))
+            f"✅ {len(lines)} dorks{mode_tag}{tab_note}\n🚀 Starting...")
+        task = asyncio.create_task(run_dork_job(chat_id, lines, context, tab_id=tab_id))
+        set_tab(chat_id, tab_id, task, asyncio.Event(), label=f"dork/{len(lines)}")
     else:
         await update.message.reply_text(
             "Use /dork <q> or upload .txt\n"
@@ -3515,16 +3616,25 @@ async def handle_callback(update, context):
         return
 
     if data == "m_status":
-        job = active_jobs.get(chat_id)
-        running = bool(job and not job.done())
-        mode = "⚡ XTREAM (1000 RPS)" if sess.get("xtream") else "🕷 Standard (~200 RPS)"
+        tabs    = active_jobs.get(chat_id, {})
+        labels  = active_tab_labels.get(chat_id, {})
+        running = [(tid, t) for tid, t in tabs.items() if not t.done()]
+        mode    = "⚡ XTREAM (1000 RPS)" if sess.get("xtream") else "🕷 Standard (~200 RPS)"
+        if running:
+            tab_lines = "\n".join(f"  🗂 Tab {tid}: {labels.get(tid,'job')}"
+                                  for tid, _ in sorted(running))
+            state_txt = f"⚡ {len(running)}/{MAX_TABS_PER_USER} tab(s)\n{tab_lines}"
+        else:
+            state_txt = "💤 Idle"
         try:
             await query.edit_message_text(
                 f"📊 STATUS\n━━━━━━━━━━━━━━━\n"
-                f"State: {'⚡ Running' if running else '💤 Idle'}\n"
+                f"State: {state_txt}\n"
                 f"Mode : {mode}\n"
                 f"Tor  : {'ON' if sess.get('tor') else 'OFF'}\n"
-                f"Filt : ≥{sess.get('min_score', 30)}",
+                f"Filt : ≥{sess.get('min_score', 30)}\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"/stop <N> — stop tab N  |  /stop — stop all",
                 reply_markup=main_menu_keyboard(sess),
             )
         except Exception: pass
@@ -3586,7 +3696,7 @@ def main():
         ("filter", cmd_filter), ("settings", cmd_settings),
         ("workers", cmd_workers), ("chunks", cmd_chunks),
         ("maxres", cmd_maxres), ("engine", cmd_engine),
-        ("stop", cmd_stop), ("status", cmd_status),
+        ("stop", cmd_stop), ("status", cmd_status), ("tabs", cmd_tabs),
     ]:
         app.add_handler(CommandHandler(name, handler))
 
