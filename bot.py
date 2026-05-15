@@ -2212,14 +2212,32 @@ async def run_xtream_job(chat_id: int, dorks: list, context):
     except Exception: pass
 
     if all_scored:
-        with open(tmp_path, "rb") as f:
-            await context.bot.send_document(
-                chat_id, f,
-                filename=f"xtream_{total_dorks}d_{len(all_scored)}u.txt",
-                caption=(f"⚡ XTREAM v21 RESULTS\n"
-                         f"🎯 {len(all_scored)} URLs | 📊 {avg_rps:.0f} avg / {peak_rps:.0f} peak RPS\n"
-                         f"⏱ {elapsed}s | 🛡 {total_captcha} captchas"),
-            )
+        sent = False
+        for attempt in range(4):
+            try:
+                with open(tmp_path, "rb") as f:
+                    await context.bot.send_document(
+                        chat_id, f,
+                        filename=f"xtream_{total_dorks}d_{len(all_scored)}u.txt",
+                        caption=(f"⚡ XTREAM v21 RESULTS\n"
+                                 f"🎯 {len(all_scored)} URLs | 📊 {avg_rps:.0f} avg / {peak_rps:.0f} peak RPS\n"
+                                 f"⏱ {elapsed}s | 🛡 {total_captcha} captchas"),
+                        read_timeout=60, write_timeout=120, connect_timeout=30,
+                    )
+                sent = True
+                break
+            except Exception as exc:
+                log.warning(f"[XTREAM] send_document attempt {attempt+1} failed: {exc}")
+                if attempt < 3:
+                    await asyncio.sleep(5 * (attempt + 1))
+        if not sent:
+            try:
+                await context.bot.send_message(
+                    chat_id,
+                    f"⚠️ File delivery failed after 4 attempts.\n"
+                    f"Results: {len(all_scored)} URLs collected — tmp file: {tmp_path}",
+                )
+            except Exception: pass
     else:
         await context.bot.send_message(chat_id, "⚠️ No URLs matched filter. Try lowering /filter or adding proxies.")
 
@@ -2506,10 +2524,30 @@ async def run_dork_job(chat_id, dorks, context):
     except Exception: pass
 
     if all_scored:
-        with open(tmp_path, "rb") as f:
-            await context.bot.send_document(chat_id, f,
-                filename=f"sql_{total_dorks}d_{unique_cnt}u.txt",
-                caption=f"🎯 {unique_cnt} URLs | 📊 {avg_rps:.0f} RPS | ⏱ {elapsed}s")
+        sent = False
+        for attempt in range(4):
+            try:
+                with open(tmp_path, "rb") as f:
+                    await context.bot.send_document(
+                        chat_id, f,
+                        filename=f"sql_{total_dorks}d_{unique_cnt}u.txt",
+                        caption=f"🎯 {unique_cnt} URLs | 📊 {avg_rps:.0f} RPS | ⏱ {elapsed}s",
+                        read_timeout=60, write_timeout=120, connect_timeout=30,
+                    )
+                sent = True
+                break
+            except Exception as exc:
+                log.warning(f"[JOB] send_document attempt {attempt+1} failed: {exc}")
+                if attempt < 3:
+                    await asyncio.sleep(5 * (attempt + 1))
+        if not sent:
+            try:
+                await context.bot.send_message(
+                    chat_id,
+                    f"⚠️ File delivery failed after 4 attempts.\n"
+                    f"Results: {unique_cnt} URLs — tmp file: {tmp_path}",
+                )
+            except Exception: pass
     else:
         await context.bot.send_message(chat_id, "⚠️ No URLs matched filter.")
     try: os.unlink(tmp_path)
@@ -2738,9 +2776,30 @@ async def cmd_mutate(update, context):
 
 async def cmd_pages(update, context):
     chat_id = update.effective_chat.id
-    selected = get_session(chat_id).get("pages", [1])
+    sess = get_session(chat_id)
+    if context.args:
+        try:
+            n = int(context.args[0])
+            if not 1 <= n <= 70:
+                raise ValueError
+            pages = list(range(1, n + 1))
+            sess["pages"] = pages
+            await update.message.reply_text(
+                f"📄 Pages set: 1–{n} ({n} pages per dork)\n"
+                f"Selected: {', '.join(str(p) for p in pages)}"
+            )
+            return
+        except ValueError:
+            await update.message.reply_text(
+                "⚠️ Invalid value. Usage: /pages <number 1–70>\n"
+                "Example: /pages 10  →  crawls pages 1 to 10 per dork"
+            )
+            return
+    selected = sess.get("pages", [1])
     await update.message.reply_text(
-        f"📄 SELECT PAGES (1–70)\nSelected: {', '.join(str(p) for p in selected)}",
+        f"📄 SELECT PAGES (1–70)\n"
+        f"Tip: /pages <N> sets pages 1–N directly (e.g. /pages 15)\n\n"
+        f"Selected: {', '.join(str(p) for p in selected)}",
         reply_markup=page_keyboard(selected),
     )
 
