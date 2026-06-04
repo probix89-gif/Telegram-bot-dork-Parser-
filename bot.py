@@ -34,7 +34,7 @@ from telegram.ext import (
     CallbackQueryHandler, ContextTypes, filters
 )
 
-load_dotenv()
+load_dotenv(override=False)
 
 # ─── LOGGING ─────────────────────────────────────────────────────────────────
 Path("logs").mkdir(exist_ok=True)
@@ -701,6 +701,49 @@ def vary_yahoo_params(base_params: dict) -> dict:
         p["age"] = random.choice(["1d", "1w", "1m", ""])
     if random.random() < 0.08:
         p["toggle"] = "1"
+    return p
+
+
+# ── Advanced Yahoo Parameter Variance (Normal Bulk Mode) ──────────────────────
+
+_YAHOO_FR_POOL_ADV = [
+    "fp-tts", "yfp-t-902", "yfp-t-501", "free", "p2", "sfp",
+    "uh3_finance_vert_gs", "uh3_finance_vert", "yfp-t-152",
+    "uh3_search_web", "yfp-t", "yfp-t-s", "yfp-t-501-s",
+    "sb-top", "v9", "yfp-t-900", "uh3_new_design",
+]
+_YAHOO_NOL_POOL  = ["1", "0", ""]
+_YAHOO_BTF_POOL  = ["", "1"]
+_YAHOO_NC_POOL   = ["1", ""]
+_YAHOO_INTENT    = ["", "go", "pr"]
+
+
+def vary_yahoo_params_advanced(base_params: dict) -> dict:
+    """
+    Richer parameter variance for Yahoo in advanced TLS mode.
+    More `fr` values, extra optional params, and mild `b` jitter to
+    prevent caching fingerprints across requests.
+    """
+    p = dict(base_params)
+    p["fr"]  = random.choice(_YAHOO_FR_POOL_ADV)
+    p["ei"]  = random.choice(_YAHOO_EI_POOL)
+    if random.random() < 0.20:
+        p["vd"] = random.choice(_YAHOO_VD_POOL)
+    if random.random() < 0.12:
+        p["age"] = random.choice(["1d", "1w", "1m", ""])
+    if random.random() < 0.10:
+        p["toggle"] = "1"
+    if random.random() < 0.15:
+        p["nol"] = random.choice(_YAHOO_NOL_POOL)
+    if random.random() < 0.08:
+        p["btf"] = random.choice(_YAHOO_BTF_POOL)
+    if random.random() < 0.10:
+        p["nc"] = random.choice(_YAHOO_NC_POOL)
+    if random.random() < 0.07:
+        p["intent"] = random.choice(_YAHOO_INTENT)
+    # Tiny b-offset jitter on inner pages to bust CDN caching
+    if random.random() < 0.06 and int(p.get("b", 1)) > 1:
+        p["b"] = max(1, int(p["b"]) + random.choice([-1, 0, 1]))
     return p
 
 
@@ -1376,7 +1419,26 @@ async def _preseed_session_cookies(sess, engine: str = "yahoo") -> None:
             url = random.choice(YAHOO_HOMEPAGES)
         profile = getattr(sess, "_tls_profile", None) or get_tls_profile("weighted")
         headers = build_headers_from_profile(profile)
-        await sess.get(url, headers=headers, timeout=10)
+        resp = await sess.get(url, headers=headers, timeout=10,
+                              allow_redirects=True)
+        # Best-effort EU consent handling: when Yahoo bounces a fresh
+        # visitor to guce.yahoo.com/consent we POST a synthetic "agree"
+        # form so subsequent /search calls don't redirect again.
+        try:
+            final_url = str(getattr(resp, "url", "") or "")
+            if engine != "bing" and "guce." in final_url and "consent" in final_url:
+                consent_headers = build_headers_from_profile(
+                    profile, referer=final_url)
+                consent_headers["Content-Type"] = "application/x-www-form-urlencoded"
+                await sess.post(
+                    "https://guce.yahoo.com/consent",
+                    data={"agree": "agree", "consentUUID": "default",
+                          "originalDoneUrl": url, "namespace": "yahoo"},
+                    headers=consent_headers, timeout=10,
+                    allow_redirects=True,
+                )
+        except Exception:
+            pass
         await asyncio.sleep(random.uniform(0.15, 0.4))
     except Exception:
         pass
@@ -1464,6 +1526,108 @@ class XtreamSessionPool:
                 except Exception: pass
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ─── NORMAL MODE YAHOO SESSION POOL — Advanced TLS Rotation ──────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Gives normal-bulk-mode Yahoo workers the same benefits as XTREAM:
+#   • One pre-seeded session per worker (distinct TLS fingerprint each)
+#   • Sessions rotate automatically after MAX_USES requests or MAX_AGE seconds
+#   • On captcha / 429 / 403: session is burned; pool spawns a replacement
+#     asynchronously with a new TLS profile (no blocking other workers)
+#   • Pool is initialised in parallel at chunk-start before any dork fires
+# ══════════════════════════════════════════════════════════════════════════════
+
+class NormalYahooSessionPool:
+    """
+    Lightweight rotating session pool for Yahoo in normal bulk mode.
+    API is intentionally identical to XtreamSessionPool so workers can
+    call acquire() / release(burned=…) without knowing which pool type
+    they hold.
+    """
+    _MAX_USES = 25       # rotate session after this many requests
+    _MAX_AGE  = 300.0    # rotate session after 5 minutes regardless of use
+
+    def __init__(self, size: int = 4):
+        self.size     = size
+        self._sessions: deque = deque()
+        self._usage:   dict   = {}
+        self._age:     dict   = {}
+        self._lock             = asyncio.Lock()
+        self._closed           = False
+
+    async def _make_one(self) -> None:
+        profile = get_tls_profile("weighted")
+        sess    = _make_isolated_session(profile=profile)
+        await _preseed_session_cookies(sess, engine="yahoo")
+        async with self._lock:
+            sid = id(sess)
+            self._sessions.append(sess)
+            self._usage[sid] = 0
+            self._age[sid]   = time.time()
+
+    async def initialize(self) -> None:
+        """Pre-warm the pool in parallel before the job starts."""
+        batch = min(self.size, 8)
+        remaining = self.size
+        while remaining > 0:
+            n = min(batch, remaining)
+            await asyncio.gather(*[self._make_one() for _ in range(n)],
+                                  return_exceptions=True)
+            remaining -= n
+        log.info(f"[YAHOO-ADV] Pool ready: {len(self._sessions)} sessions "
+                 f"({self.size} requested)")
+
+    async def acquire(self):
+        """Return a session from the pool (or create one on-demand)."""
+        # Fast path: pop an existing session under the lock.
+        async with self._lock:
+            if self._sessions:
+                return self._sessions.popleft()
+        # Slow path: build a new session OUTSIDE the lock so other
+        # workers aren't blocked on the cookie-preseed network call.
+        profile = get_tls_profile("weighted")
+        sess    = _make_isolated_session(profile=profile)
+        try:
+            await _preseed_session_cookies(sess, engine="yahoo")
+        except Exception:
+            pass
+        async with self._lock:
+            sid = id(sess)
+            self._usage[sid] = 0
+            self._age[sid]   = time.time()
+        return sess
+
+    async def release(self, sess, burned: bool = False) -> None:
+        """Return session to pool; replace if burned, too-old, or over-used."""
+        if self._closed:
+            try: await sess.close()
+            except Exception: pass
+            return
+        async with self._lock:
+            sid      = id(sess)
+            self._usage[sid] = self._usage.get(sid, 0) + 1
+            too_old  = (time.time() - self._age.get(sid, 0)) > self._MAX_AGE
+            too_used = self._usage[sid] >= self._MAX_USES
+            if burned or too_old or too_used:
+                try: await sess.close()
+                except Exception: pass
+                self._usage.pop(sid, None)
+                self._age.pop(sid, None)
+                # Replenish asynchronously — doesn't block the caller
+                asyncio.create_task(self._make_one())
+            else:
+                self._sessions.append(sess)
+
+    async def close_all(self) -> None:
+        self._closed = True
+        async with self._lock:
+            while self._sessions:
+                s = self._sessions.popleft()
+                try: await s.close()
+                except Exception: pass
+
+
 # ─── TOR ROTATION (unchanged) ────────────────────────────────────────────────
 _tor_rotation_task = None
 tor_enabled_users = 0
@@ -1519,7 +1683,16 @@ def _is_degraded(html, engine):
     if len(html) < 400: return True
     if _CAPTCHA_RE.search(html[:4096]): return True
     if engine == "bing" and 'id="b_results"' not in html and "b_algo" not in html: return True
-    if engine == "yahoo" and not _YAHOO_RESULT_SIGNALS.search(html): return True
+    if engine == "yahoo":
+        # Layout markers shift frequently across Yahoo mirrors. Treat the
+        # page as "real" if it carries any known result signal OR it ships
+        # enough <a href> links to plausibly be a results page. This stops
+        # us from burning sessions on legitimate sparse-result dorks.
+        if _YAHOO_RESULT_SIGNALS.search(html):
+            return False
+        if html.lower().count("<a ") >= 25:
+            return False
+        return True
     if engine == "duckduckgo" and "result__a" not in html and "results--main" not in html: return True
     return False
 
@@ -1580,23 +1753,76 @@ _YAHOO_RU_PATH = re.compile(r"/RU=([^/&]+)")
 _DDG_NOISE     = re.compile(r"duckduckgo\.com|duck\.com", re.IGNORECASE)
 
 
+# Region → Accept-Language mapping for Yahoo mirror endpoints.
+# Used so a request to uk.search.yahoo.com doesn't advertise "en-US".
+_YAHOO_REGION_LANG = {
+    "uk": "en-GB,en;q=0.9", "ca": "en-CA,en;q=0.9", "au": "en-AU,en;q=0.9",
+    "in": "en-IN,en;q=0.9", "sg": "en-SG,en;q=0.9", "nz": "en-NZ,en;q=0.9",
+    "za": "en-ZA,en;q=0.9",
+    "de": "de-DE,de;q=0.9,en;q=0.6", "fr": "fr-FR,fr;q=0.9,en;q=0.6",
+    "es": "es-ES,es;q=0.9,en;q=0.6", "it": "it-IT,it;q=0.9,en;q=0.6",
+    "nl": "nl-NL,nl;q=0.9,en;q=0.6", "br": "pt-BR,pt;q=0.9,en;q=0.6",
+    "mx": "es-MX,es;q=0.9,en;q=0.6",
+}
+
+def _accept_language_for_endpoint(endpoint: str) -> str:
+    try:
+        host = urlparse(endpoint).netloc.lower()
+        sub  = host.split(".", 1)[0]
+        return _YAHOO_REGION_LANG.get(sub, "en-US,en;q=0.9")
+    except Exception:
+        return "en-US,en;q=0.9"
+
+
 def _yahoo_link_extractor(html):
+    """
+    Unified Yahoo link extractor — handles all known redirect patterns:
+      • r.search.yahoo.com / rd.yahoo.com  /RU=<encoded>
+      • /r/ short-redirect paths on any yahoo subdomain
+      • Query-string RU= on any yahoo redirect host
+    """
     raw = _extract_links(html)
     out = []
     for u in raw:
-        if "r.search.yahoo.com" in u or "/r/" in u:
+        if not u:
+            continue
+        u = u.strip()
+        if not u.startswith(("http://", "https://")):
+            continue
+        try:
             parsed = urlparse(u)
-            qs = parse_qs(parsed.query)
-            if "RU" in qs:
-                real = unquote(qs["RU"][0])
-                if real.startswith(("http://", "https://")): u = real
-            else:
-                m = _YAHOO_RU_PATH.search(parsed.path)
-                if m:
-                    real = unquote(m.group(1))
-                    if real.startswith(("http://", "https://")): u = real
+            host   = parsed.netloc.lower()
+            is_redirect = (
+                "r.search.yahoo.com" in host
+                or "rd.yahoo.com" in host
+                or ("/r/" in parsed.path and "yahoo" in host)
+            )
+            if is_redirect:
+                qs = parse_qs(parsed.query)
+                if "RU" in qs:
+                    real = unquote(qs["RU"][0])
+                    if real.startswith(("http://", "https://")):
+                        u = real
+                else:
+                    m = _YAHOO_RU_PATH.search(parsed.path)
+                    if m:
+                        real = unquote(m.group(1))
+                        if real.startswith(("http://", "https://")):
+                            u = real
+        except Exception:
+            pass
         out.append(u)
     return out
+
+
+_YAHOO_RU_PATH_V2     = re.compile(r"/RU=([^/&]+)")
+_YAHOO_REDIRECT_HOSTS = frozenset(["r.search.yahoo.com", "rd.yahoo.com",
+                                    "search.yahoo.com"])
+
+
+# Kept as alias for backward compatibility with callers that imported
+# the v2 name. Both now point at the unified extractor above.
+_yahoo_link_extractor_v2 = _yahoo_link_extractor
 
 
 # ─── FAST FETCH (v20.0) — uses TLS rotation + better retry ──────────────────
@@ -1693,17 +1919,255 @@ async def fetch_page_bing(session, dork, page, max_res, chunk_id=0):
     )
 
 
+_YAHOO_BASIC_MAX_RETRIES = 3
+
+
 async def fetch_page_yahoo(session, dork, page, max_res, chunk_id=0):
-    base_params = {"p": translate_dork(dork, "yahoo"), "b": (page-1)*10+1,
-                   "pz": min(max_res, 10), "vl": "lang_en"}
-    return await _generic_engine_fetch(
-        session, "GET", "https://search.yahoo.com/search",
-        params=vary_yahoo_params(base_params),
-        engine="yahoo", page=page, max_res=max_res, chunk_id=chunk_id,
-        referer="https://search.yahoo.com/",
-        link_extractor=_yahoo_link_extractor,
-        noise_filter=lambda u: bool(_YAHOO_NOISE.search(u)),
-    )
+    """
+    Stable Yahoo fetch for normal bulk mode.
+    Improvements vs. the previous single-endpoint path:
+      • Rotates Yahoo regional mirrors (subset of YAHOO_ENDPOINTS)
+      • Referer matches the chosen endpoint host (no cross-origin signal)
+      • Accept-Language matches the endpoint region
+      • Sec-Fetch-Site=same-origin (matching real browser nav)
+      • Up to 3 retries on 429/403/503/captcha with fresh mirror + backoff
+      • Softer degraded check (see _is_degraded) so sparse-result dorks
+        don't get marked as blocks.
+    Signature unchanged: returns (urls, degraded).
+    """
+    # YAHOO_ENDPOINTS is defined later in the file; resolved at call time.
+    try:
+        endpoint_pool = YAHOO_ENDPOINTS  # type: ignore[name-defined]
+    except NameError:
+        endpoint_pool = ["https://search.yahoo.com/search"]
+
+    last_degraded = False
+    for attempt in range(_YAHOO_BASIC_MAX_RETRIES):
+        endpoint = random.choice(endpoint_pool)
+        ep_host  = urlparse(endpoint).netloc
+        referer  = f"https://{ep_host}/"
+
+        # Per-attempt circuit-breaker pause for the chosen mirror.
+        wait_secs = await circuit_breaker.check(endpoint)
+        if wait_secs > 0:
+            await asyncio.sleep(min(wait_secs, 30.0))
+
+        profile = getattr(session, "_tls_profile", None) or get_tls_profile("weighted")
+        headers = build_headers_from_profile(profile, referer=referer)
+        headers["Accept-Language"] = _accept_language_for_endpoint(endpoint)
+        headers["Sec-Fetch-Site"]  = "same-origin"
+        spoof_xff_headers(headers, probability=0.30)
+
+        params = vary_yahoo_params({
+            "p":  translate_dork(dork, "yahoo"),
+            "b":  (page - 1) * 10 + 1,
+            "pz": min(max_res, 10),
+            "vl": "lang_en",
+        })
+
+        try:
+            resp   = await session.get(endpoint, params=params,
+                                       headers=headers, timeout=20)
+            status = resp.status_code
+            html   = resp.text
+
+            if status in (429, 403, 503):
+                await circuit_breaker.record(endpoint, blocked=True)
+                if attempt < _YAHOO_BASIC_MAX_RETRIES - 1:
+                    await asyncio.sleep(humanize_delay(2.0 * (attempt + 1)))
+                    continue
+                return [], True
+
+            if status != 200:
+                await circuit_breaker.record(endpoint, blocked=False)
+                return [], False
+
+            if _is_captcha(html):
+                await circuit_breaker.record(endpoint, blocked=True)
+                await _on_captcha_detected(
+                    "yahoo", chunk_id,
+                    getattr(session, "_cur_proxy", None))
+                if attempt < _YAHOO_BASIC_MAX_RETRIES - 1:
+                    await asyncio.sleep(humanize_delay(4.0 + attempt * 2.0))
+                    continue
+                return [], True
+
+            if _is_degraded(html, "yahoo"):
+                await circuit_breaker.record(endpoint, blocked=True)
+                last_degraded = True
+                if attempt < _YAHOO_BASIC_MAX_RETRIES - 1:
+                    await asyncio.sleep(humanize_delay(1.5 * (attempt + 1)))
+                    continue
+                return [], True
+
+            urls = _yahoo_link_extractor(html)
+            urls = [u for u in urls if u.startswith("http")
+                    and not _YAHOO_NOISE.search(u)
+                    and not _STATIC_EXT.search(u)]
+            urls = list(dict.fromkeys(urls))[:max_res]
+            await circuit_breaker.record(endpoint, blocked=False)
+            return urls, False
+
+        except asyncio.TimeoutError:
+            await circuit_breaker.record(endpoint, blocked=True)
+            await asyncio.sleep(humanize_delay((2 ** attempt) * 1.2))
+        except CurlError as exc:
+            log.debug(f"[C{chunk_id}][YAHOO] curl: {exc}")
+            await asyncio.sleep(humanize_delay((2 ** attempt) * 1.0))
+        except Exception as exc:
+            log.error(f"[C{chunk_id}][YAHOO] err: {exc}")
+            return [], False
+
+    return [], last_degraded
+
+
+# ─── YAHOO ADVANCED FETCH — Normal Bulk Mode ──────────────────────────────────
+# Per-request TLS rotation via NormalYahooSessionPool + 15-mirror endpoint
+# rotation. On any block (429/403/captcha/degraded) the current session is
+# burned and a fresh one with a new TLS fingerprint is acquired from the pool.
+# Referers are matched to the chosen endpoint domain so cross-origin signals
+# are avoided. Enhanced parameter variance masks templated patterns.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_YAHOO_ADV_MAX_RETRIES = 4
+
+
+async def fetch_page_yahoo_advanced(pool: "NormalYahooSessionPool",
+                                     dork: str, page: int,
+                                     max_res: int, chunk_id: int = 0) -> tuple:
+    """
+    Advanced Yahoo fetch for normal bulk mode.
+    Returns (urls: list, degraded: bool) — same signature as fetch_page_yahoo.
+
+    Strategy:
+     • 15 Yahoo regional mirrors rotated per attempt
+     • Endpoint-matched referer (avoids cross-origin flag)
+     • Fresh TLS fingerprint swap on every block event
+     • Cookie-preseeded sessions via NormalYahooSessionPool
+     • Enhanced parameter variance on every request
+     • Circuit-breaker aware (respects per-domain back-off)
+    """
+    sess   = await pool.acquire()
+    try:
+        for attempt in range(_YAHOO_ADV_MAX_RETRIES):
+            endpoint = random.choice(YAHOO_ENDPOINTS)
+            # Match referer to endpoint domain — prevents cross-origin signals
+            ep_host  = urlparse(endpoint).netloc
+            referer  = f"https://{ep_host}/"
+            profile  = getattr(sess, "_tls_profile", None) or get_tls_profile("weighted")
+            headers  = build_headers_from_profile(profile, referer=referer)
+            # Endpoint-region aware Accept-Language overrides the global default.
+            headers["Accept-Language"] = _accept_language_for_endpoint(endpoint)
+            headers["Sec-Fetch-Site"]  = "same-origin"
+            spoof_xff_headers(headers, probability=0.35)
+
+            params = vary_yahoo_params_advanced({
+                "p":  translate_dork(dork, "yahoo"),
+                "b":  (page - 1) * 10 + 1,
+                "pz": min(max_res, 10),
+                "vl": "lang_en",
+            })
+
+            # Respect circuit-breaker cooldown for this endpoint
+            wait_secs = await circuit_breaker.check(endpoint)
+            if wait_secs > 0:
+                await asyncio.sleep(min(wait_secs, 30.0))
+
+            try:
+                resp   = await sess.get(endpoint, params=params,
+                                        headers=headers, timeout=22)
+                status = resp.status_code
+                html   = resp.text
+
+                if status in (429, 403, 503):
+                    await circuit_breaker.record(endpoint, blocked=True)
+                    # Burn session → fresh TLS fingerprint for next attempt.
+                    # Drop our reference BEFORE awaiting the next acquire so
+                    # a failure in acquire() can't cause double-release.
+                    old = sess
+                    sess = None
+                    await pool.release(old, burned=True)
+                    sess = await pool.acquire()
+                    await asyncio.sleep(humanize_delay(3.5 * (attempt + 1)))
+                    continue
+
+                if status != 200:
+                    await circuit_breaker.record(endpoint, blocked=False)
+                    return [], False
+
+                if _is_captcha(html):
+                    await circuit_breaker.record(endpoint, blocked=True)
+                    old = sess
+                    sess = None
+                    await pool.release(old, burned=True)
+                    sess = await pool.acquire()
+                    await asyncio.sleep(humanize_delay(9.0 + attempt * 3.5))
+                    continue
+
+                if _is_degraded(html, "yahoo"):
+                    await circuit_breaker.record(endpoint, blocked=True)
+                    if attempt < _YAHOO_ADV_MAX_RETRIES - 1:
+                        await asyncio.sleep(humanize_delay(2.0 * (attempt + 1)))
+                        continue
+                    return [], True
+
+                # Success — extract and clean URLs
+                urls = _yahoo_link_extractor_v2(html)
+                urls = [u for u in urls if u.startswith("http")
+                        and not _YAHOO_NOISE.search(u)
+                        and not _STATIC_EXT.search(u)]
+                urls = list(dict.fromkeys(urls))[:max_res]
+                await circuit_breaker.record(endpoint, blocked=False)
+                return urls, False
+
+            except asyncio.TimeoutError:
+                await circuit_breaker.record(endpoint, blocked=True)
+                await asyncio.sleep(humanize_delay((2 ** attempt) * 1.2))
+            except CurlError as exc:
+                if (_is_proxy_error(exc) and PROXY_ENABLED and len(_proxy_pool) > 1):
+                    old = sess
+                    sess = None
+                    await pool.release(old, burned=True)
+                    sess = await pool.acquire()
+                    await asyncio.sleep(humanize_delay(0.8))
+                    continue
+                await asyncio.sleep(humanize_delay((2 ** attempt) * 1.0))
+            except Exception as exc:
+                log.error(f"[C{chunk_id}][YAHOO-ADV] err: {exc}")
+                return [], False
+
+        return [], True
+    finally:
+        # Only release if we still own a session (None means we swapped
+        # mid-loop and acquire() failed before assigning a replacement).
+        if sess is not None:
+            await pool.release(sess, burned=False)
+
+
+async def fetch_all_pages_yahoo_adv(pool: "NormalYahooSessionPool",
+                                     dork: str, pages: list,
+                                     max_res: int, chunk_id: int = 0) -> tuple:
+    """
+    Multi-page Yahoo fetch using the advanced pool.
+    Each page request independently acquires/releases a session so
+    concurrent pages get different TLS fingerprints.
+    """
+    sorted_pages = sorted(pages)
+
+    async def _fetch_one(page, idx):
+        if idx > 0:
+            await asyncio.sleep(humanize_delay(0.08 * idx, sigma_ratio=0.4))
+        return await fetch_page_yahoo_advanced(pool, dork, page, max_res, chunk_id)
+
+    tasks   = [_fetch_one(p, i) for i, p in enumerate(sorted_pages)]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    all_urls = []; degraded_total = 0
+    for res in results:
+        if isinstance(res, Exception): continue
+        urls, degraded = res
+        if degraded: degraded_total += 1
+        all_urls.extend(urls)
+    return all_urls, degraded_total
 
 
 async def fetch_page_duckduckgo(session, dork, page, max_res, chunk_id=0):
@@ -1725,8 +2189,10 @@ async def fetch_all_pages(session, dork, engine, pages, max_res, chunk_id=0):
 
     async def _fetch_with_stagger(page, idx):
         if idx > 0:
-            # Gaussian jitter instead of uniform — more human-like inter-page timing
-            await asyncio.sleep(humanize_delay(0.05 * idx, sigma_ratio=0.4))
+            # Gaussian jitter — slightly larger base for Yahoo to look less
+            # templated across consecutive page requests.
+            base = (0.12 if engine == "yahoo" else 0.05) * idx
+            await asyncio.sleep(humanize_delay(base, sigma_ratio=0.4))
         return await fetch_fn(session, dork, page, max_res, chunk_id)
 
     tasks = [_fetch_with_stagger(p, i) for i, p in enumerate(sorted_pages)]
@@ -1941,7 +2407,15 @@ async def xtream_worker(wid: int, queue: asyncio.Queue, results_q: asyncio.Queue
         # Per-worker cooldown after burns
         now = time.time()
         if cooldown_until > now:
-            await asyncio.sleep(cooldown_until - now)
+            # Sleep in slices so a stop event aborts cooldown promptly.
+            remaining = cooldown_until - now
+            while remaining > 0 and not stop_ev.is_set():
+                step = min(remaining, 0.5)
+                await asyncio.sleep(step)
+                remaining -= step
+            if stop_ev.is_set():
+                queue.task_done()
+                break
 
         # Pick engine for this dork
         if xtream_engine == "both":
@@ -2232,7 +2706,14 @@ async def run_xtream_job(chat_id: int, dorks: list, context):
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def dork_worker(wid, chunk_id, queue, results_q, engines, pages, max_res,
-                       session, min_score, stop_ev, slowdown_ev):
+                       session, min_score, stop_ev, slowdown_ev, yahoo_pool=None):
+    """
+    Normal-mode dork worker.
+    When `yahoo_pool` is provided and the assigned engine is Yahoo, the worker
+    uses `fetch_all_pages_yahoo_adv` (advanced TLS rotation) instead of the
+    standard single-session fetch.  All other engines continue to use the
+    shared chunk session unchanged.
+    """
     eidx = wid % len(engines)
     empty_streak = consecutive_hits = 0
     while not stop_ev.is_set():
@@ -2243,10 +2724,18 @@ async def dork_worker(wid, chunk_id, queue, results_q, engines, pages, max_res,
         engine = engines[eidx % len(engines)]; eidx += 1
         raw, degraded_cnt = [], 0
         try:
-            raw, degraded_cnt = await asyncio.wait_for(
-                fetch_all_pages(session, dork, engine, pages, max_res, chunk_id),
-                timeout=WORKER_FETCH_TIMEOUT,
-            )
+            if engine == "yahoo" and yahoo_pool is not None:
+                # ── Advanced TLS path — pool-managed sessions + 15 mirrors ──
+                raw, degraded_cnt = await asyncio.wait_for(
+                    fetch_all_pages_yahoo_adv(yahoo_pool, dork, pages, max_res, chunk_id),
+                    timeout=WORKER_FETCH_TIMEOUT,
+                )
+            else:
+                # ── Standard path for Bing / DDG (or Yahoo without pool) ────
+                raw, degraded_cnt = await asyncio.wait_for(
+                    fetch_all_pages(session, dork, engine, pages, max_res, chunk_id),
+                    timeout=WORKER_FETCH_TIMEOUT,
+                )
         except asyncio.TimeoutError:
             log.warning(f"[C{chunk_id}][W{wid}] timeout: {dork[:50]}")
         except asyncio.CancelledError:
@@ -2278,6 +2767,13 @@ async def dork_worker(wid, chunk_id, queue, results_q, engines, pages, max_res,
 async def run_chunk(chunk_id, dorks, engines, pages, max_res, use_tor, min_score,
                      workers_n, progress_q, global_stop_ev, proxy=None):
     session = _make_isolated_session(use_tor=use_tor, proxy=proxy)
+
+    # ── Advanced Yahoo TLS pool — one pre-seeded session per worker ───────────
+    yahoo_pool = None
+    if "yahoo" in engines:
+        yahoo_pool = NormalYahooSessionPool(size=max(workers_n, 2))
+        await yahoo_pool.initialize()
+
     queue = asyncio.Queue(maxsize=len(dorks) * 2)
     results_q = asyncio.Queue(maxsize=500)
     stop_ev = asyncio.Event(); slowdown_ev = asyncio.Event()
@@ -2289,7 +2785,8 @@ async def run_chunk(chunk_id, dorks, engines, pages, max_res, use_tor, min_score
             if global_stop_ev.is_set(): stop_ev.set()
             await asyncio.sleep(0.5)
     worker_tasks = [asyncio.create_task(dork_worker(i, chunk_id, queue, results_q,
-                    engines, pages, max_res, session, min_score, stop_ev, slowdown_ev))
+                    engines, pages, max_res, session, min_score, stop_ev, slowdown_ev,
+                    yahoo_pool=yahoo_pool))
                     for i in range(workers_n)]
     global_watcher = asyncio.create_task(_watch_global())
     try:
@@ -2323,6 +2820,8 @@ async def run_chunk(chunk_id, dorks, engines, pages, max_res, use_tor, min_score
         global_watcher.cancel()
         await asyncio.gather(global_watcher, return_exceptions=True)
         await session.close()
+        if yahoo_pool is not None:
+            await yahoo_pool.close_all()
     return {"chunk_id":chunk_id,"scored":chunk_scored,"raw_count":chunk_raw,
             "degraded_count":chunk_degraded,"processed":processed,"empty_count":empty_count}
 
@@ -2378,9 +2877,14 @@ async def run_dork_job(chat_id, dorks, context):
         proxy_info = f"⏸ DISABLED"
     else: proxy_info = "🔓 Direct"
 
+    yahoo_adv = "yahoo" in engines
+    tls_line  = (f"🔒 TLS      : {len(TLS_PROFILES)} profiles rotating\n"
+                 f"⚡ Yahoo    : ADV-TLS | 15 mirrors | cookie-seeded\n"
+                 if yahoo_adv else
+                 f"🔒 TLS      : {len(TLS_PROFILES)} profiles rotating\n")
     status_msg = await context.bot.send_message(
         chat_id,
-        f"🕷 DORK PARSER v20.0 — STARTED\n{'━'*30}\n"
+        f"🕷 DORK PARSER v21.0 — STARTED\n{'━'*30}\n"
         f"📋 Dorks    : {total_dorks}"
         + (f" (⚠️ {len(invalid_dorks)} skip)" if invalid_dorks else "")
         + f"\n📄 Pages    : {pages_str}\n"
@@ -2389,7 +2893,7 @@ async def run_dork_job(chat_id, dorks, context):
         f"🔍 Engines  : {' + '.join(e.upper() for e in engines)}\n"
         f"🛡 Filter   : SQL ≥{min_score}\n"
         f"🌐 Network  : {proxy_info}\n"
-        f"🔒 TLS      : {len(TLS_PROFILES)} profiles rotating\n"
+        + tls_line +
         f"🎯 Target   : ~200 URLs/sec\n{'━'*30}\n⏳ Starting...",
     )
 
@@ -2602,7 +3106,7 @@ async def cmd_start(update, context):
         "  /dorkcheck <q>— validate dork\n"
         "  /mutate <q>   — generate variations\n"
         "  /clean        — URL cleaner\n"
-        "  /pages        — page selector\n"
+        "  /pages [N|1-10|1,3,5] — set pages\n"
         "  /workers N    — workers/chunk (1-60)\n"
         "  /chunks N     — parallel chunks (1-8)\n"
         "  /engine X     — bing|yahoo|ddg|all\n"
@@ -2737,11 +3241,68 @@ async def cmd_mutate(update, context):
 
 
 async def cmd_pages(update, context):
+    """
+    /pages              — open interactive keyboard
+    /pages 5            — set pages 1-5
+    /pages 1-10         — set page range (inclusive)
+    /pages 1,3,5,7      — set specific pages
+    """
     chat_id = update.effective_chat.id
-    selected = get_session(chat_id).get("pages", [1])
+    sess    = get_session(chat_id)
+
+    if not context.args:
+        # No args → open the interactive keyboard as before
+        selected = sess.get("pages", [1])
+        await update.message.reply_text(
+            f"📄 SELECT PAGES (1–70)\n"
+            f"Currently: {', '.join(str(p) for p in sorted(selected))}\n\n"
+            f"💡 Tip: /pages <N> sets 1–N  |  /pages 1-10  |  /pages 1,3,5",
+            reply_markup=page_keyboard(selected),
+        )
+        return
+
+    raw = " ".join(context.args).strip()
+    pages = []
+
+    try:
+        if "-" in raw and "," not in raw:
+            # Range: "3-10"
+            parts = raw.split("-", 1)
+            start = max(1, min(int(parts[0].strip()), 70))
+            end   = max(1, min(int(parts[1].strip()), 70))
+            if start > end:
+                start, end = end, start
+            pages = list(range(start, end + 1))
+        elif "," in raw:
+            # Comma list: "1,3,5,7"
+            pages = sorted(set(
+                max(1, min(int(x.strip()), 70))
+                for x in raw.split(",") if x.strip().isdigit()
+            ))
+        else:
+            # Single number N → pages 1..N
+            n = max(1, min(int(raw), 70))
+            pages = list(range(1, n + 1))
+    except Exception:
+        await update.message.reply_text(
+            "⚠️ Invalid format.\n"
+            "Usage:\n"
+            "  /pages 5        → pages 1–5\n"
+            "  /pages 3-10     → pages 3 to 10\n"
+            "  /pages 1,3,5    → specific pages\n"
+            "  /pages          → open selector keyboard"
+        )
+        return
+
+    if not pages:
+        pages = [1]
+
+    sess["pages"] = pages
+    label = (f"1–{pages[-1]}" if pages == list(range(1, pages[-1] + 1))
+             else ", ".join(str(p) for p in pages))
     await update.message.reply_text(
-        f"📄 SELECT PAGES (1–70)\nSelected: {', '.join(str(p) for p in selected)}",
-        reply_markup=page_keyboard(selected),
+        f"✅ Pages set: {label}\n"
+        f"📄 Total: {len(pages)} page(s)"
     )
 
 
