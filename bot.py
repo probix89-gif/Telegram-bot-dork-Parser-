@@ -18,7 +18,8 @@ import logging
 import tempfile
 import shlex
 import itertools
-from collections import deque
+from collections import deque, Counter
+import array, math
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
@@ -141,6 +142,77 @@ _ACCEPT_CHROME  = "text/html,application/xhtml+xml,application/xml;q=0.9,image/a
 _ACCEPT_FIREFOX = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
 _ACCEPT_SAFARI  = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 _ACCEPT_EDGE    = "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ─── BLOOM FILTER — memory-efficient URL deduplication ───────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Replaces Python `set` for URL dedup.  A set of 10 M strings uses ~500 MB+;
+# a Bloom filter for the same load uses ≈ 12 MB at 1 % false-positive rate.
+# False positives mean we occasionally skip a *unique* URL — acceptable because
+# the same URL rarely appears in more than one SERP result anyway.
+#
+# Uses double-hashing (md5 low-half + high-half) to produce k bit positions.
+# ══════════════════════════════════════════════════════════════════════════════
+
+import hashlib as _hashlib
+
+class BloomFilter:
+    """
+    Probabilistic set for memory-efficient deduplication.
+
+    Usage:
+        bf = BloomFilter(capacity=1_000_000)
+        already_seen = bf.add(url)   # True → duplicate (skip); False → new
+    """
+    __slots__ = ("_bits", "_size", "_k", "capacity", "error_rate")
+
+    def __init__(self, capacity: int = 1_000_000, error_rate: float = 0.01):
+        self.capacity   = max(capacity, 1_000)
+        self.error_rate = error_rate
+        # Optimal bit-array size and number of hash functions
+        n = self.capacity
+        p = error_rate
+        self._size = max(int(-n * math.log(p) / (math.log(2) ** 2)), 64)
+        self._k    = max(int((self._size / n) * math.log(2)), 1)
+        self._bits = array.array("B", b"\x00" * ((self._size + 7) // 8))
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+    def _positions(self, item: str):
+        """Yield k bit positions via double-hashing."""
+        raw  = item.encode("utf-8", errors="replace")
+        digest = _hashlib.md5(raw).digest()
+        h1 = int.from_bytes(digest[:4],  "little") % self._size
+        h2 = int.from_bytes(digest[4:8], "little") % self._size or 1
+        for i in range(self._k):
+            yield (h1 + i * h2) % self._size
+
+    # ── Public API ────────────────────────────────────────────────────────────
+    def add(self, item: str) -> bool:
+        """
+        Add item to the filter.
+        Returns True  → item was ALREADY present (probable duplicate — skip it).
+        Returns False → item appears NEW (added to filter — process it).
+        """
+        seen = True
+        for pos in self._positions(item):
+            byte_i, bit_i = divmod(pos, 8)
+            if not (self._bits[byte_i] >> bit_i & 1):
+                seen = False
+                self._bits[byte_i] |= (1 << bit_i)
+        return seen
+
+    def __contains__(self, item: str) -> bool:
+        return all(
+            (self._bits[pos >> 3] >> (pos & 7)) & 1
+            for pos in self._positions(item)
+        )
+
+    @property
+    def memory_mb(self) -> float:
+        return len(self._bits) / 1_048_576
+
 
 TLS_PROFILES = [
     # ── Chrome 110 · Windows ────────────────────────────────────────────────
@@ -1419,26 +1491,7 @@ async def _preseed_session_cookies(sess, engine: str = "yahoo") -> None:
             url = random.choice(YAHOO_HOMEPAGES)
         profile = getattr(sess, "_tls_profile", None) or get_tls_profile("weighted")
         headers = build_headers_from_profile(profile)
-        resp = await sess.get(url, headers=headers, timeout=10,
-                              allow_redirects=True)
-        # Best-effort EU consent handling: when Yahoo bounces a fresh
-        # visitor to guce.yahoo.com/consent we POST a synthetic "agree"
-        # form so subsequent /search calls don't redirect again.
-        try:
-            final_url = str(getattr(resp, "url", "") or "")
-            if engine != "bing" and "guce." in final_url and "consent" in final_url:
-                consent_headers = build_headers_from_profile(
-                    profile, referer=final_url)
-                consent_headers["Content-Type"] = "application/x-www-form-urlencoded"
-                await sess.post(
-                    "https://guce.yahoo.com/consent",
-                    data={"agree": "agree", "consentUUID": "default",
-                          "originalDoneUrl": url, "namespace": "yahoo"},
-                    headers=consent_headers, timeout=10,
-                    allow_redirects=True,
-                )
-        except Exception:
-            pass
+        await sess.get(url, headers=headers, timeout=10)
         await asyncio.sleep(random.uniform(0.15, 0.4))
     except Exception:
         pass
@@ -1446,23 +1499,31 @@ async def _preseed_session_cookies(sess, engine: str = "yahoo") -> None:
 
 class XtreamSessionPool:
     """
-    Maintains a rotating pool of pre-built sessions for maximum throughput.
-    Each session keeps cookies & a stable TLS profile to look human.
-    Sessions are rotated based on usage count + age.
-    Pool is initialized in parallel batches for fast startup.
+    Rotating session pool for XTREAM mode.
+
+    v22 fixes:
+      • _use_tor stored on instance — replenishment always uses correct network
+      • _replenish_sem throttles concurrent cookie-seed HTTP calls during
+        bulk-burn events (prevents event-loop flooding + RAM spike)
+      • Stale _usage / _age entries cleaned up properly on close
+      • release() no longer synchronously creates a new session inline —
+        it fires a background task (throttled) instead
     """
     def __init__(self, size=XTREAM_SESSION_POOL_SIZE, engine: str = "yahoo"):
-        self.size   = size
-        self.engine = engine  # which engine to pre-seed cookies for
-        self.sessions: deque = deque()
-        self._usage: dict = {}    # session_id -> count
-        self._age:   dict = {}    # session_id -> ts
-        self._lock   = asyncio.Lock()
-        self._closed = False
+        self.size         = size
+        self.engine       = engine
+        self.sessions:    deque = deque()
+        self._usage:      dict  = {}
+        self._age:        dict  = {}
+        self._lock                = asyncio.Lock()
+        self._closed              = False
+        self._use_tor             = False      # set in initialize()
+        self._replenish_sem       = None       # asyncio.Semaphore, created in initialize()
 
-    async def _make_one(self, use_tor: bool) -> None:
+    async def _make_one(self) -> None:
+        """Create one session and add it to the pool."""
         profile = get_tls_profile("weighted")
-        sess = _make_isolated_session(use_tor=use_tor, profile=profile)
+        sess    = _make_isolated_session(use_tor=self._use_tor, profile=profile)
         if XTREAM_PRESEED_COOKIES:
             seed_engine = "bing" if self.engine == "bing" else "yahoo"
             await _preseed_session_cookies(sess, engine=seed_engine)
@@ -1472,58 +1533,70 @@ class XtreamSessionPool:
             self._usage[sid] = 0
             self._age[sid]   = time.time()
 
-    async def initialize(self, use_tor=False):
+    async def initialize(self, use_tor: bool = False) -> None:
+        self._use_tor       = use_tor
+        self._replenish_sem = asyncio.Semaphore(XTREAM_POOL_BATCH_SIZE)
         log.info(f"[XTREAM] Building session pool of {self.size} (batch={XTREAM_POOL_BATCH_SIZE})...")
         tasks_left = self.size
         while tasks_left > 0:
             batch = min(XTREAM_POOL_BATCH_SIZE, tasks_left)
-            await asyncio.gather(*[self._make_one(use_tor) for _ in range(batch)],
+            await asyncio.gather(*[self._make_one() for _ in range(batch)],
                                   return_exceptions=True)
             tasks_left -= batch
         log.info(f"[XTREAM] Pool ready: {len(self.sessions)} sessions")
 
     async def acquire(self):
-        """Get a session from the pool (rotates round-robin)."""
+        """Pop a session from the front of the pool (or create on-demand)."""
         async with self._lock:
             if not self.sessions:
+                # Pool temporarily empty — make one synchronously so the worker
+                # is not blocked waiting for a background replenish task
                 profile = get_tls_profile("weighted")
-                sess = _make_isolated_session(profile=profile)
-                self._usage[id(sess)] = 0
-                self._age[id(sess)]   = time.time()
+                sess    = _make_isolated_session(use_tor=self._use_tor, profile=profile)
+                sid     = id(sess)
+                self._usage[sid] = 0
+                self._age[sid]   = time.time()
                 return sess
-            sess = self.sessions.popleft()
-            return sess
+            return self.sessions.popleft()
 
-    async def release(self, sess, burned=False):
-        """Return session to pool. If burned (got blocked), replace it."""
+    async def release(self, sess, burned: bool = False) -> None:
+        """Return session to pool; replace if burned / too-old / over-used."""
         if self._closed:
             try: await sess.close()
             except Exception: pass
             return
         async with self._lock:
-            sid = id(sess)
+            sid      = id(sess)
             self._usage[sid] = self._usage.get(sid, 0) + 1
-            too_old   = (time.time() - self._age.get(sid, 0)) > XTREAM_SESSION_MAX_AGE
-            too_used  = self._usage[sid] > XTREAM_SESSION_MAX_USES
+            too_old  = (time.time() - self._age.get(sid, 0)) > XTREAM_SESSION_MAX_AGE
+            too_used = self._usage[sid] > XTREAM_SESSION_MAX_USES
             if burned or too_old or too_used:
                 try: await sess.close()
                 except Exception: pass
-                self._usage.pop(sid, None); self._age.pop(sid, None)
-                profile   = get_tls_profile("weighted")
-                new_sess  = _make_isolated_session(profile=profile)
-                self._usage[id(new_sess)] = 0
-                self._age[id(new_sess)]   = time.time()
-                self.sessions.append(new_sess)
+                self._usage.pop(sid, None)
+                self._age.pop(sid, None)
+                # Throttled background replenishment — cap concurrent cookie seeds
+                sem = self._replenish_sem
+                if sem is not None:
+                    async def _replenish(_sem=sem):
+                        async with _sem:
+                            await self._make_one()
+                    asyncio.create_task(_replenish())
+                else:
+                    asyncio.create_task(self._make_one())
             else:
                 self.sessions.append(sess)
 
-    async def close_all(self):
+    async def close_all(self) -> None:
         self._closed = True
         async with self._lock:
             while self.sessions:
                 s = self.sessions.popleft()
                 try: await s.close()
                 except Exception: pass
+            # Purge orphaned metadata to free RAM
+            self._usage.clear()
+            self._age.clear()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1540,21 +1613,26 @@ class XtreamSessionPool:
 
 class NormalYahooSessionPool:
     """
-    Lightweight rotating session pool for Yahoo in normal bulk mode.
-    API is intentionally identical to XtreamSessionPool so workers can
-    call acquire() / release(burned=…) without knowing which pool type
-    they hold.
+    Rotating Yahoo session pool for normal bulk mode.
+
+    v22 fixes:
+      • _replenish_sem caps concurrent cookie-seed replenishment tasks.
+        Previously, a mass-burn event could spawn hundreds of concurrent
+        _preseed_session_cookies() HTTP calls, spiking RAM and CPU.
+      • Stale metadata cleaned on close_all().
     """
-    _MAX_USES = 25       # rotate session after this many requests
-    _MAX_AGE  = 300.0    # rotate session after 5 minutes regardless of use
+    _MAX_USES             = 25       # rotate after N requests
+    _MAX_AGE              = 300.0    # rotate after 5 minutes
+    _MAX_CONCURRENT_REPLENISH = 4    # max parallel cookie-seed tasks at once
 
     def __init__(self, size: int = 4):
-        self.size     = size
+        self.size       = size
         self._sessions: deque = deque()
         self._usage:   dict   = {}
         self._age:     dict   = {}
-        self._lock             = asyncio.Lock()
-        self._closed           = False
+        self._lock              = asyncio.Lock()
+        self._closed            = False
+        self._replenish_sem     = None   # asyncio.Semaphore, created in initialize()
 
     async def _make_one(self) -> None:
         profile = get_tls_profile("weighted")
@@ -1568,7 +1646,8 @@ class NormalYahooSessionPool:
 
     async def initialize(self) -> None:
         """Pre-warm the pool in parallel before the job starts."""
-        batch = min(self.size, 8)
+        self._replenish_sem = asyncio.Semaphore(self._MAX_CONCURRENT_REPLENISH)
+        batch     = min(self.size, 8)
         remaining = self.size
         while remaining > 0:
             n = min(batch, remaining)
@@ -1580,23 +1659,15 @@ class NormalYahooSessionPool:
 
     async def acquire(self):
         """Return a session from the pool (or create one on-demand)."""
-        # Fast path: pop an existing session under the lock.
         async with self._lock:
-            if self._sessions:
-                return self._sessions.popleft()
-        # Slow path: build a new session OUTSIDE the lock so other
-        # workers aren't blocked on the cookie-preseed network call.
-        profile = get_tls_profile("weighted")
-        sess    = _make_isolated_session(profile=profile)
-        try:
-            await _preseed_session_cookies(sess, engine="yahoo")
-        except Exception:
-            pass
-        async with self._lock:
-            sid = id(sess)
-            self._usage[sid] = 0
-            self._age[sid]   = time.time()
-        return sess
+            if not self._sessions:
+                profile = get_tls_profile("weighted")
+                sess    = _make_isolated_session(profile=profile)
+                sid     = id(sess)
+                self._usage[sid] = 0
+                self._age[sid]   = time.time()
+                return sess
+            return self._sessions.popleft()
 
     async def release(self, sess, burned: bool = False) -> None:
         """Return session to pool; replace if burned, too-old, or over-used."""
@@ -1614,8 +1685,15 @@ class NormalYahooSessionPool:
                 except Exception: pass
                 self._usage.pop(sid, None)
                 self._age.pop(sid, None)
-                # Replenish asynchronously — doesn't block the caller
-                asyncio.create_task(self._make_one())
+                # Throttled async replenishment — cap concurrent cookie seeds
+                sem = self._replenish_sem
+                if sem is not None:
+                    async def _replenish(_sem=sem):
+                        async with _sem:
+                            await self._make_one()
+                    asyncio.create_task(_replenish())
+                else:
+                    asyncio.create_task(self._make_one())
             else:
                 self._sessions.append(sess)
 
@@ -1626,6 +1704,8 @@ class NormalYahooSessionPool:
                 s = self._sessions.popleft()
                 try: await s.close()
                 except Exception: pass
+            self._usage.clear()
+            self._age.clear()
 
 
 # ─── TOR ROTATION (unchanged) ────────────────────────────────────────────────
@@ -1683,16 +1763,7 @@ def _is_degraded(html, engine):
     if len(html) < 400: return True
     if _CAPTCHA_RE.search(html[:4096]): return True
     if engine == "bing" and 'id="b_results"' not in html and "b_algo" not in html: return True
-    if engine == "yahoo":
-        # Layout markers shift frequently across Yahoo mirrors. Treat the
-        # page as "real" if it carries any known result signal OR it ships
-        # enough <a href> links to plausibly be a results page. This stops
-        # us from burning sessions on legitimate sparse-result dorks.
-        if _YAHOO_RESULT_SIGNALS.search(html):
-            return False
-        if html.lower().count("<a ") >= 25:
-            return False
-        return True
+    if engine == "yahoo" and not _YAHOO_RESULT_SIGNALS.search(html): return True
     if engine == "duckduckgo" and "result__a" not in html and "results--main" not in html: return True
     return False
 
@@ -1753,47 +1824,51 @@ _YAHOO_RU_PATH = re.compile(r"/RU=([^/&]+)")
 _DDG_NOISE     = re.compile(r"duckduckgo\.com|duck\.com", re.IGNORECASE)
 
 
-# Region → Accept-Language mapping for Yahoo mirror endpoints.
-# Used so a request to uk.search.yahoo.com doesn't advertise "en-US".
-_YAHOO_REGION_LANG = {
-    "uk": "en-GB,en;q=0.9", "ca": "en-CA,en;q=0.9", "au": "en-AU,en;q=0.9",
-    "in": "en-IN,en;q=0.9", "sg": "en-SG,en;q=0.9", "nz": "en-NZ,en;q=0.9",
-    "za": "en-ZA,en;q=0.9",
-    "de": "de-DE,de;q=0.9,en;q=0.6", "fr": "fr-FR,fr;q=0.9,en;q=0.6",
-    "es": "es-ES,es;q=0.9,en;q=0.6", "it": "it-IT,it;q=0.9,en;q=0.6",
-    "nl": "nl-NL,nl;q=0.9,en;q=0.6", "br": "pt-BR,pt;q=0.9,en;q=0.6",
-    "mx": "es-MX,es;q=0.9,en;q=0.6",
-}
-
-def _accept_language_for_endpoint(endpoint: str) -> str:
-    try:
-        host = urlparse(endpoint).netloc.lower()
-        sub  = host.split(".", 1)[0]
-        return _YAHOO_REGION_LANG.get(sub, "en-US,en;q=0.9")
-    except Exception:
-        return "en-US,en;q=0.9"
-
-
 def _yahoo_link_extractor(html):
+    raw = _extract_links(html)
+    out = []
+    for u in raw:
+        if "r.search.yahoo.com" in u or "/r/" in u:
+            parsed = urlparse(u)
+            qs = parse_qs(parsed.query)
+            if "RU" in qs:
+                real = unquote(qs["RU"][0])
+                if real.startswith(("http://", "https://")): u = real
+            else:
+                m = _YAHOO_RU_PATH.search(parsed.path)
+                if m:
+                    real = unquote(m.group(1))
+                    if real.startswith(("http://", "https://")): u = real
+        out.append(u)
+    return out
+
+
+_YAHOO_RU_PATH_V2     = re.compile(r"/RU=([^/&]+)")
+_YAHOO_REDIRECT_HOSTS = frozenset(["r.search.yahoo.com", "rd.yahoo.com",
+                                    "search.yahoo.com"])
+
+
+def _yahoo_link_extractor_v2(html: str) -> list:
     """
-    Unified Yahoo link extractor — handles all known redirect patterns:
-      • r.search.yahoo.com / rd.yahoo.com  /RU=<encoded>
-      • /r/ short-redirect paths on any yahoo subdomain
-      • Query-string RU= on any yahoo redirect host
+    Enhanced Yahoo link extractor for advanced mode.
+    Handles all known Yahoo redirect patterns:
+      • r.search.yahoo.com/RU=<encoded>
+      • rd.yahoo.com redirect paths
+      • /r/ short-redirect paths
+      • Query-string RU= on any yahoo domain
     """
     raw = _extract_links(html)
     out = []
     for u in raw:
-        if not u:
-            continue
         u = u.strip()
-        if not u.startswith(("http://", "https://")):
+        if not u.startswith("http"):
             continue
         try:
             parsed = urlparse(u)
             host   = parsed.netloc.lower()
             is_redirect = (
-                "r.search.yahoo.com" in host
+                host in _YAHOO_REDIRECT_HOSTS
+                or "r.search.yahoo.com" in host
                 or "rd.yahoo.com" in host
                 or ("/r/" in parsed.path and "yahoo" in host)
             )
@@ -1804,7 +1879,7 @@ def _yahoo_link_extractor(html):
                     if real.startswith(("http://", "https://")):
                         u = real
                 else:
-                    m = _YAHOO_RU_PATH.search(parsed.path)
+                    m = _YAHOO_RU_PATH_V2.search(parsed.path)
                     if m:
                         real = unquote(m.group(1))
                         if real.startswith(("http://", "https://")):
@@ -1813,16 +1888,6 @@ def _yahoo_link_extractor(html):
             pass
         out.append(u)
     return out
-
-
-_YAHOO_RU_PATH_V2     = re.compile(r"/RU=([^/&]+)")
-_YAHOO_REDIRECT_HOSTS = frozenset(["r.search.yahoo.com", "rd.yahoo.com",
-                                    "search.yahoo.com"])
-
-
-# Kept as alias for backward compatibility with callers that imported
-# the v2 name. Both now point at the unified extractor above.
-_yahoo_link_extractor_v2 = _yahoo_link_extractor
 
 
 # ─── FAST FETCH (v20.0) — uses TLS rotation + better retry ──────────────────
@@ -1919,106 +1984,17 @@ async def fetch_page_bing(session, dork, page, max_res, chunk_id=0):
     )
 
 
-_YAHOO_BASIC_MAX_RETRIES = 3
-
-
 async def fetch_page_yahoo(session, dork, page, max_res, chunk_id=0):
-    """
-    Stable Yahoo fetch for normal bulk mode.
-    Improvements vs. the previous single-endpoint path:
-      • Rotates Yahoo regional mirrors (subset of YAHOO_ENDPOINTS)
-      • Referer matches the chosen endpoint host (no cross-origin signal)
-      • Accept-Language matches the endpoint region
-      • Sec-Fetch-Site=same-origin (matching real browser nav)
-      • Up to 3 retries on 429/403/503/captcha with fresh mirror + backoff
-      • Softer degraded check (see _is_degraded) so sparse-result dorks
-        don't get marked as blocks.
-    Signature unchanged: returns (urls, degraded).
-    """
-    # YAHOO_ENDPOINTS is defined later in the file; resolved at call time.
-    try:
-        endpoint_pool = YAHOO_ENDPOINTS  # type: ignore[name-defined]
-    except NameError:
-        endpoint_pool = ["https://search.yahoo.com/search"]
-
-    last_degraded = False
-    for attempt in range(_YAHOO_BASIC_MAX_RETRIES):
-        endpoint = random.choice(endpoint_pool)
-        ep_host  = urlparse(endpoint).netloc
-        referer  = f"https://{ep_host}/"
-
-        # Per-attempt circuit-breaker pause for the chosen mirror.
-        wait_secs = await circuit_breaker.check(endpoint)
-        if wait_secs > 0:
-            await asyncio.sleep(min(wait_secs, 30.0))
-
-        profile = getattr(session, "_tls_profile", None) or get_tls_profile("weighted")
-        headers = build_headers_from_profile(profile, referer=referer)
-        headers["Accept-Language"] = _accept_language_for_endpoint(endpoint)
-        headers["Sec-Fetch-Site"]  = "same-origin"
-        spoof_xff_headers(headers, probability=0.30)
-
-        params = vary_yahoo_params({
-            "p":  translate_dork(dork, "yahoo"),
-            "b":  (page - 1) * 10 + 1,
-            "pz": min(max_res, 10),
-            "vl": "lang_en",
-        })
-
-        try:
-            resp   = await session.get(endpoint, params=params,
-                                       headers=headers, timeout=20)
-            status = resp.status_code
-            html   = resp.text
-
-            if status in (429, 403, 503):
-                await circuit_breaker.record(endpoint, blocked=True)
-                if attempt < _YAHOO_BASIC_MAX_RETRIES - 1:
-                    await asyncio.sleep(humanize_delay(2.0 * (attempt + 1)))
-                    continue
-                return [], True
-
-            if status != 200:
-                await circuit_breaker.record(endpoint, blocked=False)
-                return [], False
-
-            if _is_captcha(html):
-                await circuit_breaker.record(endpoint, blocked=True)
-                await _on_captcha_detected(
-                    "yahoo", chunk_id,
-                    getattr(session, "_cur_proxy", None))
-                if attempt < _YAHOO_BASIC_MAX_RETRIES - 1:
-                    await asyncio.sleep(humanize_delay(4.0 + attempt * 2.0))
-                    continue
-                return [], True
-
-            if _is_degraded(html, "yahoo"):
-                await circuit_breaker.record(endpoint, blocked=True)
-                last_degraded = True
-                if attempt < _YAHOO_BASIC_MAX_RETRIES - 1:
-                    await asyncio.sleep(humanize_delay(1.5 * (attempt + 1)))
-                    continue
-                return [], True
-
-            urls = _yahoo_link_extractor(html)
-            urls = [u for u in urls if u.startswith("http")
-                    and not _YAHOO_NOISE.search(u)
-                    and not _STATIC_EXT.search(u)]
-            urls = list(dict.fromkeys(urls))[:max_res]
-            await circuit_breaker.record(endpoint, blocked=False)
-            return urls, False
-
-        except asyncio.TimeoutError:
-            await circuit_breaker.record(endpoint, blocked=True)
-            await asyncio.sleep(humanize_delay((2 ** attempt) * 1.2))
-        except CurlError as exc:
-            log.debug(f"[C{chunk_id}][YAHOO] curl: {exc}")
-            await asyncio.sleep(humanize_delay((2 ** attempt) * 1.0))
-        except Exception as exc:
-            log.error(f"[C{chunk_id}][YAHOO] err: {exc}")
-            return [], False
-
-    return [], last_degraded
+    base_params = {"p": translate_dork(dork, "yahoo"), "b": (page-1)*10+1,
+                   "pz": min(max_res, 10), "vl": "lang_en"}
+    return await _generic_engine_fetch(
+        session, "GET", "https://search.yahoo.com/search",
+        params=vary_yahoo_params(base_params),
+        engine="yahoo", page=page, max_res=max_res, chunk_id=chunk_id,
+        referer="https://search.yahoo.com/",
+        link_extractor=_yahoo_link_extractor,
+        noise_filter=lambda u: bool(_YAHOO_NOISE.search(u)),
+    )
 
 
 # ─── YAHOO ADVANCED FETCH — Normal Bulk Mode ──────────────────────────────────
@@ -2048,6 +2024,7 @@ async def fetch_page_yahoo_advanced(pool: "NormalYahooSessionPool",
      • Circuit-breaker aware (respects per-domain back-off)
     """
     sess   = await pool.acquire()
+    burned = False
     try:
         for attempt in range(_YAHOO_ADV_MAX_RETRIES):
             endpoint = random.choice(YAHOO_ENDPOINTS)
@@ -2056,9 +2033,6 @@ async def fetch_page_yahoo_advanced(pool: "NormalYahooSessionPool",
             referer  = f"https://{ep_host}/"
             profile  = getattr(sess, "_tls_profile", None) or get_tls_profile("weighted")
             headers  = build_headers_from_profile(profile, referer=referer)
-            # Endpoint-region aware Accept-Language overrides the global default.
-            headers["Accept-Language"] = _accept_language_for_endpoint(endpoint)
-            headers["Sec-Fetch-Site"]  = "same-origin"
             spoof_xff_headers(headers, probability=0.35)
 
             params = vary_yahoo_params_advanced({
@@ -2081,13 +2055,10 @@ async def fetch_page_yahoo_advanced(pool: "NormalYahooSessionPool",
 
                 if status in (429, 403, 503):
                     await circuit_breaker.record(endpoint, blocked=True)
-                    # Burn session → fresh TLS fingerprint for next attempt.
-                    # Drop our reference BEFORE awaiting the next acquire so
-                    # a failure in acquire() can't cause double-release.
-                    old = sess
-                    sess = None
-                    await pool.release(old, burned=True)
-                    sess = await pool.acquire()
+                    # Burn session → fresh TLS fingerprint for next attempt
+                    await pool.release(sess, burned=True)
+                    burned = False   # pool has taken ownership; final block won't re-release
+                    sess   = await pool.acquire()
                     await asyncio.sleep(humanize_delay(3.5 * (attempt + 1)))
                     continue
 
@@ -2097,10 +2068,9 @@ async def fetch_page_yahoo_advanced(pool: "NormalYahooSessionPool",
 
                 if _is_captcha(html):
                     await circuit_breaker.record(endpoint, blocked=True)
-                    old = sess
-                    sess = None
-                    await pool.release(old, burned=True)
-                    sess = await pool.acquire()
+                    await pool.release(sess, burned=True)
+                    burned = False
+                    sess   = await pool.acquire()
                     await asyncio.sleep(humanize_delay(9.0 + attempt * 3.5))
                     continue
 
@@ -2125,10 +2095,9 @@ async def fetch_page_yahoo_advanced(pool: "NormalYahooSessionPool",
                 await asyncio.sleep(humanize_delay((2 ** attempt) * 1.2))
             except CurlError as exc:
                 if (_is_proxy_error(exc) and PROXY_ENABLED and len(_proxy_pool) > 1):
-                    old = sess
-                    sess = None
-                    await pool.release(old, burned=True)
-                    sess = await pool.acquire()
+                    await pool.release(sess, burned=True)
+                    burned = False
+                    sess   = await pool.acquire()
                     await asyncio.sleep(humanize_delay(0.8))
                     continue
                 await asyncio.sleep(humanize_delay((2 ** attempt) * 1.0))
@@ -2138,10 +2107,8 @@ async def fetch_page_yahoo_advanced(pool: "NormalYahooSessionPool",
 
         return [], True
     finally:
-        # Only release if we still own a session (None means we swapped
-        # mid-loop and acquire() failed before assigning a replacement).
-        if sess is not None:
-            await pool.release(sess, burned=False)
+        # Only release if we still own the session (not already burned+swapped)
+        await pool.release(sess, burned=burned)
 
 
 async def fetch_all_pages_yahoo_adv(pool: "NormalYahooSessionPool",
@@ -2189,10 +2156,8 @@ async def fetch_all_pages(session, dork, engine, pages, max_res, chunk_id=0):
 
     async def _fetch_with_stagger(page, idx):
         if idx > 0:
-            # Gaussian jitter — slightly larger base for Yahoo to look less
-            # templated across consecutive page requests.
-            base = (0.12 if engine == "yahoo" else 0.05) * idx
-            await asyncio.sleep(humanize_delay(base, sigma_ratio=0.4))
+            # Gaussian jitter instead of uniform — more human-like inter-page timing
+            await asyncio.sleep(humanize_delay(0.05 * idx, sigma_ratio=0.4))
         return await fetch_fn(session, dork, page, max_res, chunk_id)
 
     tasks = [_fetch_with_stagger(p, i) for i, p in enumerate(sorted_pages)]
@@ -2283,51 +2248,122 @@ BING_XTREAM_MARKETS = ["en-US", "en-GB", "en-CA", "en-AU", "en-IN", "en-SG", "en
 async def xtream_fetch_yahoo(pool: XtreamSessionPool, dork: str, page: int,
                               max_res: int, worker_id: int) -> tuple[list, bool, bool]:
     """
-    Single Yahoo fetch in xtream mode.
-    Returns (urls, was_burned, was_captcha).
+    High-throughput Yahoo fetch for XTREAM mode.
+
+    v22 improvements over v21:
+      • Endpoint-matched referer — eliminates cross-origin Sec-Fetch-Site signal
+        that Yahoo's WAF uses to differentiate scrapers from browsers.
+      • vary_yahoo_params_advanced — full 17-value fr pool + 6 optional params,
+        preventing templated fingerprinting across requests.
+      • Circuit-breaker respected before every request — avoids hammering a
+        domain that is already OPEN, saving sessions and quota.
+      • XFF spoofing on 35% of requests — breaks per-IP rate tracking.
+      • _yahoo_link_extractor_v2 — handles all known Yahoo redirect patterns
+        (r.search, rd.yahoo, /r/ short-links) for better URL extraction.
+      • Session swap on 429 / 403 / captcha — gets a fresh TLS fingerprint and
+        retries instead of immediately giving up. Old behaviour discarded the
+        entire request on first block.
     """
-    sess = await pool.acquire()
-    burned = False; captcha = False
+    sess    = await pool.acquire()
+    burned  = False
+    captcha = False
+
     try:
-        endpoint = random.choice(YAHOO_ENDPOINTS)
-        referer  = random.choice(YAHOO_REFERERS)
-        profile  = getattr(sess, "_tls_profile", None) or get_tls_profile("weighted")
-        headers  = build_headers_from_profile(profile, referer=referer)
-        params   = {
-            "p": translate_dork(dork, "yahoo"),
-            "b": (page - 1) * 10 + 1,
-            "pz": min(max_res, 10),
-            "vl": "lang_en",
-            "fr": random.choice(["yfp-t", "uh3_search_web", "sfp", "yfp-t-s"]),
-        }
         for attempt in range(XTREAM_MAX_RETRIES + 1):
+            # Pick endpoint and build an endpoint-matched referer
+            endpoint = random.choice(YAHOO_ENDPOINTS)
+            ep_host  = urlparse(endpoint).netloc
+            referer  = f"https://{ep_host}/"
+
+            profile = getattr(sess, "_tls_profile", None) or get_tls_profile("weighted")
+            headers = build_headers_from_profile(profile, referer=referer)
+            spoof_xff_headers(headers, probability=0.35)
+
+            # Full advanced parameter variance — same as normal-mode ADV path
+            params = vary_yahoo_params_advanced({
+                "p":  translate_dork(dork, "yahoo"),
+                "b":  (page - 1) * 10 + 1,
+                "pz": min(max_res, 10),
+                "vl": "lang_en",
+            })
+
+            # Respect per-domain circuit-breaker back-off
+            wait_secs = await circuit_breaker.check(endpoint)
+            if wait_secs > 0:
+                await asyncio.sleep(min(wait_secs, 20.0))
+
             try:
-                resp = await sess.get(endpoint, params=params, headers=headers,
-                                       timeout=XTREAM_TIMEOUT)
-                html = resp.text
-                if resp.status_code == 429:
-                    burned = True
-                    return [], True, False
-                if resp.status_code != 200:
+                resp   = await sess.get(endpoint, params=params, headers=headers,
+                                        timeout=XTREAM_TIMEOUT)
+                status = resp.status_code
+                html   = resp.text          # decode once, reuse
+
+                if status in (429, 403, 503):
+                    await circuit_breaker.record(endpoint, blocked=True)
+                    # Burn current session → fresh TLS fingerprint → retry
+                    await pool.release(sess, burned=True)
+                    burned = False          # pool owns / will close it
+                    sess   = await pool.acquire()
+                    backoff = random.uniform(1.5, 4.0) * (attempt + 1)
+                    await asyncio.sleep(backoff)
+                    continue
+
+                if status != 200:
+                    await circuit_breaker.record(endpoint, blocked=False)
                     return [], False, False
+
                 if _is_captcha(html):
-                    captcha = True; burned = True
-                    return [], True, True
+                    await circuit_breaker.record(endpoint, blocked=True)
+                    captcha = True
+                    await pool.release(sess, burned=True)
+                    burned = False
+                    sess   = await pool.acquire()
+                    await asyncio.sleep(random.uniform(6.0, 14.0))
+                    continue
+
                 if _is_degraded(html, "yahoo"):
-                    if attempt < XTREAM_MAX_RETRIES: continue
+                    await circuit_breaker.record(endpoint, blocked=True)
+                    if attempt < XTREAM_MAX_RETRIES:
+                        await asyncio.sleep(random.uniform(0.4, 1.2))
+                        continue
                     return [], False, False
-                urls = _yahoo_link_extractor(html)
-                urls = [u for u in urls if u.startswith("http")
-                        and not _YAHOO_NOISE.search(u) and not _STATIC_EXT.search(u)]
+
+                # Success — use v2 extractor for full redirect-pattern coverage
+                urls = _yahoo_link_extractor_v2(html)
+                urls = [u for u in urls
+                        if u.startswith("http")
+                        and not _YAHOO_NOISE.search(u)
+                        and not _STATIC_EXT.search(u)]
+                await circuit_breaker.record(endpoint, blocked=False)
                 return list(dict.fromkeys(urls))[:max_res], False, False
-            except (asyncio.TimeoutError, CurlError):
-                if attempt < XTREAM_MAX_RETRIES: continue
+
+            except asyncio.TimeoutError:
+                await circuit_breaker.record(endpoint, blocked=True)
+                if attempt < XTREAM_MAX_RETRIES:
+                    await asyncio.sleep(random.uniform(0.3, 1.0) * (attempt + 1))
+                    continue
                 return [], False, False
+
+            except CurlError as exc:
+                if _is_proxy_error(exc) and PROXY_ENABLED and len(_proxy_pool) > 1:
+                    await pool.release(sess, burned=True)
+                    burned = False
+                    sess   = await pool.acquire()
+                    await asyncio.sleep(humanize_delay(0.8))
+                    continue
+                if attempt < XTREAM_MAX_RETRIES:
+                    await asyncio.sleep(random.uniform(0.2, 0.8))
+                    continue
+                return [], False, False
+
             except Exception as exc:
-                log.debug(f"[XTREAM:W{worker_id}] {exc}")
+                log.debug(f"[XTREAM:W{worker_id}] err: {exc}")
                 return [], False, False
+
         return [], False, False
+
     finally:
+        # Only release if we still own the session (not already swapped-out)
         await pool.release(sess, burned=burned)
 
 
@@ -2407,15 +2443,7 @@ async def xtream_worker(wid: int, queue: asyncio.Queue, results_q: asyncio.Queue
         # Per-worker cooldown after burns
         now = time.time()
         if cooldown_until > now:
-            # Sleep in slices so a stop event aborts cooldown promptly.
-            remaining = cooldown_until - now
-            while remaining > 0 and not stop_ev.is_set():
-                step = min(remaining, 0.5)
-                await asyncio.sleep(step)
-                remaining -= step
-            if stop_ev.is_set():
-                queue.task_done()
-                break
+            await asyncio.sleep(cooldown_until - now)
 
         # Pick engine for this dork
         if xtream_engine == "both":
@@ -2479,7 +2507,6 @@ async def run_xtream_job(chat_id: int, dorks: list, context):
     """
     XTREAM MODE v21: Multi-engine (Yahoo/Bing/Both), adaptive throttle, domain stats.
     """
-    from collections import Counter
     sess_cfg      = get_session(chat_id)
     use_tor       = sess_cfg.get("tor", False)
     min_score     = sess_cfg.get("min_score", 30)
@@ -2527,8 +2554,11 @@ async def run_xtream_job(chat_id: int, dorks: list, context):
     pool = XtreamSessionPool(size=XTREAM_SESSION_POOL_SIZE, engine=xtream_engine)
     await pool.initialize(use_tor=use_tor)
 
-    queue     = asyncio.Queue(maxsize=total_dorks + 10)
-    results_q = asyncio.Queue(maxsize=total_dorks * 2)
+    # Bounded queues — backpressure prevents unbounded memory growth.
+    # results_q cap 1000: each item holds a scored list; 1000 items in-flight
+    # is plenty before the consumer drains them.  Workers block when full.
+    queue     = asyncio.Queue()                   # input dorks — strings are tiny
+    results_q = asyncio.Queue(maxsize=1000)       # scored results — bounded
     stop_ev   = asyncio.Event()
     active_stop_evs[chat_id] = stop_ev
 
@@ -2544,9 +2574,27 @@ async def run_xtream_job(chat_id: int, dorks: list, context):
     ]
 
     processed = 0; total_raw = 0; total_captcha = 0
-    seen_norm: set  = set()   # normalized URL set for smarter dedup
-    seen_urls: set  = set()   # original URL set
-    all_scored: list = []
+
+    # ── Memory-efficient dedup via Bloom filter ───────────────────────────────
+    # A Python set of 10M URL strings uses 500 MB+; a Bloom filter for the same
+    # load uses ≈ 12 MB at 1 % false-positive rate.  Occasional false-positives
+    # (skipping a truly unique URL) are acceptable here.
+    _bloom_cap = max(total_dorks * XTREAM_PAGES_PER_DORK * max(max_res, 10) * 3,
+                     200_000)
+    url_bloom  = BloomFilter(capacity=_bloom_cap)
+    log.info(f"[XTREAM] Bloom filter: capacity={_bloom_cap:,} "
+             f"mem={url_bloom.memory_mb:.1f} MB")
+
+    # Tier lists — HIGH kept fully (most valuable), MED/LOW capped to save RAM.
+    # The incremental file captures ALL unique URLs regardless of tier caps.
+    high_urls: list = []          # score >= 70, uncapped
+    med_urls:  list = []          # 40-69,  cap 200 K
+    low_urls:  list = []          # <  40,  cap  50 K
+    _MED_CAP   = 200_000
+    _LOW_CAP   =  50_000
+    total_kept = 0
+    domain_counts: Counter = Counter()
+
     last_edit  = 0.0
     peak_rps   = 0.0
     last_rps_t = time.time(); rps_count = 0; current_rps = 0.0
@@ -2579,11 +2627,18 @@ async def run_xtream_job(chat_id: int, dorks: list, context):
 
             for sc, url in scored:
                 norm = _normalize_url_for_dedup(url)
-                if norm not in seen_norm:
-                    seen_norm.add(norm); seen_urls.add(url)
-                    all_scored.append((sc, url))
-                    try: incremental_f.write(f"{url}\n")
-                    except Exception: pass
+                if url_bloom.add(norm):     # True → probable duplicate
+                    continue
+                total_kept += 1
+                domain_counts[extract_domain(url)] += 1
+                try: incremental_f.write(f"{url}\n")
+                except Exception: pass
+                if sc >= 70:
+                    high_urls.append((sc, url))
+                elif sc >= 40 and len(med_urls) < _MED_CAP:
+                    med_urls.append((sc, url))
+                elif len(low_urls) < _LOW_CAP:
+                    low_urls.append((sc, url))
 
             # Adaptive throttle: if captcha rate spikes, tighten the semaphore
             if processed > 0 and processed % 20 == 0:
@@ -2611,7 +2666,7 @@ async def run_xtream_job(chat_id: int, dorks: list, context):
                               f"[{bar}] {pct}%\n"
                               f"✅ Dorks    : {processed}/{total_dorks}\n"
                               f"🔍 Raw URLs : {total_raw}\n"
-                              f"🎯 Targets  : {len(all_scored)}\n"
+                              f"🎯 Targets  : {total_kept}\n"
                               f"📊 RPS      : {current_rps:.0f} (peak {peak_rps:.0f})\n"
                               f"🛡 Captchas : {total_captcha} ({captcha_rate:.0%})\n"
                               f"⏱ {elapsed}s | ETA {eta}s\n{'━'*30}"),
@@ -2638,36 +2693,40 @@ async def run_xtream_job(chat_id: int, dorks: list, context):
         active_jobs.pop(chat_id, None)
         active_stop_evs.pop(chat_id, None)
 
-    all_scored.sort(reverse=True)
-    elapsed = int(time.time() - start_time)
-    avg_rps = total_raw / max(elapsed, 1)
+    elapsed     = int(time.time() - start_time)
+    avg_rps     = total_raw / max(elapsed, 1)
+    top_domains = domain_counts.most_common(10)
 
-    # Build categorised + domain-stats output file
-    high = [(s, u) for s, u in all_scored if s >= 70]
-    med  = [(s, u) for s, u in all_scored if 40 <= s < 70]
-    low  = [(s, u) for s, u in all_scored if s < 40]
-    domain_counts = Counter(extract_domain(u) for _, u in all_scored)
-    top_domains   = domain_counts.most_common(10)
+    # Sort tier lists by score (high-value first)
+    high_urls.sort(reverse=True)
+    med_urls.sort(reverse=True)
+    low_urls.sort(reverse=True)
 
+    # Re-write tmp_path with categorised sections
+    # (incremental file already has all URLs; this adds structure + domain stats)
     with open(tmp_path, "w", encoding="utf-8") as f:
-        f.write(f"# XTREAM Mode v21 — {engine_display}\n# {datetime.now()}\n")
-        f.write(f"# Dorks: {total_dorks} | Raw: {total_raw} | Targets: {len(all_scored)}\n")
+        f.write(f"# XTREAM Mode v22 — {engine_display}\n# {datetime.now()}\n")
+        f.write(f"# Dorks: {total_dorks} | Raw: {total_raw} | Targets: {total_kept}\n")
         f.write(f"# Avg RPS: {avg_rps:.0f} | Peak RPS: {peak_rps:.0f} | Time: {elapsed}s\n")
-        f.write(f"# Captchas: {total_captcha} | Min-score: {min_score}\n\n")
+        f.write(f"# Captchas: {total_captcha} | Min-score: {min_score}\n")
+        f.write(f"# Bloom filter: {url_bloom.memory_mb:.1f} MB "
+                f"(capacity {_bloom_cap:,})\n\n")
         if top_domains:
             f.write("# ── TOP DOMAINS ────────────────────────\n")
             for dom, cnt in top_domains:
                 f.write(f"# {cnt:>4}  {dom}\n")
             f.write("\n")
-        if high:
-            f.write(f"# ── HIGH VALUE (≥70) — {len(high)} ──────────────\n")
-            for _, u in high: f.write(f"{u}\n")
-        if med:
-            f.write(f"\n# ── MEDIUM (40-69) — {len(med)} ──────────────\n")
-            for _, u in med: f.write(f"{u}\n")
-        if low and min_score < 40:
-            f.write(f"\n# ── LOW (<40) — {len(low)} ──────────────\n")
-            for _, u in low: f.write(f"{u}\n")
+        if high_urls:
+            f.write(f"# ── HIGH VALUE (≥70) — {len(high_urls)} ──────────────\n")
+            for _, u in high_urls: f.write(f"{u}\n")
+        if med_urls:
+            f.write(f"\n# ── MEDIUM (40-69) — {len(med_urls)}"
+                    + (" [CAPPED]" if len(med_urls) >= _MED_CAP else "") + " ──\n")
+            for _, u in med_urls: f.write(f"{u}\n")
+        if low_urls and min_score < 40:
+            f.write(f"\n# ── LOW (<40) — {len(low_urls)}"
+                    + (" [CAPPED]" if len(low_urls) >= _LOW_CAP else "") + " ──\n")
+            for _, u in low_urls: f.write(f"{u}\n")
 
     dom_summary = "\n".join(f"  {cnt}× {d}" for d, cnt in top_domains[:5]) if top_domains else "  (none)"
     try:
@@ -2676,7 +2735,7 @@ async def run_xtream_job(chat_id: int, dorks: list, context):
             text=(f"🏁 XTREAM COMPLETE!\n{'━'*30}\n"
                   f"📋 Dorks       : {total_dorks}\n"
                   f"🔍 Raw URLs    : {total_raw}\n"
-                  f"🎯 Targets     : {len(all_scored)}\n"
+                  f"🎯 Targets     : {total_kept}\n"
                   f"📊 Avg RPS     : {avg_rps:.0f} | Peak: {peak_rps:.0f}\n"
                   f"🛡 Captchas    : {total_captcha}\n"
                   f"⏱ Total time  : {elapsed}s\n"
@@ -2685,13 +2744,13 @@ async def run_xtream_job(chat_id: int, dorks: list, context):
         )
     except Exception: pass
 
-    if all_scored:
+    if total_kept:
         with open(tmp_path, "rb") as f:
             await context.bot.send_document(
                 chat_id, f,
-                filename=f"xtream_{total_dorks}d_{len(all_scored)}u.txt",
-                caption=(f"⚡ XTREAM v21 RESULTS\n"
-                         f"🎯 {len(all_scored)} URLs | 📊 {avg_rps:.0f} avg / {peak_rps:.0f} peak RPS\n"
+                filename=f"xtream_{total_dorks}d_{total_kept}u.txt",
+                caption=(f"⚡ XTREAM v22 RESULTS\n"
+                         f"🎯 {total_kept} URLs | 📊 {avg_rps:.0f} avg / {peak_rps:.0f} peak RPS\n"
                          f"⏱ {elapsed}s | 🛡 {total_captcha} captchas"),
             )
     else:
@@ -2774,8 +2833,8 @@ async def run_chunk(chunk_id, dorks, engines, pages, max_res, use_tor, min_score
         yahoo_pool = NormalYahooSessionPool(size=max(workers_n, 2))
         await yahoo_pool.initialize()
 
-    queue = asyncio.Queue(maxsize=len(dorks) * 2)
-    results_q = asyncio.Queue(maxsize=500)
+    queue     = asyncio.Queue()                  # unbounded input (dork strings are tiny)
+    results_q = asyncio.Queue(maxsize=500)       # bounded output — workers backpressure
     stop_ev = asyncio.Event(); slowdown_ev = asyncio.Event()
     for d in dorks: await queue.put(d)
     total = len(dorks); processed = empty_count = chunk_raw = chunk_degraded = 0
@@ -2969,12 +3028,16 @@ async def run_dork_job(chat_id, dorks, context):
         active_jobs.pop(chat_id, None)
         active_stop_evs.pop(chat_id, None)
 
-    seen_urls=set(); all_scored=[]; total_raw=total_degraded=failed_chunks=0
+    # Use a Bloom filter for final cross-chunk dedup to keep RAM bounded.
+    _total_est  = sum(r["raw_count"] for r in chunk_results if not isinstance(r, Exception))
+    _final_bloom = BloomFilter(capacity=max(_total_est * 2, 50_000))
+    all_scored=[]; total_raw=total_degraded=failed_chunks=0
     for result in chunk_results:
         if isinstance(result, Exception): failed_chunks += 1; continue
         for sc, url in result["scored"]:
-            if url not in seen_urls:
-                seen_urls.add(url); all_scored.append((sc, url))
+            norm = _normalize_url_for_dedup(url)
+            if not _final_bloom.add(norm):      # False → new
+                all_scored.append((sc, url))
         total_raw += result["raw_count"]
         total_degraded += result["degraded_count"]
     all_scored.sort(reverse=True)
