@@ -457,6 +457,896 @@ TLS_PROFILES = [
         "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
         "firefox": True,
     },
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ─── EXTENDED POOL — 101 additional fingerprints ──────────────────────────
+    # Covers: Chrome 99-133, Edge 116-131, Safari 15.3-18.1, Firefox 91-132,
+    #         Brave, Opera, Samsung Internet, Vivaldi, Yandex, UC Browser;
+    #         OS matrix: Windows, macOS, Linux, Android, ChromeOS, iOS, iPadOS,
+    #         Windows ARM64, Apple Silicon.
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # ── Chrome 99 · Windows ─────────────────────────────────────────────────
+    {
+        "impersonate": "chrome99", "browser": "chrome", "version": 99,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.84 Safari/537.36",
+        "sec_ch_ua": '" Not A;Brand";v="99", "Chromium";v="99", "Google Chrome";v="99"',
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Chrome 100 · Windows ────────────────────────────────────────────────
+    {
+        "impersonate": "chrome100", "browser": "chrome", "version": 100,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36",
+        "sec_ch_ua": '" Not A;Brand";v="99", "Chromium";v="100", "Google Chrome";v="100"',
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Chrome 101 · Windows ────────────────────────────────────────────────
+    {
+        "impersonate": "chrome101", "browser": "chrome", "version": 101,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.67 Safari/537.36",
+        "sec_ch_ua": '" Not A;Brand";v="99", "Chromium";v="101", "Google Chrome";v="101"',
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Chrome 104 · Windows ────────────────────────────────────────────────
+    {
+        "impersonate": "chrome104", "browser": "chrome", "version": 104,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/104.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="104", "Google Chrome";v="104", " Not A;Brand";v="99"',
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Chrome 107 · Windows ────────────────────────────────────────────────
+    {
+        "impersonate": "chrome107", "browser": "chrome", "version": 107,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="107", "Google Chrome";v="107", "Not=A?Brand";v="24"',
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Chrome 127 · Windows ────────────────────────────────────────────────
+    {
+        "impersonate": "chrome127", "browser": "chrome", "version": 127,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="127", "Google Chrome";v="127", "Not)A;Brand";v="99"',
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Chrome 128 · Windows ────────────────────────────────────────────────
+    {
+        "impersonate": "chrome128", "browser": "chrome", "version": 128,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="128", "Google Chrome";v="128", "Not?A_Brand";v="99"',
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Chrome 129 · Windows ────────────────────────────────────────────────
+    {
+        "impersonate": "chrome129", "browser": "chrome", "version": 129,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="129", "Google Chrome";v="129", "Not=A?Brand";v="8"',
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Chrome 130 · Windows ────────────────────────────────────────────────
+    {
+        "impersonate": "chrome130", "browser": "chrome", "version": 130,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"',
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Chrome 132 · Windows ────────────────────────────────────────────────
+    {
+        "impersonate": "chrome132", "browser": "chrome", "version": 132,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="132", "Google Chrome";v="132", "Not_A Brand";v="24"',
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Chrome 133 · Windows ────────────────────────────────────────────────
+    {
+        "impersonate": "chrome133", "browser": "chrome", "version": 133,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="133", "Google Chrome";v="133", "Not(A:Brand";v="24"',
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Chrome 110 · Windows ARM64 ──────────────────────────────────────────
+    {
+        "impersonate": "chrome110", "browser": "chrome", "version": 110,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; ARM) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="110", "Not A(Brand";v="24", "Google Chrome";v="110"',
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Chrome 131 · Windows ARM64 ──────────────────────────────────────────
+    {
+        "impersonate": "chrome131", "browser": "chrome", "version": 131,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; ARM) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Chrome 99 · macOS ───────────────────────────────────────────────────
+    {
+        "impersonate": "chrome99", "browser": "chrome", "version": 99,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.84 Safari/537.36",
+        "sec_ch_ua": '" Not A;Brand";v="99", "Chromium";v="99", "Google Chrome";v="99"',
+        "platform": '"macOS"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Chrome 107 · macOS ──────────────────────────────────────────────────
+    {
+        "impersonate": "chrome107", "browser": "chrome", "version": 107,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="107", "Google Chrome";v="107", "Not=A?Brand";v="24"',
+        "platform": '"macOS"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Chrome 116 · macOS ──────────────────────────────────────────────────
+    {
+        "impersonate": "chrome116", "browser": "chrome", "version": 116,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Not)A;Brand";v="24", "Chromium";v="116", "Google Chrome";v="116"',
+        "platform": '"macOS"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Chrome 119 · macOS ──────────────────────────────────────────────────
+    {
+        "impersonate": "chrome119", "browser": "chrome", "version": 119,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Google Chrome";v="119", "Chromium";v="119", "Not?A_Brand";v="24"',
+        "platform": '"macOS"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Chrome 123 · macOS ──────────────────────────────────────────────────
+    {
+        "impersonate": "chrome123", "browser": "chrome", "version": 123,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Google Chrome";v="123", "Not:A-Brand";v="8", "Chromium";v="123"',
+        "platform": '"macOS"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+    },
+    # ── Chrome 126 · macOS ──────────────────────────────────────────────────
+    {
+        "impersonate": "chrome126", "browser": "chrome", "version": 126,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="8"',
+        "platform": '"macOS"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Chrome 127 · macOS ──────────────────────────────────────────────────
+    {
+        "impersonate": "chrome127", "browser": "chrome", "version": 127,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="127", "Google Chrome";v="127", "Not)A;Brand";v="99"',
+        "platform": '"macOS"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Chrome 128 · macOS ──────────────────────────────────────────────────
+    {
+        "impersonate": "chrome128", "browser": "chrome", "version": 128,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="128", "Google Chrome";v="128", "Not?A_Brand";v="99"',
+        "platform": '"macOS"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Chrome 130 · macOS ──────────────────────────────────────────────────
+    {
+        "impersonate": "chrome130", "browser": "chrome", "version": 130,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"',
+        "platform": '"macOS"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Chrome 126 · macOS (Apple Silicon M3 variant) ───────────────────────
+    {
+        "impersonate": "chrome126", "browser": "chrome", "version": 126,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="8"',
+        "platform": '"macOS"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Chrome 99 · Linux ───────────────────────────────────────────────────
+    {
+        "impersonate": "chrome99", "browser": "chrome", "version": 99,
+        "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.84 Safari/537.36",
+        "sec_ch_ua": '" Not A;Brand";v="99", "Chromium";v="99", "Google Chrome";v="99"',
+        "platform": '"Linux"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Chrome 107 · Linux ──────────────────────────────────────────────────
+    {
+        "impersonate": "chrome107", "browser": "chrome", "version": 107,
+        "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="107", "Google Chrome";v="107", "Not=A?Brand";v="24"',
+        "platform": '"Linux"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Chrome 116 · Linux ──────────────────────────────────────────────────
+    {
+        "impersonate": "chrome116", "browser": "chrome", "version": 116,
+        "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Not)A;Brand";v="24", "Chromium";v="116", "Google Chrome";v="116"',
+        "platform": '"Linux"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Chrome 119 · Linux ──────────────────────────────────────────────────
+    {
+        "impersonate": "chrome119", "browser": "chrome", "version": 119,
+        "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Google Chrome";v="119", "Chromium";v="119", "Not?A_Brand";v="24"',
+        "platform": '"Linux"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Chrome 123 · Linux ──────────────────────────────────────────────────
+    {
+        "impersonate": "chrome123", "browser": "chrome", "version": 123,
+        "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Google Chrome";v="123", "Not:A-Brand";v="8", "Chromium";v="123"',
+        "platform": '"Linux"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+    },
+    # ── Chrome 126 · Linux ──────────────────────────────────────────────────
+    {
+        "impersonate": "chrome126", "browser": "chrome", "version": 126,
+        "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="8"',
+        "platform": '"Linux"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Chrome 127 · Linux ──────────────────────────────────────────────────
+    {
+        "impersonate": "chrome127", "browser": "chrome", "version": 127,
+        "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="127", "Google Chrome";v="127", "Not)A;Brand";v="99"',
+        "platform": '"Linux"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Chrome 130 · Linux ──────────────────────────────────────────────────
+    {
+        "impersonate": "chrome130", "browser": "chrome", "version": 130,
+        "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"',
+        "platform": '"Linux"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Chrome 99 · Android (Pixel 6, chrome99_android TLS) ─────────────────
+    {
+        "impersonate": "chrome99_android", "browser": "chrome", "version": 99,
+        "ua": "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.73 Mobile Safari/537.36",
+        "sec_ch_ua": '" Not A;Brand";v="99", "Chromium";v="99", "Google Chrome";v="99"',
+        "platform": '"Android"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+        "mobile": True,
+    },
+    # ── Chrome 119 · Android (Pixel 6) ──────────────────────────────────────
+    {
+        "impersonate": "chrome119", "browser": "chrome", "version": 119,
+        "ua": "Mozilla/5.0 (Linux; Android 14; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.6045.163 Mobile Safari/537.36",
+        "sec_ch_ua": '"Google Chrome";v="119", "Chromium";v="119", "Not?A_Brand";v="24"',
+        "platform": '"Android"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+        "mobile": True,
+    },
+    # ── Chrome 123 · Android (Samsung Galaxy A55) ───────────────────────────
+    {
+        "impersonate": "chrome123", "browser": "chrome", "version": 123,
+        "ua": "Mozilla/5.0 (Linux; Android 14; SM-A556B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.6312.118 Mobile Safari/537.36",
+        "sec_ch_ua": '"Google Chrome";v="123", "Not:A-Brand";v="8", "Chromium";v="123"',
+        "platform": '"Android"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "mobile": True,
+    },
+    # ── Chrome 126 · Android (Samsung Galaxy S23) ───────────────────────────
+    {
+        "impersonate": "chrome126", "browser": "chrome", "version": 126,
+        "ua": "Mozilla/5.0 (Linux; Android 13; SM-S911B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.133 Mobile Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="8"',
+        "platform": '"Android"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "mobile": True, "priority": "u=0, i",
+    },
+    # ── Chrome 127 · Android (Pixel 9) ──────────────────────────────────────
+    {
+        "impersonate": "chrome127", "browser": "chrome", "version": 127,
+        "ua": "Mozilla/5.0 (Linux; Android 14; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.6533.103 Mobile Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="127", "Google Chrome";v="127", "Not)A;Brand";v="99"',
+        "platform": '"Android"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "mobile": True, "priority": "u=0, i",
+    },
+    # ── Chrome 128 · Android (Samsung Galaxy S24) ───────────────────────────
+    {
+        "impersonate": "chrome128", "browser": "chrome", "version": 128,
+        "ua": "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.6613.88 Mobile Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="128", "Google Chrome";v="128", "Not?A_Brand";v="99"',
+        "platform": '"Android"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "mobile": True, "priority": "u=0, i",
+    },
+    # ── Chrome 129 · Android (OnePlus 12) ───────────────────────────────────
+    {
+        "impersonate": "chrome129", "browser": "chrome", "version": 129,
+        "ua": "Mozilla/5.0 (Linux; Android 14; CPH2581) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.6668.70 Mobile Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="129", "Google Chrome";v="129", "Not=A?Brand";v="8"',
+        "platform": '"Android"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "mobile": True, "priority": "u=0, i",
+    },
+    # ── Chrome 130 · Android (Pixel 7) ──────────────────────────────────────
+    {
+        "impersonate": "chrome130", "browser": "chrome", "version": 130,
+        "ua": "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.6723.58 Mobile Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"',
+        "platform": '"Android"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "mobile": True, "priority": "u=0, i",
+    },
+    # ── Chrome 131 · Android (Xiaomi 14) ────────────────────────────────────
+    {
+        "impersonate": "chrome131", "browser": "chrome", "version": 131,
+        "ua": "Mozilla/5.0 (Linux; Android 14; 2312DRN4AG) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.6778.81 Mobile Safari/537.36",
+        "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "platform": '"Android"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "mobile": True, "priority": "u=0, i",
+    },
+    # ── Chrome 126 · ChromeOS ───────────────────────────────────────────────
+    {
+        "impersonate": "chrome126", "browser": "chrome", "version": 126,
+        "ua": "Mozilla/5.0 (X11; CrOS x86_64 14541.0.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="8"',
+        "platform": '"Chrome OS"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Chrome 131 · ChromeOS ───────────────────────────────────────────────
+    {
+        "impersonate": "chrome131", "browser": "chrome", "version": 131,
+        "ua": "Mozilla/5.0 (X11; CrOS x86_64 15964.0.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "platform": '"Chrome OS"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Edge 116 · Windows ──────────────────────────────────────────────────
+    {
+        "impersonate": "chrome116", "browser": "edge", "version": 116,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36 Edg/116.0.1938.69",
+        "sec_ch_ua": '"Chromium";v="116", "Not)A;Brand";v="24", "Microsoft Edge";v="116"',
+        "platform": '"Windows"', "accept": _ACCEPT_EDGE,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Edge 120 · Windows ──────────────────────────────────────────────────
+    {
+        "impersonate": "chrome120", "browser": "edge", "version": 120,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.2210.91",
+        "sec_ch_ua": '"Not_A Brand";v="8", "Chromium";v="120", "Microsoft Edge";v="120"',
+        "platform": '"Windows"', "accept": _ACCEPT_EDGE,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Edge 122 · Windows (genuine curl_cffi impersonate) ──────────────────
+    {
+        "impersonate": "edge122", "browser": "edge", "version": 122,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0",
+        "sec_ch_ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Microsoft Edge";v="122"',
+        "platform": '"Windows"', "accept": _ACCEPT_EDGE,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Edge 124 · Windows ──────────────────────────────────────────────────
+    {
+        "impersonate": "chrome124", "browser": "edge", "version": 124,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+        "sec_ch_ua": '"Chromium";v="124", "Not-A.Brand";v="99", "Microsoft Edge";v="124"',
+        "platform": '"Windows"', "accept": _ACCEPT_EDGE,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Edge 126 · Windows ──────────────────────────────────────────────────
+    {
+        "impersonate": "chrome126", "browser": "edge", "version": 126,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0",
+        "sec_ch_ua": '"Chromium";v="126", "Not-A.Brand";v="8", "Microsoft Edge";v="126"',
+        "platform": '"Windows"', "accept": _ACCEPT_EDGE,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Edge 129 · Windows ──────────────────────────────────────────────────
+    {
+        "impersonate": "chrome129", "browser": "edge", "version": 129,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0",
+        "sec_ch_ua": '"Microsoft Edge";v="129", "Not=A?Brand";v="8", "Chromium";v="129"',
+        "platform": '"Windows"', "accept": _ACCEPT_EDGE,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Edge 131 · Windows ──────────────────────────────────────────────────
+    {
+        "impersonate": "chrome131", "browser": "edge", "version": 131,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+        "sec_ch_ua": '"Microsoft Edge";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "platform": '"Windows"', "accept": _ACCEPT_EDGE,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Edge 122 · macOS ────────────────────────────────────────────────────
+    {
+        "impersonate": "edge122", "browser": "edge", "version": 122,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0",
+        "sec_ch_ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Microsoft Edge";v="122"',
+        "platform": '"macOS"', "accept": _ACCEPT_EDGE,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Safari 15.3 · macOS ─────────────────────────────────────────────────
+    {
+        "impersonate": "safari15_3", "browser": "safari", "version": 153,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 12_2_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.3 Safari/605.1.15",
+        "sec_ch_ua": None,
+        "platform": '"macOS"', "accept": _ACCEPT_SAFARI,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Safari 16.0 · macOS ─────────────────────────────────────────────────
+    {
+        "impersonate": "safari15_5", "browser": "safari", "version": 160,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
+        "sec_ch_ua": None,
+        "platform": '"macOS"', "accept": _ACCEPT_SAFARI,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Safari 16.3 · macOS ─────────────────────────────────────────────────
+    {
+        "impersonate": "safari15_5", "browser": "safari", "version": 163,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_2_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.3 Safari/605.1.15",
+        "sec_ch_ua": None,
+        "platform": '"macOS"', "accept": _ACCEPT_SAFARI,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Safari 16.6 · macOS ─────────────────────────────────────────────────
+    {
+        "impersonate": "safari17_0", "browser": "safari", "version": 166,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15",
+        "sec_ch_ua": None,
+        "platform": '"macOS"', "accept": _ACCEPT_SAFARI,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Safari 17.2 · macOS ─────────────────────────────────────────────────
+    {
+        "impersonate": "safari17_0", "browser": "safari", "version": 172,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+        "sec_ch_ua": None,
+        "platform": '"macOS"', "accept": _ACCEPT_SAFARI,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Safari 17.4 · macOS ─────────────────────────────────────────────────
+    {
+        "impersonate": "safari17_0", "browser": "safari", "version": 174,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+        "sec_ch_ua": None,
+        "platform": '"macOS"', "accept": _ACCEPT_SAFARI,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Safari 17.5 · macOS ─────────────────────────────────────────────────
+    {
+        "impersonate": "safari17_0", "browser": "safari", "version": 175,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+        "sec_ch_ua": None,
+        "platform": '"macOS"', "accept": _ACCEPT_SAFARI,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Safari iOS 16.5 · iPhone 14 ─────────────────────────────────────────
+    {
+        "impersonate": "safari15_5", "browser": "safari", "version": 165,
+        "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1",
+        "sec_ch_ua": None,
+        "platform": '"iOS"', "accept": _ACCEPT_SAFARI,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+        "mobile": True,
+    },
+    # ── Safari iOS 17.0 · iPhone 15 ─────────────────────────────────────────
+    {
+        "impersonate": "safari17_0", "browser": "safari", "version": 170,
+        "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+        "sec_ch_ua": None,
+        "platform": '"iOS"', "accept": _ACCEPT_SAFARI,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+        "mobile": True,
+    },
+    # ── Safari iOS 17.3 · iPhone 15 Pro ─────────────────────────────────────
+    {
+        "impersonate": "safari17_0", "browser": "safari", "version": 173,
+        "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Mobile/15E148 Safari/604.1",
+        "sec_ch_ua": None,
+        "platform": '"iOS"', "accept": _ACCEPT_SAFARI,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+        "mobile": True,
+    },
+    # ── Safari iOS 17.5 · iPhone 15 Plus ────────────────────────────────────
+    {
+        "impersonate": "safari17_0", "browser": "safari", "version": 175,
+        "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+        "sec_ch_ua": None,
+        "platform": '"iOS"', "accept": _ACCEPT_SAFARI,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+        "mobile": True,
+    },
+    # ── Safari iOS 18.1 · iPhone 16 ─────────────────────────────────────────
+    {
+        "impersonate": "safari18_0", "browser": "safari", "version": 181,
+        "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1",
+        "sec_ch_ua": None,
+        "platform": '"iOS"', "accept": _ACCEPT_SAFARI,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+        "mobile": True,
+    },
+    # ── Safari iPadOS 16.0 · iPad ────────────────────────────────────────────
+    {
+        "impersonate": "safari15_5", "browser": "safari", "version": 160,
+        "ua": "Mozilla/5.0 (iPad; CPU OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
+        "sec_ch_ua": None,
+        "platform": '"iPad"', "accept": _ACCEPT_SAFARI,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+        "mobile": True,
+    },
+    # ── Safari iPadOS 17.0 · iPad Pro ────────────────────────────────────────
+    {
+        "impersonate": "safari17_0", "browser": "safari", "version": 170,
+        "ua": "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+        "sec_ch_ua": None,
+        "platform": '"iPad"', "accept": _ACCEPT_SAFARI,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+        "mobile": True,
+    },
+    # ── Firefox 91 ESR · Windows ─────────────────────────────────────────────
+    {
+        "impersonate": "firefox91esr", "browser": "firefox", "version": 91,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:91.0) Gecko/20100101 Firefox/91.0",
+        "sec_ch_ua": None,
+        "platform": None, "accept": _ACCEPT_FIREFOX,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+        "firefox": True,
+    },
+    # ── Firefox 102 · Windows ────────────────────────────────────────────────
+    {
+        "impersonate": "firefox102", "browser": "firefox", "version": 102,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:102.0) Gecko/20100101 Firefox/102.0",
+        "sec_ch_ua": None,
+        "platform": None, "accept": _ACCEPT_FIREFOX,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+        "firefox": True,
+    },
+    # ── Firefox 105 · Windows ────────────────────────────────────────────────
+    {
+        "impersonate": "firefox105", "browser": "firefox", "version": 105,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:105.0) Gecko/20100101 Firefox/105.0",
+        "sec_ch_ua": None,
+        "platform": None, "accept": _ACCEPT_FIREFOX,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+        "firefox": True,
+    },
+    # ── Firefox 109 · Windows ────────────────────────────────────────────────
+    {
+        "impersonate": "firefox109", "browser": "firefox", "version": 109,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/109.0",
+        "sec_ch_ua": None,
+        "platform": None, "accept": _ACCEPT_FIREFOX,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+        "firefox": True,
+    },
+    # ── Firefox 115 · Windows ────────────────────────────────────────────────
+    {
+        "impersonate": "firefox115", "browser": "firefox", "version": 115,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:115.0) Gecko/20100101 Firefox/115.0",
+        "sec_ch_ua": None,
+        "platform": None, "accept": _ACCEPT_FIREFOX,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+        "firefox": True,
+    },
+    # ── Firefox 117 · Windows ────────────────────────────────────────────────
+    {
+        "impersonate": "firefox117", "browser": "firefox", "version": 117,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:117.0) Gecko/20100101 Firefox/117.0",
+        "sec_ch_ua": None,
+        "platform": None, "accept": _ACCEPT_FIREFOX,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "firefox": True,
+    },
+    # ── Firefox 121 · Windows ────────────────────────────────────────────────
+    {
+        "impersonate": "firefox121", "browser": "firefox", "version": 121,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+        "sec_ch_ua": None,
+        "platform": None, "accept": _ACCEPT_FIREFOX,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "firefox": True,
+    },
+    # ── Firefox 128 · Windows ────────────────────────────────────────────────
+    {
+        "impersonate": "firefox128", "browser": "firefox", "version": 128,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
+        "sec_ch_ua": None,
+        "platform": None, "accept": _ACCEPT_FIREFOX,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "firefox": True,
+    },
+    # ── Firefox 130 · Windows ────────────────────────────────────────────────
+    {
+        "impersonate": "firefox130", "browser": "firefox", "version": 130,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0",
+        "sec_ch_ua": None,
+        "platform": None, "accept": _ACCEPT_FIREFOX,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "firefox": True,
+    },
+    # ── Firefox 131 · Windows ────────────────────────────────────────────────
+    {
+        "impersonate": "firefox131", "browser": "firefox", "version": 131,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
+        "sec_ch_ua": None,
+        "platform": None, "accept": _ACCEPT_FIREFOX,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "firefox": True,
+    },
+    # ── Firefox 132 · Windows ────────────────────────────────────────────────
+    {
+        "impersonate": "firefox132", "browser": "firefox", "version": 132,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
+        "sec_ch_ua": None,
+        "platform": None, "accept": _ACCEPT_FIREFOX,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "firefox": True,
+    },
+    # ── Firefox 115 · Linux ──────────────────────────────────────────────────
+    {
+        "impersonate": "firefox115", "browser": "firefox", "version": 115,
+        "ua": "Mozilla/5.0 (X11; Linux x86_64; rv:115.0) Gecko/20100101 Firefox/115.0",
+        "sec_ch_ua": None,
+        "platform": None, "accept": _ACCEPT_FIREFOX,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+        "firefox": True,
+    },
+    # ── Firefox 117 · Linux ──────────────────────────────────────────────────
+    {
+        "impersonate": "firefox117", "browser": "firefox", "version": 117,
+        "ua": "Mozilla/5.0 (X11; Linux x86_64; rv:117.0) Gecko/20100101 Firefox/117.0",
+        "sec_ch_ua": None,
+        "platform": None, "accept": _ACCEPT_FIREFOX,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "firefox": True,
+    },
+    # ── Firefox 121 · Linux ──────────────────────────────────────────────────
+    {
+        "impersonate": "firefox121", "browser": "firefox", "version": 121,
+        "ua": "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
+        "sec_ch_ua": None,
+        "platform": None, "accept": _ACCEPT_FIREFOX,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "firefox": True,
+    },
+    # ── Firefox 128 · Linux ──────────────────────────────────────────────────
+    {
+        "impersonate": "firefox128", "browser": "firefox", "version": 128,
+        "ua": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+        "sec_ch_ua": None,
+        "platform": None, "accept": _ACCEPT_FIREFOX,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "firefox": True,
+    },
+    # ── Firefox 130 · Linux ──────────────────────────────────────────────────
+    {
+        "impersonate": "firefox130", "browser": "firefox", "version": 130,
+        "ua": "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0",
+        "sec_ch_ua": None,
+        "platform": None, "accept": _ACCEPT_FIREFOX,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "firefox": True,
+    },
+    # ── Firefox 132 · Linux ──────────────────────────────────────────────────
+    {
+        "impersonate": "firefox132", "browser": "firefox", "version": 132,
+        "ua": "Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0",
+        "sec_ch_ua": None,
+        "platform": None, "accept": _ACCEPT_FIREFOX,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "firefox": True,
+    },
+    # ── Firefox 115 · macOS ──────────────────────────────────────────────────
+    {
+        "impersonate": "firefox115", "browser": "firefox", "version": 115,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.0; rv:115.0) Gecko/20100101 Firefox/115.0",
+        "sec_ch_ua": None,
+        "platform": None, "accept": _ACCEPT_FIREFOX,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+        "firefox": True,
+    },
+    # ── Firefox 121 · macOS ──────────────────────────────────────────────────
+    {
+        "impersonate": "firefox121", "browser": "firefox", "version": 121,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.2; rv:121.0) Gecko/20100101 Firefox/121.0",
+        "sec_ch_ua": None,
+        "platform": None, "accept": _ACCEPT_FIREFOX,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "firefox": True,
+    },
+    # ── Firefox 128 · macOS ──────────────────────────────────────────────────
+    {
+        "impersonate": "firefox128", "browser": "firefox", "version": 128,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.6; rv:128.0) Gecko/20100101 Firefox/128.0",
+        "sec_ch_ua": None,
+        "platform": None, "accept": _ACCEPT_FIREFOX,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "firefox": True,
+    },
+    # ── Firefox 132 · macOS ──────────────────────────────────────────────────
+    {
+        "impersonate": "firefox132", "browser": "firefox", "version": 132,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.7; rv:132.0) Gecko/20100101 Firefox/132.0",
+        "sec_ch_ua": None,
+        "platform": None, "accept": _ACCEPT_FIREFOX,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "firefox": True,
+    },
+    # ── Firefox 123 · Android ────────────────────────────────────────────────
+    {
+        "impersonate": "firefox123", "browser": "firefox", "version": 123,
+        "ua": "Mozilla/5.0 (Android 14; Mobile; rv:123.0) Gecko/123.0 Firefox/123.0",
+        "sec_ch_ua": None,
+        "platform": None, "accept": _ACCEPT_FIREFOX,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "firefox": True, "mobile": True,
+    },
+    # ── Firefox 128 · Android ────────────────────────────────────────────────
+    {
+        "impersonate": "firefox128", "browser": "firefox", "version": 128,
+        "ua": "Mozilla/5.0 (Android 14; Mobile; rv:128.0) Gecko/128.0 Firefox/128.0",
+        "sec_ch_ua": None,
+        "platform": None, "accept": _ACCEPT_FIREFOX,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "firefox": True, "mobile": True,
+    },
+    # ── Brave 1.61 · Windows (Chrome 120 TLS stack) ──────────────────────────
+    {
+        "impersonate": "chrome120", "browser": "chrome", "version": 120,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Brave";v="120", "Chromium";v="120", "Not?A_Brand";v="24"',
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Brave 1.65 · Windows (Chrome 124 TLS stack) ──────────────────────────
+    {
+        "impersonate": "chrome124", "browser": "chrome", "version": 124,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Brave";v="124", "Chromium";v="124", "Not-A.Brand";v="99"',
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Brave 1.68 · macOS (Chrome 126 TLS stack) ────────────────────────────
+    {
+        "impersonate": "chrome126", "browser": "chrome", "version": 126,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Brave";v="126", "Chromium";v="126", "Not-A.Brand";v="8"',
+        "platform": '"macOS"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Brave 1.70 · Linux (Chrome 128 TLS stack) ────────────────────────────
+    {
+        "impersonate": "chrome128", "browser": "chrome", "version": 128,
+        "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Brave";v="128", "Chromium";v="128", "Not?A_Brand";v="99"',
+        "platform": '"Linux"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Opera 106 · Windows (Chrome 120 TLS stack) ───────────────────────────
+    {
+        "impersonate": "chrome120", "browser": "chrome", "version": 120,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 OPR/106.0.0.0",
+        "sec_ch_ua": '"Opera";v="106", "Chromium";v="120", "Not?A_Brand";v="24"',
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Opera 109 · Windows (Chrome 123 TLS stack) ───────────────────────────
+    {
+        "impersonate": "chrome123", "browser": "chrome", "version": 123,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 OPR/109.0.0.0",
+        "sec_ch_ua": '"Opera";v="109", "Google Chrome";v="123", "Not:A-Brand";v="8"',
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+    },
+    # ── Opera 112 · macOS (Chrome 126 TLS stack) ─────────────────────────────
+    {
+        "impersonate": "chrome126", "browser": "chrome", "version": 126,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 OPR/112.0.0.0",
+        "sec_ch_ua": '"Opera";v="112", "Chromium";v="126", "Not-A.Brand";v="8"',
+        "platform": '"macOS"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Samsung Internet 24 · Android (Chrome 120 TLS stack) ─────────────────
+    {
+        "impersonate": "chrome120", "browser": "chrome", "version": 120,
+        "ua": "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/24.0 Chrome/120.0.6099.193 Mobile Safari/537.36",
+        "sec_ch_ua": '"Samsung Internet";v="24.0", "Chromium";v="120", "Not-A.Brand";v="8"',
+        "platform": '"Android"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+        "mobile": True,
+    },
+    # ── Samsung Internet 25 · Android (Chrome 124 TLS stack) ─────────────────
+    {
+        "impersonate": "chrome124", "browser": "chrome", "version": 124,
+        "ua": "Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/25.0 Chrome/124.0.6367.82 Mobile Safari/537.36",
+        "sec_ch_ua": '"Samsung Internet";v="25.0", "Chromium";v="124", "Not-A.Brand";v="99"',
+        "platform": '"Android"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "mobile": True,
+    },
+    # ── Vivaldi 6.9 · Windows (Chrome 124 TLS stack) ─────────────────────────
+    {
+        "impersonate": "chrome124", "browser": "chrome", "version": 124,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Vivaldi";v="6.9", "Chromium";v="124", "Not-A.Brand";v="99"',
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Vivaldi 7.1 · macOS (Chrome 128 TLS stack) ───────────────────────────
+    {
+        "impersonate": "chrome128", "browser": "chrome", "version": 128,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Vivaldi";v="7.1", "Chromium";v="128", "Not?A_Brand";v="99"',
+        "platform": '"macOS"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Yandex Browser 24.4 · Windows (Chrome 124 TLS stack) ─────────────────
+    {
+        "impersonate": "chrome124", "browser": "chrome", "version": 124,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.29 YaBrowser/24.4.0.0 Safari/537.36",
+        "sec_ch_ua": '"Yandex";v="24.4", "Chromium";v="124", "Not-A.Brand";v="99"',
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Yandex Browser 24.6 · macOS (Chrome 126 TLS stack) ───────────────────
+    {
+        "impersonate": "chrome126", "browser": "chrome", "version": 126,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.114 YaBrowser/24.6.0.0 Safari/537.36",
+        "sec_ch_ua": '"Yandex";v="24.6", "Chromium";v="126", "Not-A.Brand";v="8"',
+        "platform": '"macOS"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── UC Browser 15.4 · Android (Chrome 119 TLS stack) ─────────────────────
+    {
+        "impersonate": "chrome119", "browser": "chrome", "version": 119,
+        "ua": "Mozilla/5.0 (Linux; U; Android 14; en-US; SM-S918B Build/UP1A.231005.007) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/119.0.6045.163 UCBrowser/15.4.2.1666 Mobile Safari/537.36",
+        "sec_ch_ua": None,
+        "platform": '"Android"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate",
+        "mobile": True,
+    },
 ]
 
 # Cycling iterator for round-robin strategy
