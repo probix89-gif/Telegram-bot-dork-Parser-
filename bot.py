@@ -15,15 +15,17 @@ import re
 import os
 import time
 import logging
+import logging.handlers
 import tempfile
 import shlex
 import itertools
+import hashlib as _hashlib
 from collections import deque, Counter
 import array, math
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs, unquote, quote_plus
+from urllib.parse import urlparse, parse_qs, unquote, quote_plus, urlencode
 
 from curl_cffi.requests import AsyncSession
 from curl_cffi import CurlError
@@ -43,7 +45,12 @@ log_file = f"logs/bot_{datetime.now().strftime('%Y%m%d')}.log"
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(message)s",
-    handlers=[logging.FileHandler(log_file), logging.StreamHandler()],
+    handlers=[
+        logging.handlers.RotatingFileHandler(
+            log_file, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
+        ),
+        logging.StreamHandler(),
+    ],
 )
 log = logging.getLogger(__name__)
 
@@ -105,6 +112,34 @@ user_sessions:   dict = {}
 active_jobs:     dict = {}
 active_stop_evs: dict = {}
 
+# ─── ACCESS CONTROL ──────────────────────────────────────────────────────────
+# Set ALLOWED_USERS=123456789,987654321 in .env to restrict access.
+# Leave empty (default) to allow all Telegram users (open mode).
+_ALLOWED_RAW = os.environ.get("ALLOWED_USERS", "").strip()
+ALLOWED_USERS: set[int] = (
+    {int(u.strip()) for u in _ALLOWED_RAW.split(",") if u.strip().isdigit()}
+    if _ALLOWED_RAW else set()
+)
+
+
+def is_allowed(update) -> bool:
+    """Return True if this user is permitted to use the bot."""
+    if not ALLOWED_USERS:
+        return True
+    user = update.effective_user
+    return user is not None and user.id in ALLOWED_USERS
+
+
+async def deny_unauthorized(update) -> None:
+    """Send a rejection message and log the attempt."""
+    user = update.effective_user
+    uid  = user.id if user else "?"
+    name = user.username or user.first_name if user else "unknown"
+    log.warning(f"[AUTH] Unauthorized access attempt: uid={uid} name={name}")
+    msg = update.effective_message
+    if msg:
+        await msg.reply_text("⛔ Unauthorized. Contact the bot owner.")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ─── ADVANCED TLS FINGERPRINT ROTATION v21.0 ─────────────────────────────────
@@ -156,8 +191,6 @@ _ACCEPT_EDGE    = "text/html,application/xhtml+xml,application/xml;q=0.9,image/w
 # Uses double-hashing (md5 low-half + high-half) to produce k bit positions.
 # ══════════════════════════════════════════════════════════════════════════════
 
-import hashlib as _hashlib
-
 class BloomFilter:
     """
     Probabilistic set for memory-efficient deduplication.
@@ -180,13 +213,24 @@ class BloomFilter:
 
     # ── Internal helpers ──────────────────────────────────────────────────────
     def _positions(self, item: str):
-        """Yield k bit positions via double-hashing."""
-        raw  = item.encode("utf-8", errors="replace")
-        digest = _hashlib.md5(raw).digest()
-        h1 = int.from_bytes(digest[:4],  "little") % self._size
-        h2 = int.from_bytes(digest[4:8], "little") % self._size or 1
+        """
+        Yield k bit positions using SHA-256 double-hashing.
+
+        Improvement over MD5: SHA-256 gives 32 bytes, so we extract 4
+        independent 32-bit seeds from non-overlapping digest regions.
+        Combining two linear families via XOR gives better bit dispersion
+        and reduces correlation between adjacent hash values.
+        """
+        raw    = item.encode("utf-8", errors="replace")
+        digest = _hashlib.sha256(raw).digest()
+        # 4 independent seeds from non-overlapping 4-byte windows
+        h1 = int.from_bytes(digest[0:4],   "little") % self._size
+        h2 = int.from_bytes(digest[8:12],  "little") % self._size or 1
+        h3 = int.from_bytes(digest[16:20], "little") % self._size
+        h4 = int.from_bytes(digest[24:28], "little") % self._size or 1
+        # Two independent linear families XOR'd together for better spread
         for i in range(self._k):
-            yield (h1 + i * h2) % self._size
+            yield ((h1 + i * h2) ^ (h3 + i * h4)) % self._size
 
     # ── Public API ────────────────────────────────────────────────────────────
     def add(self, item: str) -> bool:
@@ -414,10 +458,9 @@ TLS_PROFILES = [
     },
 ]
 
-# Cycling iterator (thread-safe ish — used as a hint only)
+# Cycling iterator for round-robin strategy
 _tls_cycle = itertools.cycle(TLS_PROFILES)
-_tls_lock  = asyncio.Lock()
-_tls_last  = []         # tracks last N profiles used to avoid consecutive repeats
+_tls_last: list[str] = []   # tracks last N profile impersonate tags (anti-repeat window)
 _TLS_ANTI_REPEAT = 3   # don't repeat same impersonate within this window
 
 
@@ -480,7 +523,7 @@ def build_headers_from_profile(profile: dict, referer: str | None = None,
         h = {
             "User-Agent":              profile["ua"],
             "Accept":                  profile.get("accept", _ACCEPT_FIREFOX),
-            "Accept-Language":         profile["accept_lang"],
+            "Accept-Language":         random.choice(_LANG_POOL),   # rotated per-request
             "Accept-Encoding":         profile.get("accept_enc", "gzip, deflate, br, zstd"),
             "Connection":              "keep-alive",
             "Upgrade-Insecure-Requests": "1",
@@ -496,7 +539,7 @@ def build_headers_from_profile(profile: dict, referer: str | None = None,
         h = {
             "User-Agent":              profile["ua"],
             "Accept":                  profile.get("accept", _ACCEPT_CHROME),
-            "Accept-Language":         profile["accept_lang"],
+            "Accept-Language":         random.choice(_LANG_POOL),   # rotated per-request
             "Accept-Encoding":         profile.get("accept_enc", "gzip, deflate, br"),
             "Upgrade-Insecure-Requests": "1",
             "Cache-Control":           cache_ctrl,
@@ -1366,7 +1409,6 @@ def _normalize_url_for_dedup(url: str) -> str:
         p = urlparse(url)
         if not p.query:
             return url
-        from urllib.parse import urlencode
         params = parse_qs(p.query, keep_blank_values=True)
         cleaned = {k: v for k, v in params.items() if not _TRACKING_PARAM_RE.match(k)}
         if cleaned == params:
@@ -1409,7 +1451,6 @@ async def run_url_clean_job(chat_id, raw_lines, context):
             for u in r:
                 if u not in seen_final:
                     seen_final.add(u); final_urls.append(u)
-    full_stats = filter_urls(raw_lines)
     removed = total_input - len(final_urls)
     stopped = stop_ev.is_set()
     output_path = Path("results") / "cleaned_urls.txt"
@@ -2477,6 +2518,8 @@ async def xtream_worker(wid: int, queue: asyncio.Queue, results_q: asyncio.Queue
                     if captcha: any_captcha = True
         except asyncio.TimeoutError:
             for t in page_tasks: t.cancel()
+            # Await cancelled tasks so they can release semaphore slots cleanly
+            await asyncio.gather(*page_tasks, return_exceptions=True)
 
         scored = filter_scored(all_urls, min_score)
         try:
@@ -3142,6 +3185,7 @@ def filter_keyboard():
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def cmd_start(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     chat_id = update.effective_chat.id
     sess = get_session(chat_id)
     alive = sum(1 for p in _proxy_pool if p["alive"])
@@ -3184,6 +3228,7 @@ async def cmd_start(update, context):
 
 
 async def cmd_dork(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     chat_id = update.effective_chat.id
     if not context.args:
         await update.message.reply_text("Usage: /dork inurl:login.php?id=")
@@ -3206,6 +3251,7 @@ async def cmd_dork(update, context):
 
 async def cmd_xtream(update, context):
     """Toggle XTREAM mode or set engine: /xtream [on|off|engine yahoo|bing|both]"""
+    if not is_allowed(update): await deny_unauthorized(update); return
     chat_id = update.effective_chat.id
     sess = get_session(chat_id)
 
@@ -3310,6 +3356,7 @@ async def cmd_pages(update, context):
     /pages 1-10         — set page range (inclusive)
     /pages 1,3,5,7      — set specific pages
     """
+    if not is_allowed(update): await deny_unauthorized(update); return
     chat_id = update.effective_chat.id
     sess    = get_session(chat_id)
 
@@ -3370,6 +3417,7 @@ async def cmd_pages(update, context):
 
 
 async def cmd_tor(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     global tor_enabled_users
     chat_id = update.effective_chat.id
     sess = get_session(chat_id)
@@ -3389,6 +3437,7 @@ async def cmd_tor(update, context):
 
 
 async def cmd_filter(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     chat_id = update.effective_chat.id
     sess = get_session(chat_id)
     try:
@@ -3428,6 +3477,7 @@ async def cmd_settings(update, context):
 
 
 async def cmd_workers(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     chat_id = update.effective_chat.id
     try:
         n = max(1, min(int(context.args[0]), MAX_WORKERS_PER_CHUNK))
@@ -3438,6 +3488,7 @@ async def cmd_workers(update, context):
 
 
 async def cmd_chunks(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     chat_id = update.effective_chat.id
     try:
         n = max(1, min(int(context.args[0]), 8))
@@ -3458,6 +3509,7 @@ async def cmd_maxres(update, context):
 
 
 async def cmd_engine(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     chat_id = update.effective_chat.id
     try:
         choice = context.args[0].lower()
@@ -3475,6 +3527,7 @@ async def cmd_clean(update, context):
 
 
 async def cmd_stop(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     chat_id = update.effective_chat.id
     stop_ev = active_stop_evs.get(chat_id)
     job = active_jobs.get(chat_id)
@@ -3503,6 +3556,7 @@ _awaiting_bulk_proxy: set = set()
 
 
 async def cmd_addproxy(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     if not context.args:
         await update.message.reply_text(
             "➕ ADD PROXY\nUsage: /addproxy <proxy>\n\n"
@@ -3535,6 +3589,7 @@ async def cmd_addproxy(update, context):
 
 
 async def cmd_addproxies(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     chat_id = update.effective_chat.id
     _awaiting_bulk_proxy.add(chat_id)
     await update.message.reply_text(
@@ -3593,6 +3648,7 @@ async def _bulk_add_proxies(chat_id, lines, context):
 
 
 async def cmd_proxycheck(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     if not _proxy_pool:
         await update.message.reply_text("📭 Empty."); return
     status_msg = await update.message.reply_text(f"🔍 Re-checking {len(_proxy_pool)}...")
@@ -3616,6 +3672,7 @@ async def cmd_proxycheck(update, context):
 
 
 async def cmd_proxyclean(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     async with _proxy_pool_lock:
         before = len(_proxy_pool)
         _proxy_pool[:] = [p for p in _proxy_pool if p["alive"]]
@@ -3625,6 +3682,7 @@ async def cmd_proxyclean(update, context):
 
 
 async def cmd_removeproxy(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     if not context.args:
         if not _proxy_pool:
             await update.message.reply_text("📭 Empty."); return
@@ -3651,6 +3709,7 @@ async def cmd_removeproxy(update, context):
 
 
 async def cmd_proxylist(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     if not _proxy_pool:
         await update.message.reply_text("📭 Empty.\nUse /addproxy or /addproxies."); return
     alive = sum(1 for p in _proxy_pool if p["alive"])
@@ -3670,6 +3729,7 @@ async def cmd_proxylist(update, context):
 
 
 async def cmd_testproxy(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     if not context.args:
         await update.message.reply_text("Usage: /testproxy <line>"); return
     line = " ".join(context.args).strip()
@@ -3706,6 +3766,7 @@ def _looks_like_proxy_list(lines):
 
 # ─── DOCUMENT / TEXT HANDLERS ────────────────────────────────────────────────
 async def handle_document(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     chat_id = update.effective_chat.id
     doc = update.message.document
     if chat_id in active_jobs and not active_jobs[chat_id].done():
@@ -3739,6 +3800,7 @@ async def handle_document(update, context):
 
 
 async def handle_text(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     chat_id = update.effective_chat.id
     if chat_id in _awaiting_bulk_proxy:
         _awaiting_bulk_proxy.discard(chat_id)
