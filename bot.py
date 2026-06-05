@@ -14,6 +14,7 @@ import random
 import re
 import os
 import time
+import json as _json
 import logging
 import logging.handlers
 import tempfile
@@ -712,6 +713,187 @@ class DomainCircuitBreaker:
 circuit_breaker = DomainCircuitBreaker()
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ─── YAHOO CAPTCHA BYPASS ENGINE v23.0 ────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#
+#  Multi-layer framework to prevent Yahoo visual CAPTCHAs and recover when hit.
+#
+#  Prevention layers (run BEFORE each request):
+#    1. Per-endpoint captcha score tracker — quarantines hot endpoints
+#    2. Endpoint health-aware selection — always picks the cleanest mirror out
+#       of 15 Yahoo regional domains
+#    3. Query fingerprint noise — slight dork transformations per-request to
+#       prevent identical-string WAF pattern matching
+#
+#  Recovery layers (run AFTER captcha detected):
+#    1. Per-endpoint strike + exponential quarantine (20 → 360 s)
+#    2. Session burn + fresh TLS profile acquisition from the pool
+#    3. "Shadow probe" — hits Yahoo Suggest API (JSON, separate backend, almost
+#       never CAPTCHA-gated) to verify the IP is clean before retrying
+#    4. Extended wait if shadow probe fails (IP-level block, not session)
+#
+# ══════════════════════════════════════════════════════════════════════════════
+
+_YAHOO_SUGGEST_URL = (
+    "https://search.yahoo.com/sugg/gossip/gossip-us-ura/"
+    "?output=sd1&appid=fp&command="
+)
+
+
+class YahooCaptchaBypassEngine:
+    """
+    Centralised Yahoo CAPTCHA / rate-limit bypass state machine.
+
+    One shared instance used by all XTREAM workers.  Thread-safe via asyncio.Lock.
+    Integrates with xtream_fetch_yahoo at four points:
+      • endpoint selection     (pick_clean_endpoint)
+      • query noise            (noise_query)
+      • captcha recording      (record_captcha)
+      • IP-clean verification  (shadow_probe)
+      • success healing        (record_success)
+    """
+    # Quarantine durations indexed by cumulative strike count
+    STRIKE_QUARANTINE: list = [0.0, 20.0, 45.0, 90.0, 180.0, 360.0]
+    STRIKE_MAX   = 5
+    PROBE_TIMEOUT = 4.0
+
+    def __init__(self):
+        self._lock                           = asyncio.Lock()
+        self._strikes:     dict              = {}   # endpoint → int
+        self._quarantine:  dict              = {}   # endpoint → float (unix ts)
+        self._captcha_count: dict            = {}   # endpoint → int
+        self.total_captchas  = 0
+        self.total_bypassed  = 0
+
+    # ── Query fingerprint noise ───────────────────────────────────────────────
+
+    @staticmethod
+    def noise_query(query: str) -> str:
+        """
+        Introduce harmless noise into a dork to defeat identical-string WAF
+        correlation.  Three strategies applied probabilistically:
+
+          A) Trailing space variant — cosmetic only, same SERP results  (10%)
+          B) Case-flip one free keyword — non-operator word only         (10%)
+          C) No change — most common path                                (80%)
+        """
+        if not query:
+            return query
+        r = random.random()
+        if r < 0.10:
+            return query + " "
+        if r < 0.20:
+            words = query.split()
+            for i, w in enumerate(words):
+                if not any(op in w for op in
+                           ("inurl:", "intitle:", "site:", "filetype:", "ext:")):
+                    words[i] = w.capitalize() if w.islower() else w.lower()
+                    break
+            return " ".join(words)
+        return query
+
+    # ── Endpoint health ───────────────────────────────────────────────────────
+
+    async def record_captcha(self, endpoint: str) -> float:
+        """
+        Record a CAPTCHA event for *endpoint*.
+        Returns the quarantine duration applied (seconds, 0.0 = none).
+        """
+        async with self._lock:
+            self.total_captchas += 1
+            self._captcha_count[endpoint] = self._captcha_count.get(endpoint, 0) + 1
+            strikes = min(self._strikes.get(endpoint, 0) + 1, self.STRIKE_MAX)
+            self._strikes[endpoint] = strikes
+            q_secs = self.STRIKE_QUARANTINE[strikes]
+            if q_secs > 0:
+                self._quarantine[endpoint] = time.time() + q_secs
+                log.warning(
+                    f"[BYPASS] {endpoint.replace('https://', '')}: "
+                    f"strike {strikes} → quarantine {q_secs:.0f}s"
+                )
+            return q_secs
+
+    async def record_success(self, endpoint: str) -> None:
+        """A successful request partially heals this endpoint's strike count."""
+        async with self._lock:
+            if self._strikes.get(endpoint, 0) > 0:
+                self._strikes[endpoint] -= 1
+                self.total_bypassed += 1
+
+    async def is_quarantined(self, endpoint: str) -> float:
+        """Returns seconds remaining in quarantine (0.0 = endpoint is clean)."""
+        async with self._lock:
+            remaining = self._quarantine.get(endpoint, 0.0) - time.time()
+            return max(0.0, remaining)
+
+    def pick_clean_endpoint(self, exclude: str = "") -> str:
+        """
+        Return the Yahoo endpoint with the lowest (quarantine_remaining, strikes).
+        Picks randomly from the 3 cleanest mirrors to avoid always hammering one.
+        """
+        candidates = [ep for ep in YAHOO_ENDPOINTS if ep != exclude]
+        if not candidates:
+            candidates = list(YAHOO_ENDPOINTS)
+        now = time.time()
+
+        def _score(ep):
+            return (
+                max(0.0, self._quarantine.get(ep, 0.0) - now),
+                self._strikes.get(ep, 0),
+            )
+
+        candidates.sort(key=_score)
+        return random.choice(candidates[:3])
+
+    async def stats(self) -> dict:
+        """Snapshot of bypass engine metrics for /capstatus."""
+        async with self._lock:
+            now = time.time()
+            return {
+                "total_captchas": self.total_captchas,
+                "total_bypassed": self.total_bypassed,
+                "per_endpoint":   dict(self._captcha_count),
+                "active_quarantines": {
+                    ep: round(t - now, 1)
+                    for ep, t in self._quarantine.items()
+                    if t > now
+                },
+                "strikes": {ep: s for ep, s in self._strikes.items() if s > 0},
+            }
+
+    # ── Shadow probe ──────────────────────────────────────────────────────────
+
+    async def shadow_probe(self, sess, word: str = "test") -> bool:
+        """
+        Hit Yahoo's Suggest API to verify the session/IP is not blocked.
+        Returns True if the IP looks clean.
+
+        Why the Suggest API:
+          • Served from a separate backend to /search — rarely CAPTCHA-gated
+          • JSON response (~500 B) — negligible overhead
+          • A valid gossip payload strongly implies the IP is allowed
+        """
+        try:
+            safe_word = quote_plus(word[:10])
+            url       = _YAHOO_SUGGEST_URL + safe_word
+            profile   = getattr(sess, "_tls_profile", None) or get_tls_profile("weighted")
+            headers   = build_headers_from_profile(profile)
+            headers["Accept"]           = "application/json, text/javascript, */*; q=0.01"
+            headers["X-Requested-With"] = "XMLHttpRequest"
+            resp = await sess.get(url, headers=headers, timeout=self.PROBE_TIMEOUT)
+            if resp.status_code == 200:
+                txt = resp.text[:256]
+                return '"gossip"' in txt or '"query"' in txt or txt.startswith("{")
+            return False
+        except Exception:
+            return False
+
+
+# Global singleton — shared by all XTREAM Yahoo workers
+yahoo_captcha_bypass = YahooCaptchaBypassEngine()
+
+
 # ── 2. Gaussian Jitter Timing ─────────────────────────────────────────────────
 
 def humanize_delay(base: float, sigma_ratio: float = 0.30,
@@ -999,7 +1181,6 @@ async def _probe_single(host, port, user, pwd, scheme):
         text = resp.text.strip()
         ext_ip = None
         try:
-            import json as _json
             data = _json.loads(text)
             ext_ip = data.get("ip") or data.get("origin") or data.get("query")
         except Exception:
@@ -1521,19 +1702,97 @@ def _make_fallback_session(exclude_proxy=None):
 
 async def _preseed_session_cookies(sess, engine: str = "yahoo") -> None:
     """
-    Visit a search engine homepage before querying.
-    This warms the cookie jar and makes the session look like a real browser
-    that browsed naturally rather than hitting the API cold.
+    Deep cookie warm-up: 3-step realistic browser navigation chain.
+
+    Chain for Yahoo:
+      1. Visit Yahoo homepage  →  establishes B / A3 session cookies
+      2. Browse a category page (news/finance/sports, 60% chance)  →  warms T_T/JSERP
+      3. Run a lightweight innocuous search  →  fills the full cookie jar
+
+    Chain for Bing:
+      1. Visit Bing homepage  →  establishes _EDGE_S / SRCHHPGUSR cookies
+      2. Run a lightweight common search  →  warms SRCHUID / SRCHD
+
+    Why this matters: a session hitting /search cold (no cookie jar) is
+    distinguishable from a real browser at Yahoo's WAF layer.  Yahoo's B cookie
+    is only set after a full page visit; its absence raises CAPTCHA probability ~4×.
     """
     try:
-        if engine == "bing":
-            url = random.choice(BING_HOMEPAGES)
-        else:
-            url = random.choice(YAHOO_HOMEPAGES)
         profile = getattr(sess, "_tls_profile", None) or get_tls_profile("weighted")
-        headers = build_headers_from_profile(profile)
-        await sess.get(url, headers=headers, timeout=10)
-        await asyncio.sleep(random.uniform(0.15, 0.4))
+
+        # ── Bing 2-step chain ─────────────────────────────────────────────────
+        if engine == "bing":
+            home = random.choice(BING_HOMEPAGES)
+            h1   = build_headers_from_profile(profile)
+            try:
+                await sess.get(home, headers=h1, timeout=10)
+            except Exception:
+                pass
+            await asyncio.sleep(random.uniform(0.25, 0.65))
+            warm_queries = ["weather today", "news", "sports scores", "movies", "recipes"]
+            h2 = build_headers_from_profile(profile, referer=home)
+            try:
+                await sess.get(
+                    "https://www.bing.com/search",
+                    params={"q": random.choice(warm_queries), "form": "QBLH", "setlang": "en"},
+                    headers=h2, timeout=9,
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(random.uniform(0.15, 0.35))
+            return
+
+        # ── Yahoo 3-step chain ────────────────────────────────────────────────
+        home = random.choice(YAHOO_HOMEPAGES)
+        h1   = build_headers_from_profile(profile)
+
+        # Step 1: Yahoo homepage
+        try:
+            await sess.get(home, headers=h1, timeout=10)
+        except Exception:
+            pass
+        await asyncio.sleep(random.uniform(0.2, 0.5))
+
+        # Step 2: Category browse (60% probability — mirrors real user variance)
+        _YAHOO_CATEGORIES = [
+            "https://news.yahoo.com/",
+            "https://finance.yahoo.com/",
+            "https://sports.yahoo.com/",
+            "https://www.yahoo.com/entertainment/",
+        ]
+        if random.random() < 0.60:
+            h2 = build_headers_from_profile(profile, referer=home)
+            try:
+                await sess.get(random.choice(_YAHOO_CATEGORIES), headers=h2, timeout=9)
+            except Exception:
+                pass
+            await asyncio.sleep(random.uniform(0.15, 0.40))
+            ref_for_search = random.choice(_YAHOO_CATEGORIES)
+        else:
+            ref_for_search = home
+
+        # Step 3: Lightweight innocuous search to complete the cookie jar
+        _WARM_QUERIES = [
+            "weather", "news today", "sports", "movies", "travel deals",
+            "recipes", "stock market", "local restaurants",
+        ]
+        endpoint = random.choice(YAHOO_ENDPOINTS)
+        h3 = build_headers_from_profile(profile, referer=ref_for_search)
+        try:
+            await sess.get(
+                endpoint,
+                params={
+                    "p":  random.choice(_WARM_QUERIES),
+                    "fr": random.choice(_YAHOO_FR_POOL_ADV),
+                    "ei": "UTF-8",
+                },
+                headers=h3,
+                timeout=9,
+            )
+        except Exception:
+            pass
+        await asyncio.sleep(random.uniform(0.10, 0.30))
+
     except Exception:
         pass
 
@@ -1662,7 +1921,7 @@ class NormalYahooSessionPool:
         _preseed_session_cookies() HTTP calls, spiking RAM and CPU.
       • Stale metadata cleaned on close_all().
     """
-    _MAX_USES             = 25       # rotate after N requests
+    _MAX_USES             = 15       # rotate after N requests (lowered: Yahoo tracks long-lived sessions)
     _MAX_AGE              = 300.0    # rotate after 5 minutes
     _MAX_CONCURRENT_REPLENISH = 4    # max parallel cookie-seed tasks at once
 
@@ -1789,13 +2048,29 @@ _CAPTCHA_RE = re.compile(
     r"please verify|too many requests|blocked|forbidden|rate limit|temporarily unavailable|"
     r"cf-error|error 429|request denied|robot check|human verification|"
     r"your ip|ip address|automated|bot detection|security check|"
-    r"503 service|502 bad gateway|pardon our interruption",
+    r"503 service|502 bad gateway|pardon our interruption|"
+    # Yahoo-specific challenge/block patterns
+    r"yahoo.*captcha|challenge.*yahoo|yahoo.*challenge|captcha\.yahoo|"
+    r"suspicious activity|validate your request|confirm you.re human|"
+    r"sign in to continue|please sign in to|account verification required|"
+    r"we.ve detected unusual|traffic from your network|automated queries|"
+    r"not a robot|recaptcha|hcaptcha|cf_chl_captcha|jschl_vc|"
+    r"challenge-running|_cf_chl|cf-ray|cf_clearance|"
+    r"div#captcha-container|form\[action.*yahooapis\]|"
+    r"div\.captcha|#captcha|\.challenge-form|challenge-error-title",
     re.IGNORECASE,
 )
 
 _YAHOO_RESULT_SIGNALS = re.compile(
+    # Classic Yahoo SERP layout (pre-2022)
     r'id="results"|searchCenterMiddle|class="algo|class="Sr|data-b="algo|'
-    r'"algo-sr"|"dd algo"|uh3_id|"compTitle"',
+    r'"algo-sr"|"dd algo"|uh3_id|"compTitle"|'
+    # Modern Yahoo SERP layout (2022-present)
+    r'"searchResult"|class="web-algo"|"organic-result"|'
+    r'"PartnerSearchResult"|"searchCenterCol"|'
+    r'"sres-cnt"|"voh-serp-main"|"algo-section"|'
+    r'"compDocs"|"algo-list"|"td-applet-webresults"|'
+    r'data-wf-type="SerpMiddle"|"sys-hdr"|"reg searchstring"',
     re.IGNORECASE,
 )
 
@@ -1813,9 +2088,20 @@ def _is_captcha(html):
     return bool(_CAPTCHA_RE.search(html[:4096]))
 
 
-async def _on_captcha_detected(engine, chunk_id, session_proxy):
-    log.warning(f"[C{chunk_id}][{engine.upper()}] 🔴 CAPTCHA")
-    await asyncio.sleep(random.uniform(8.0, 18.0))
+async def _on_captcha_detected(engine: str, chunk_id: int, session_proxy) -> None:
+    """
+    Called when a CAPTCHA page is detected in normal (non-XTREAM) mode.
+    Applies an engine-aware cool-down.  XTREAM mode uses YahooCaptchaBypassEngine
+    directly instead of this function.
+    """
+    log.warning(f"[C{chunk_id}][{engine.upper()}] 🔴 CAPTCHA — entering bypass cooldown")
+    if engine == "yahoo":
+        # Yahoo rate-windows are typically 60-120 s; a 10-20 s wait is the
+        # minimum useful pause before the same IP is likely clean again.
+        await asyncio.sleep(random.uniform(10.0, 20.0))
+    else:
+        # Bing / DDG are stricter per-IP; longer wait helps avoid ban escalation.
+        await asyncio.sleep(random.uniform(15.0, 30.0))
 
 
 # ─── LINK EXTRACTION (unchanged) ─────────────────────────────────────────────
@@ -2026,14 +2312,28 @@ async def fetch_page_bing(session, dork, page, max_res, chunk_id=0):
 
 
 async def fetch_page_yahoo(session, dork, page, max_res, chunk_id=0):
-    base_params = {"p": translate_dork(dork, "yahoo"), "b": (page-1)*10+1,
-                   "pz": min(max_res, 10), "vl": "lang_en"}
+    """
+    Normal-mode Yahoo fetch — upgraded to match the ADV pool path:
+      • 15-mirror endpoint rotation (was single fixed endpoint)
+      • vary_yahoo_params_advanced (was basic vary_yahoo_params)
+      • _yahoo_link_extractor_v2 (handles all redirect patterns)
+      • Endpoint-matched referer (eliminates cross-origin WAF signal)
+    """
+    endpoint = random.choice(YAHOO_ENDPOINTS)
+    ep_host  = urlparse(endpoint).netloc
+    referer  = f"https://{ep_host}/"
+    base_params = {
+        "p":  translate_dork(dork, "yahoo"),
+        "b":  (page - 1) * 10 + 1,
+        "pz": min(max_res, 10),
+        "vl": "lang_en",
+    }
     return await _generic_engine_fetch(
-        session, "GET", "https://search.yahoo.com/search",
-        params=vary_yahoo_params(base_params),
+        session, "GET", endpoint,
+        params=vary_yahoo_params_advanced(base_params),
         engine="yahoo", page=page, max_res=max_res, chunk_id=chunk_id,
-        referer="https://search.yahoo.com/",
-        link_extractor=_yahoo_link_extractor,
+        referer=referer,
+        link_extractor=_yahoo_link_extractor_v2,
         noise_filter=lambda u: bool(_YAHOO_NOISE.search(u)),
     )
 
@@ -2291,38 +2591,46 @@ async def xtream_fetch_yahoo(pool: XtreamSessionPool, dork: str, page: int,
     """
     High-throughput Yahoo fetch for XTREAM mode.
 
-    v22 improvements over v21:
-      • Endpoint-matched referer — eliminates cross-origin Sec-Fetch-Site signal
-        that Yahoo's WAF uses to differentiate scrapers from browsers.
-      • vary_yahoo_params_advanced — full 17-value fr pool + 6 optional params,
-        preventing templated fingerprinting across requests.
-      • Circuit-breaker respected before every request — avoids hammering a
-        domain that is already OPEN, saving sessions and quota.
-      • XFF spoofing on 35% of requests — breaks per-IP rate tracking.
-      • _yahoo_link_extractor_v2 — handles all known Yahoo redirect patterns
-        (r.search, rd.yahoo, /r/ short-links) for better URL extraction.
-      • Session swap on 429 / 403 / captcha — gets a fresh TLS fingerprint and
-        retries instead of immediately giving up. Old behaviour discarded the
-        entire request on first block.
+    v23 — CAPTCHA Bypass Engine integrated:
+      • pick_clean_endpoint()  — selects the healthiest of the 15 Yahoo mirrors
+        (lowest quarantine_remaining + strike score) instead of random choice.
+      • noise_query()          — per-request dork fingerprint variation defeats
+        identical-string pattern detection at Yahoo's WAF.
+      • record_captcha()       — per-endpoint exponential quarantine (20–360 s)
+        so hot endpoints are automatically avoided by all workers.
+      • shadow_probe()         — lightweight Suggest API hit verifies the IP is
+        clean before retrying; doubles the wait if the IP itself is blocked.
+      • record_success()       — heals the endpoint's strike count on every
+        successful result, allowing natural quarantine recovery.
+      • XFF spoofing raised to 40% (was 35%) to widen the apparent IP pool.
     """
-    sess    = await pool.acquire()
-    burned  = False
-    captcha = False
+    sess       = await pool.acquire()
+    burned     = False
+    captcha    = False
+    noisy_dork = yahoo_captcha_bypass.noise_query(dork)
 
     try:
         for attempt in range(XTREAM_MAX_RETRIES + 1):
-            # Pick endpoint and build an endpoint-matched referer
-            endpoint = random.choice(YAHOO_ENDPOINTS)
+            # ── Endpoint selection: bypass engine picks the cleanest mirror ───
+            endpoint = yahoo_captcha_bypass.pick_clean_endpoint()
             ep_host  = urlparse(endpoint).netloc
             referer  = f"https://{ep_host}/"
 
+            # If even the best endpoint is still in quarantine, pick the next
+            q_remaining = await yahoo_captcha_bypass.is_quarantined(endpoint)
+            if q_remaining > 0:
+                alt = yahoo_captcha_bypass.pick_clean_endpoint(exclude=endpoint)
+                if alt != endpoint:
+                    endpoint = alt
+                    ep_host  = urlparse(endpoint).netloc
+                    referer  = f"https://{ep_host}/"
+
             profile = getattr(sess, "_tls_profile", None) or get_tls_profile("weighted")
             headers = build_headers_from_profile(profile, referer=referer)
-            spoof_xff_headers(headers, probability=0.35)
+            spoof_xff_headers(headers, probability=0.40)
 
-            # Full advanced parameter variance — same as normal-mode ADV path
             params = vary_yahoo_params_advanced({
-                "p":  translate_dork(dork, "yahoo"),
+                "p":  translate_dork(noisy_dork, "yahoo"),
                 "b":  (page - 1) * 10 + 1,
                 "pz": min(max_res, 10),
                 "vl": "lang_en",
@@ -2337,15 +2645,15 @@ async def xtream_fetch_yahoo(pool: XtreamSessionPool, dork: str, page: int,
                 resp   = await sess.get(endpoint, params=params, headers=headers,
                                         timeout=XTREAM_TIMEOUT)
                 status = resp.status_code
-                html   = resp.text          # decode once, reuse
+                html   = resp.text
 
                 if status in (429, 403, 503):
                     await circuit_breaker.record(endpoint, blocked=True)
-                    # Burn current session → fresh TLS fingerprint → retry
+                    await yahoo_captcha_bypass.record_captcha(endpoint)
                     await pool.release(sess, burned=True)
-                    burned = False          # pool owns / will close it
-                    sess   = await pool.acquire()
-                    backoff = random.uniform(1.5, 4.0) * (attempt + 1)
+                    burned  = False
+                    sess    = await pool.acquire()
+                    backoff = random.uniform(2.0, 5.0) * (attempt + 1)
                     await asyncio.sleep(backoff)
                     continue
 
@@ -2355,11 +2663,23 @@ async def xtream_fetch_yahoo(pool: XtreamSessionPool, dork: str, page: int,
 
                 if _is_captcha(html):
                     await circuit_breaker.record(endpoint, blocked=True)
+                    q_secs  = await yahoo_captcha_bypass.record_captcha(endpoint)
                     captcha = True
                     await pool.release(sess, burned=True)
                     burned = False
                     sess   = await pool.acquire()
-                    await asyncio.sleep(random.uniform(6.0, 14.0))
+                    # ── Shadow probe: verify IP is clean before retrying ──────
+                    probe_ok  = await yahoo_captcha_bypass.shadow_probe(
+                        sess, noisy_dork[:8]
+                    )
+                    base_wait = max(q_secs * 0.5, random.uniform(6.0, 14.0))
+                    if not probe_ok:
+                        base_wait = min(base_wait * 2.0, 60.0)
+                        log.warning(
+                            f"[BYPASS:W{worker_id}] shadow probe FAIL "
+                            f"(IP-level block) — extended wait {base_wait:.1f}s"
+                        )
+                    await asyncio.sleep(base_wait)
                     continue
 
                 if _is_degraded(html, "yahoo"):
@@ -2369,13 +2689,14 @@ async def xtream_fetch_yahoo(pool: XtreamSessionPool, dork: str, page: int,
                         continue
                     return [], False, False
 
-                # Success — use v2 extractor for full redirect-pattern coverage
+                # ── Success ───────────────────────────────────────────────────
                 urls = _yahoo_link_extractor_v2(html)
                 urls = [u for u in urls
                         if u.startswith("http")
                         and not _YAHOO_NOISE.search(u)
                         and not _STATIC_EXT.search(u)]
                 await circuit_breaker.record(endpoint, blocked=False)
+                await yahoo_captcha_bypass.record_success(endpoint)
                 return list(dict.fromkeys(urls))[:max_res], False, False
 
             except asyncio.TimeoutError:
@@ -2404,53 +2725,81 @@ async def xtream_fetch_yahoo(pool: XtreamSessionPool, dork: str, page: int,
         return [], False, False
 
     finally:
-        # Only release if we still own the session (not already swapped-out)
         await pool.release(sess, burned=burned)
 
 
 async def xtream_fetch_bing(pool: XtreamSessionPool, dork: str, page: int,
                              max_res: int, worker_id: int) -> tuple[list, bool, bool]:
     """
-    Single Bing fetch in xtream mode.
+    Single Bing fetch in XTREAM mode.
+
+    v23 — circuit-breaker fully integrated (was missing entirely before):
+      • check() respected before every attempt — avoids hammering a domain
+        that is already in the OPEN state, saving session burn budget.
+      • record(blocked=True/False) called on every outcome so the breaker's
+        rolling-window block-rate stays accurate.
+      • Session swap on 429/403/503 + captcha (was: hard return on first 429).
     Returns (urls, was_burned, was_captcha).
     """
-    sess = await pool.acquire()
-    burned = False; captcha = False
+    sess    = await pool.acquire()
+    burned  = False
+    captcha = False
     try:
-        endpoint = random.choice(BING_XTREAM_ENDPOINTS)
-        referer  = random.choice(BING_XTREAM_REFERERS)
-        profile  = getattr(sess, "_tls_profile", None) or get_tls_profile("weighted")
-        headers  = build_headers_from_profile(profile, referer=referer)
-        params   = {
-            "q":       translate_dork(dork, "bing"),
-            "count":   min(max_res, 10),
-            "first":   (page - 1) * 10 + 1,
-            "setlang": "en",
-            "mkt":     random.choice(BING_XTREAM_MARKETS),
-            "form":    random.choice(["QBLH", "QBRE", "SBSD", "NMSP"]),
-        }
         for attempt in range(XTREAM_MAX_RETRIES + 1):
+            endpoint = random.choice(BING_XTREAM_ENDPOINTS)
+            referer  = random.choice(BING_XTREAM_REFERERS)
+            profile  = getattr(sess, "_tls_profile", None) or get_tls_profile("weighted")
+            headers  = build_headers_from_profile(profile, referer=referer)
+            params   = {
+                "q":       translate_dork(dork, "bing"),
+                "count":   min(max_res, 10),
+                "first":   (page - 1) * 10 + 1,
+                "setlang": "en",
+                "mkt":     random.choice(BING_XTREAM_MARKETS),
+                "form":    random.choice(["QBLH", "QBRE", "SBSD", "NMSP"]),
+            }
+            # Respect circuit-breaker back-off
+            wait_secs = await circuit_breaker.check(endpoint)
+            if wait_secs > 0:
+                await asyncio.sleep(min(wait_secs, 20.0))
             try:
                 resp = await sess.get(endpoint, params=params, headers=headers,
                                       timeout=XTREAM_TIMEOUT)
                 html = resp.text
-                if resp.status_code == 429:
-                    burned = True
-                    return [], True, False
+                if resp.status_code in (429, 403, 503):
+                    await circuit_breaker.record(endpoint, blocked=True)
+                    await pool.release(sess, burned=True)
+                    burned = False
+                    sess   = await pool.acquire()
+                    await asyncio.sleep(random.uniform(2.0, 5.0) * (attempt + 1))
+                    continue
                 if resp.status_code not in (200,):
+                    await circuit_breaker.record(endpoint, blocked=False)
                     if attempt < XTREAM_MAX_RETRIES: continue
                     return [], False, False
                 if _is_captcha(html):
-                    captcha = True; burned = True
-                    return [], True, True
+                    await circuit_breaker.record(endpoint, blocked=True)
+                    captcha = True
+                    await pool.release(sess, burned=True)
+                    burned = False
+                    sess   = await pool.acquire()
+                    await asyncio.sleep(random.uniform(6.0, 14.0))
+                    continue
                 if _is_degraded(html, "bing"):
+                    await circuit_breaker.record(endpoint, blocked=True)
                     if attempt < XTREAM_MAX_RETRIES: continue
                     return [], False, False
                 urls = _extract_links(html)
                 urls = [u for u in urls if u.startswith("http")
                         and not _BING_NOISE.search(u) and not _STATIC_EXT.search(u)]
+                await circuit_breaker.record(endpoint, blocked=False)
                 return list(dict.fromkeys(urls))[:max_res], False, False
-            except (asyncio.TimeoutError, CurlError):
+            except asyncio.TimeoutError:
+                await circuit_breaker.record(endpoint, blocked=True)
+                if attempt < XTREAM_MAX_RETRIES: continue
+                return [], False, False
+            except CurlError as exc:
+                log.debug(f"[XTREAM:BING:W{worker_id}] curl: {exc}")
                 if attempt < XTREAM_MAX_RETRIES: continue
                 return [], False, False
             except Exception as exc:
@@ -3551,6 +3900,47 @@ async def cmd_status(update, context):
     )
 
 
+async def cmd_capstatus(update, context):
+    """
+    /capstatus — display the Yahoo CAPTCHA Bypass Engine live statistics.
+
+    Shows:
+      • Total CAPTCHA events recorded and healed
+      • Per-endpoint CAPTCHA hit counts
+      • Currently active endpoint quarantines with time remaining
+      • Active strike counts per endpoint
+    """
+    if not is_allowed(update): await deny_unauthorized(update); return
+    stats = await yahoo_captcha_bypass.stats()
+    lines = [
+        "🛡 Yahoo CAPTCHA Bypass Engine — v23.0",
+        "─────────────────────────────────────────",
+        f"Total CAPTCHAs hit   : {stats['total_captchas']}",
+        f"Total healed         : {stats['total_bypassed']}",
+    ]
+    if stats["per_endpoint"]:
+        lines.append("\nHits per endpoint:")
+        for ep, cnt in sorted(stats["per_endpoint"].items(), key=lambda x: -x[1]):
+            short = ep.replace("https://", "").replace("/search", "")
+            lines.append(f"  {short}: {cnt}×")
+    if stats["active_quarantines"]:
+        lines.append("\n🔴 Active quarantines:")
+        for ep, secs in sorted(stats["active_quarantines"].items(),
+                               key=lambda x: -x[1]):
+            short = ep.replace("https://", "").replace("/search", "")
+            lines.append(f"  {short}: {secs:.0f}s remaining")
+    elif stats["per_endpoint"]:
+        lines.append("\n✅ No active quarantines")
+    if stats["strikes"]:
+        lines.append("\nStrikes (active):")
+        for ep, s in sorted(stats["strikes"].items(), key=lambda x: -x[1]):
+            short = ep.replace("https://", "").replace("/search", "")
+            lines.append(f"  {short}: {s} strike(s)")
+    if not stats["per_endpoint"]:
+        lines.append("\nNo CAPTCHA events recorded yet.")
+    await update.message.reply_text("\n".join(lines))
+
+
 # ─── PROXY COMMAND HANDLERS (unchanged) ──────────────────────────────────────
 _awaiting_bulk_proxy: set = set()
 
@@ -4130,6 +4520,7 @@ def main():
         ("workers", cmd_workers), ("chunks", cmd_chunks),
         ("maxres", cmd_maxres), ("engine", cmd_engine),
         ("stop", cmd_stop), ("status", cmd_status),
+        ("capstatus", cmd_capstatus),
     ]:
         app.add_handler(CommandHandler(name, handler))
 
@@ -4151,13 +4542,14 @@ def main():
     app.post_init = _on_startup
 
     log.info("=" * 60)
-    log.info("  DORK PARSER v21.0 — XTREAM EDITION")
+    log.info("  DORK PARSER v23.0 — XTREAM EDITION")
     log.info(f"  TLS profiles : {len(TLS_PROFILES)} rotating (Chrome/Firefox/Edge/Safari)")
     log.info(f"  Anti-block   : circuit-breaker | gaussian jitter | XFF spoof | param vary")
+    log.info(f"  CAPTCHA bypass: endpoint quarantine (20-360s) | shadow probe | query noise")
     log.info(f"  Standard     : ~200 URLs/sec ({N_CHUNKS}×{WORKERS_PER_CHUNK})")
     log.info(f"  Xtream       : {XTREAM_TARGET_RPS} RPS target ({XTREAM_CHUNKS}×{XTREAM_WORKERS_PER_CHUNK})")
     log.info(f"  Xtream pages : {XTREAM_PAGES_PER_DORK}/dork | pool: {XTREAM_SESSION_POOL_SIZE}")
-    log.info(f"  Cookie seed  : {'on' if XTREAM_PRESEED_COOKIES else 'off'} | retries: {XTREAM_MAX_RETRIES}")
+    log.info(f"  Cookie seed  : {'on' if XTREAM_PRESEED_COOKIES else 'off'} (3-step chain) | retries: {XTREAM_MAX_RETRIES}")
     log.info(f"  Proxies      : {len(_proxy_pool)} loaded")
     log.info(f"  Engines      : {', '.join(ENGINES)}")
     log.info("=" * 60)
